@@ -21,9 +21,10 @@ use actix::{
     SpawnHandle,
 };
 use log::info;
+use specs::WorldExt;
 
 use crate::{
-    perf, InboundStateBuffer, ResetWorld, Server, SyncWorld, Teardown, World, WorldConfig,
+    perf, Chunks, InboundStateBuffer, ResetWorld, Server, SyncWorld, Teardown, World, WorldConfig,
 };
 
 /// Immutable, cheaply-cloneable descriptor of a live world, snapshotted at
@@ -192,6 +193,19 @@ pub struct CreateWorld {
     pub gc_policy: GcPolicy,
 }
 
+/// Register a fully configured world at runtime.
+///
+/// Games use this when a world needs application-owned pipeline stages, ECS
+/// resources, parsers, methods, or a custom dispatcher.  The engine deliberately
+/// knows nothing about the opaque definition/session data used to build it; by
+/// the time this message arrives it is an ordinary [`World`].
+#[derive(ActixMessage)]
+#[rtype(result = "Result<WorldHandle, WorldLifecycleError>")]
+pub struct RegisterWorld {
+    pub world: World,
+    pub gc_policy: GcPolicy,
+}
+
 /// Tear down a world. `force = false` respects in-flight-tick safety and may
 /// return `TeardownInFlight`; `force = true` schedules teardown to run *after*
 /// the in-flight tick completes (never mid-borrow).
@@ -266,6 +280,14 @@ impl Handler<CreateWorld> for Server {
 
     fn handle(&mut self, msg: CreateWorld, _: &mut Context<Self>) -> Self::Result {
         MessageResult(self.create_world(msg))
+    }
+}
+
+impl Handler<RegisterWorld> for Server {
+    type Result = MessageResult<RegisterWorld>;
+
+    fn handle(&mut self, msg: RegisterWorld, _: &mut Context<Self>) -> Self::Result {
+        MessageResult(self.register_world(msg))
     }
 }
 
@@ -472,6 +494,76 @@ impl Server {
             reused,
             gc_policy
         );
+
+        Ok(WorldHandle {
+            name,
+            addr,
+            created_at,
+            player_count: 0,
+            gc_policy,
+        })
+    }
+
+    /// Register an application-configured world using the same runtime
+    /// bookkeeping as `CreateWorld`, without rebuilding it as a bare engine
+    /// world and discarding the application's setup.
+    fn register_world(&mut self, msg: RegisterWorld) -> Result<WorldHandle, WorldLifecycleError> {
+        let RegisterWorld {
+            mut world,
+            gc_policy,
+        } = msg;
+        let name = world.name.clone();
+
+        if name.trim().is_empty() {
+            return Err(WorldLifecycleError::InvalidConfig(
+                "world name must not be empty".to_owned(),
+            ));
+        }
+        if self.worlds.contains_key(&name) {
+            return Err(WorldLifecycleError::DuplicateName(name));
+        }
+
+        let live = self.worlds.len();
+        let cap = self.world_cap();
+        if live >= cap {
+            self.lifecycle_metrics.cap_rejected += 1;
+            return Err(WorldLifecycleError::CapacityReached { live, cap });
+        }
+
+        let config = world.config().make_copy();
+        let fingerprint = ConfigFingerprint::of(&config);
+        let max_clients = config.max_clients;
+        let is_deterministic = config.fixed_timestep.is_some();
+
+        let registry = self.registry.clone();
+        world.ecs_mut().insert(registry.clone());
+        world
+            .ecs_mut()
+            .write_resource::<Chunks>()
+            .set_waterlogging_rules(registry.waterlogging_rules().map(Arc::new));
+        if let Some(rtc_senders) = &self.rtc_senders {
+            world.ecs_mut().insert(rtc_senders.clone());
+        }
+
+        let inbound_state = world.inbound_state_handle();
+        let addr = world.start();
+        self.world_inbound_state.insert(name.clone(), inbound_state);
+        self.worlds.insert(name.clone(), addr.clone());
+
+        let created_at = Instant::now();
+        self.world_entries.insert(
+            name.clone(),
+            WorldEntry {
+                created_at,
+                gc_policy: gc_policy.clone(),
+                max_clients,
+                peak_players: 0,
+                gc_handle: None,
+                config_fingerprint: fingerprint,
+                is_deterministic,
+            },
+        );
+        self.lifecycle_metrics.created += 1;
 
         Ok(WorldHandle {
             name,
@@ -776,6 +868,34 @@ mod runtime_lifecycle_tests {
     fn ecs_entity_count(world: &World) -> usize {
         let entities = world.ecs().entities();
         (&entities).join().count()
+    }
+
+    #[test]
+    fn register_world_preserves_application_configuration() {
+        actix::System::new().block_on(async {
+            let server = Server::new().debug(false).max_worlds(2).build();
+            let addr = server.start();
+            let config = WorldConfig::new().max_clients(4).build();
+            let world = World::new("configured-session", &config);
+
+            let handle = addr
+                .send(RegisterWorld {
+                    world,
+                    gc_policy: GcPolicy::WhenEmpty {
+                        grace: Duration::from_secs(5),
+                    },
+                })
+                .await
+                .unwrap()
+                .expect("register configured world");
+
+            let registered = handle.addr.send(crate::GetConfig).await.unwrap();
+            assert_eq!(registered.max_clients, 4);
+            assert!(matches!(
+                handle.gc_policy,
+                GcPolicy::WhenEmpty { grace } if grace == Duration::from_secs(5)
+            ));
+        });
     }
 
     // ── Test 1a: the reset pass ReuseWarm relies on leaves no state behind. ──
