@@ -45,16 +45,24 @@ impl SystemTimings {
         self.samples
             .iter()
             .map(|(name, samples)| {
-                let durations: Vec<f64> = samples.iter().map(|s| s.duration_ms).collect();
+                let mut durations: Vec<f64> = samples.iter().map(|s| s.duration_ms).collect();
                 let avg = durations.iter().sum::<f64>() / durations.len() as f64;
                 let max = durations.iter().cloned().fold(0.0, f64::max);
                 let min = durations.iter().cloned().fold(f64::MAX, f64::min);
+                durations.sort_by(f64::total_cmp);
+                let percentile = |p: f64| {
+                    let index = ((durations.len() - 1) as f64 * p).ceil() as usize;
+                    durations[index]
+                };
                 (
                     name.clone(),
                     SystemStats {
                         avg,
                         max,
                         min,
+                        p50: percentile(0.50),
+                        p95: percentile(0.95),
+                        p99: percentile(0.99),
                         samples: durations.len(),
                     },
                 )
@@ -72,6 +80,9 @@ pub struct SystemStats {
     pub avg: f64,
     pub max: f64,
     pub min: f64,
+    pub p50: f64,
+    pub p95: f64,
+    pub p99: f64,
     pub samples: usize,
 }
 
