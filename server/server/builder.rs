@@ -116,6 +116,7 @@ impl ServerBuilder {
             started: false,
 
             connections: HashMap::default(),
+            connection_world_guards: HashMap::default(),
             lost_sessions: HashMap::default(),
             transport_sessions: HashMap::default(),
             pending_world_ticks: HashSet::default(),

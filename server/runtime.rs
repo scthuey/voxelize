@@ -15,7 +15,7 @@
 //!   further socket reads while an ack is pending, repeated slow-ack warnings,
 //!   and a hard drop for a truly wedged server actor.
 
-use std::{future::Future, net::SocketAddr, time::Duration};
+use std::{future::Future, net::SocketAddr, sync::Arc, time::Duration};
 
 use actix::{Actor, Addr};
 use actix_cors::Cors;
@@ -24,7 +24,7 @@ use actix_web::{
     body::MessageBody,
     dev::{ServiceFactory, ServiceRequest, ServiceResponse},
     web::{self, Query},
-    App, Error, HttpRequest, HttpResponse, HttpServer, Result,
+    App, Error, HttpMessage, HttpRequest, HttpResponse, HttpServer, Result,
 };
 use actix_ws::AggregatedMessage;
 use futures_util::{future::poll_immediate, StreamExt};
@@ -51,6 +51,20 @@ const CLIENT_MESSAGE_ACK_HARD_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How often the server pings each WebSocket connection.
 const DEFAULT_WS_HEARTBEAT_INTERVAL_MS: u64 = 10_000;
+
+/// Optional application-supplied authorization bound to one upgraded socket.
+///
+/// Middleware may insert this value into [`HttpRequest::extensions`] before
+/// Voxelize's canonical `/ws/` route runs. The engine uses only generic
+/// transport facts: an authoritative client id, an optional world restriction,
+/// and a lifecycle callback. Games remain responsible for tickets, parties,
+/// reservations, matchmaking, and any other admission policy.
+#[derive(Clone, Default)]
+pub struct WsConnectionContext {
+    pub client_id: Option<String>,
+    pub allowed_world: Option<String>,
+    pub on_disconnect: Option<Arc<dyn Fn() + Send + Sync>>,
+}
 
 /// How long a connection may stay silent (no frames of any kind, including
 /// pongs) before it is treated as dead and reaped. Abrupt closures (killed
@@ -415,11 +429,16 @@ pub async fn ws_route(
         }
     }
 
-    let id = if let Some(id) = options.get("client_id") {
-        id.to_owned()
-    } else {
-        "".to_owned()
-    };
+    let connection_context = req
+        .extensions()
+        .get::<WsConnectionContext>()
+        .cloned()
+        .unwrap_or_default();
+    let id = connection_context
+        .client_id
+        .clone()
+        .or_else(|| options.get("client_id").cloned())
+        .unwrap_or_default();
 
     let is_transport = options.contains_key("is_transport");
 
@@ -429,7 +448,15 @@ pub async fn ws_route(
 
     info!("[WS] New connection with 16MB continuation limit");
 
-    let (response, session, stream) = actix_ws::handle(&req, body)?;
+    let (response, session, stream) = match actix_ws::handle(&req, body) {
+        Ok(upgrade) => upgrade,
+        Err(error) => {
+            if let Some(callback) = &connection_context.on_disconnect {
+                callback();
+            }
+            return Err(error);
+        }
+    };
 
     let stream = stream
         .max_frame_size(16 * 1024 * 1024)
@@ -443,6 +470,8 @@ pub async fn ws_route(
         stream,
         handle.server.clone(),
         handle.session_policy,
+        connection_context.allowed_world,
+        connection_context.on_disconnect,
     ));
 
     Ok(response)
@@ -473,10 +502,15 @@ pub async fn run_ws_session(
     mut stream: impl StreamExt<Item = Result<AggregatedMessage, actix_ws::ProtocolError>> + Unpin,
     server: Addr<Server>,
     policy: WsSessionPolicy,
+    allowed_world: Option<String>,
+    on_disconnect: Option<Arc<dyn Fn() + Send + Sync>>,
 ) {
     if let Err(error) = policy.validate() {
         log::error!("[WS] Refusing session with invalid policy: {}", error);
         let _ = session.close(None).await;
+        if let Some(callback) = on_disconnect {
+            callback();
+        }
         return;
     }
     // Two outbound lanes per connection (see `WsSender`): control traffic
@@ -496,6 +530,7 @@ pub async fn run_ws_session(
             },
             is_transport,
             sender: tx.clone(),
+            allowed_world,
         })
         .await
     {
@@ -503,6 +538,9 @@ pub async fn run_ws_session(
         Err(e) => {
             warn!("[WS] Failed to register session: {:?}", e);
             let _ = session.close(None).await;
+            if let Some(callback) = on_disconnect {
+                callback();
+            }
             return;
         }
     };
@@ -636,6 +674,9 @@ pub async fn run_ws_session(
         id: session_id,
         token: connection_token,
     });
+    if let Some(callback) = on_disconnect {
+        callback();
+    }
 
     // If the server requested a terminal close (e.g. a protocol-version
     // mismatch), close with that application code so the client can treat it as

@@ -17,6 +17,9 @@ pub struct Connect {
     pub id: Option<String>,
     pub is_transport: bool,
     pub sender: WsSender,
+    /// Optional application-authorized world for this socket. `None` preserves
+    /// the unrestricted engine behavior used by existing applications.
+    pub allowed_world: Option<String>,
 }
 
 /// Session is disconnected
@@ -89,7 +92,12 @@ impl Handler<Connect> for Server {
     type Result = MessageResult<Connect>;
 
     fn handle(&mut self, msg: Connect, ctx: &mut Context<Self>) -> Self::Result {
-        let result = self.register_session(msg.id, msg.is_transport, msg.sender);
+        let result = self.register_session_with_world(
+            msg.id,
+            msg.is_transport,
+            msg.sender,
+            msg.allowed_world,
+        );
         self.reconcile_gc(ctx);
         MessageResult(result)
     }

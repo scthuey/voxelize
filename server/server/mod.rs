@@ -42,8 +42,8 @@ use crate::{
     errors::AddWorldError,
     perf,
     world::{
-        check_protocol, Chunks, ClientPreferencesPatch, InboundStateBuffer, MotionProtocol, Registry,
-        World, PROTOCOL_MISMATCH_CLOSE_CODE, PROTOCOL_VERSION,
+        check_protocol, Chunks, ClientPreferencesPatch, InboundStateBuffer, MotionProtocol,
+        Registry, World, PROTOCOL_MISMATCH_CLOSE_CODE, PROTOCOL_VERSION,
     },
     ClientJoinRequest, ClientLeaveRequest, ClientRequest, GetInfo, Preload, Prepare, RtcSenders,
     SyncWorld, Tick, TransportJoinRequest, TransportLeaveRequest,
@@ -406,6 +406,11 @@ pub struct Server {
     /// Value: (sender, world_name, connection_token)
     pub connections: HashMap<String, (WsSender, String, String)>,
 
+    /// Optional application authorization for a connection: client id ->
+    /// (connection token, allowed world). Kept separate so the public session
+    /// tuple and unrestricted default behavior remain unchanged.
+    connection_world_guards: HashMap<String, (String, String)>,
+
     /// Worlds with a tick already queued or running.
     pending_world_ticks: HashSet<String>,
 
@@ -741,6 +746,14 @@ impl Server {
     /// join -> ack unanswered -> retry -> "already in world" -> disconnect
     /// loops in live deployments.
     fn on_join(&mut self, id: &str, json: OnJoinRequest) -> Option<String> {
+        if let Some((_, allowed_world)) = self.connection_world_guards.get(id) {
+            if allowed_world != &json.world {
+                return Some(format!(
+                    "This connection is authorized for world {}, not {}.",
+                    allowed_world, json.world
+                ));
+            }
+        }
         let preferences = json
             .flat_preferences
             .merge(json.preferences.unwrap_or_default());
@@ -871,6 +884,16 @@ impl Server {
         is_transport: bool,
         sender: WsSender,
     ) -> (String, String) {
+        self.register_session_with_world(id, is_transport, sender, None)
+    }
+
+    pub(crate) fn register_session_with_world(
+        &mut self,
+        id: Option<String>,
+        is_transport: bool,
+        sender: WsSender,
+        allowed_world: Option<String>,
+    ) -> (String, String) {
         let id = id.unwrap_or_else(|| nanoid!());
         let token = nanoid!();
 
@@ -909,6 +932,12 @@ impl Server {
 
         self.lost_sessions
             .insert(id.to_owned(), (sender, token.clone()));
+        if let Some(allowed_world) = allowed_world {
+            self.connection_world_guards
+                .insert(id.clone(), (token.clone(), allowed_world));
+        } else {
+            self.connection_world_guards.remove(&id);
+        }
 
         (id, token)
     }
@@ -917,6 +946,13 @@ impl Server {
     /// world membership. Token-checked so a stale disconnect from a kicked
     /// socket cannot remove its replacement's state.
     pub(crate) fn unregister_session(&mut self, id: &str, token: &str) {
+        if self
+            .connection_world_guards
+            .get(id)
+            .is_some_and(|(current_token, _)| current_token == token)
+        {
+            self.connection_world_guards.remove(id);
+        }
         if let Some((_, _, current_token)) = self.connections.get(id) {
             if current_token == token {
                 let (_, world_name, _) = self.connections.remove(id).unwrap();

@@ -950,6 +950,7 @@ mod runtime_lifecycle_tests {
                     id: Some("bot".into()),
                     is_transport: false,
                     sender,
+                    allowed_world: None,
                 })
                 .await
                 .unwrap();
@@ -1056,6 +1057,7 @@ mod runtime_lifecycle_tests {
                     id: Some("bot".into()),
                     is_transport: false,
                     sender,
+                    allowed_world: None,
                 })
                 .await
                 .unwrap();
@@ -1101,6 +1103,7 @@ mod runtime_lifecycle_tests {
                     id: Some("bot".into()),
                     is_transport: false,
                     sender,
+                    allowed_world: None,
                 })
                 .await
                 .unwrap();
@@ -1155,6 +1158,7 @@ mod runtime_lifecycle_tests {
                     id: Some("a".into()),
                     is_transport: false,
                     sender: sender_a,
+                    allowed_world: None,
                 })
                 .await
                 .unwrap();
@@ -1170,6 +1174,7 @@ mod runtime_lifecycle_tests {
                     id: Some("b".into()),
                     is_transport: false,
                     sender: sender_b,
+                    allowed_world: None,
                 })
                 .await
                 .unwrap();
@@ -1204,6 +1209,7 @@ mod runtime_lifecycle_tests {
                     id: Some("bot".into()),
                     is_transport: false,
                     sender,
+                    allowed_world: None,
                 })
                 .await
                 .unwrap();
@@ -1331,6 +1337,7 @@ mod runtime_lifecycle_tests {
                     id: Some("bot".into()),
                     is_transport: false,
                     sender,
+                    allowed_world: None,
                 })
                 .await
                 .unwrap();
@@ -1367,6 +1374,44 @@ mod runtime_lifecycle_tests {
             let _ = handle_1;
             let stats_2 = handle_2.addr.send(GetWorldStats).await.unwrap();
             assert_eq!(stats_2.client_count, 1, "client resolved into w2");
+        });
+    }
+
+    #[test]
+    fn connection_world_guard_rejects_joining_another_world() {
+        actix::System::new().block_on(async {
+            let addr = Server::new().debug(false).build().start();
+            for name in ["authorized", "other"] {
+                addr.send(CreateWorld {
+                    name: name.into(),
+                    config: WorldConfig::new().build(),
+                    gc_policy: GcPolicy::Never,
+                })
+                .await
+                .unwrap()
+                .expect("create world");
+            }
+            let (sender, _rx) = fake_socket();
+            let (id, token) = addr
+                .send(Connect {
+                    id: Some("guarded".into()),
+                    is_transport: false,
+                    sender,
+                    allowed_world: Some("authorized".into()),
+                })
+                .await
+                .unwrap();
+            assert!(addr
+                .send(client_message(&id, &token, join_message("other")))
+                .await
+                .unwrap()
+                .is_some());
+            assert_eq!(
+                addr.send(client_message(&id, &token, join_message("authorized")))
+                    .await
+                    .unwrap(),
+                None
+            );
         });
     }
 }
