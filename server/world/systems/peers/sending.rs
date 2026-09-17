@@ -1,3 +1,4 @@
+use hashbrown::HashSet;
 use specs::{ReadExpect, ReadStorage, System, WriteExpect, WriteStorage};
 
 use crate::{
@@ -40,17 +41,17 @@ impl<'a> System<'a> for PeersSendingSystem {
 
         // Collect the peers whose metadata (position, direction, flags...)
         // changed this tick, along with their positions for relevance checks.
-        let mut changed: Vec<(PeerProtocol, Option<[f32; 3]>)> = vec![];
+        let mut peers: Vec<(PeerProtocol, Option<[f32; 3]>)> = vec![];
+        let mut changed = HashSet::new();
         for (id, name, metadata, position, _) in
             (&ids, &names, &mut metadatas, positions.maybe(), &flag).join()
         {
             let (json_str, updated) = metadata.to_cached_str();
 
-            if !updated {
-                continue;
+            if updated {
+                changed.insert(id.0.to_owned());
             }
-
-            changed.push((
+            peers.push((
                 PeerProtocol {
                     id: id.0.to_owned(),
                     username: name.0.to_owned(),
@@ -76,7 +77,8 @@ impl<'a> System<'a> for PeersSendingSystem {
                 .get(client.entity)
                 .map(|p| [p.0 .0, p.0 .1, p.0 .2]);
 
-            for (peer, peer_pos) in &changed {
+            let client_moved = changed.contains(client_id);
+            for (peer, peer_pos) in &peers {
                 // A client is authoritative over its own pose; echoing it back
                 // is wasted bandwidth and lets a buggy client create a
                 // self-peer.
@@ -96,7 +98,14 @@ impl<'a> System<'a> for PeersSendingSystem {
                     _ => true,
                 };
 
-                if relevant {
+                // With spatial interest, moving either endpoint can cross the
+                // boundary. Re-send a stationary peer when the receiving
+                // client moves so entering its radius never leaves a frozen or
+                // missing avatar. Unlimited worlds retain changed-only traffic.
+                if relevant
+                    && (config.peer_visible_radius.is_some() && client_moved
+                        || changed.contains(&peer.id))
+                {
                     replicated_state.stage_peer_update(client_id, peer.clone());
                 }
             }
@@ -105,7 +114,10 @@ impl<'a> System<'a> for PeersSendingSystem {
         // Transports observe the whole world, so they receive the full
         // change set directly (no interest filtering, no coalescing).
         if !transports.is_empty() {
-            let peers: Vec<PeerProtocol> = changed.into_iter().map(|(peer, _)| peer).collect();
+            let peers: Vec<PeerProtocol> = peers
+                .into_iter()
+                .filter_map(|(peer, _)| changed.contains(&peer.id).then_some(peer))
+                .collect();
             let message = Message::new(&MessageType::Peer)
                 .peers(&peers)
                 .tick(stats.dispatch_count())
