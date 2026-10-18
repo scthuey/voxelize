@@ -81,7 +81,16 @@ fn bench_pathfinding(c: &mut Criterion) {
                 .or_insert_with(|| raw_passable(vx, vy, vz))
         };
         assert!(
-            find_path(start, goal, height, max_depth, max_time, &passable).is_some(),
+            find_path(
+                start,
+                goal,
+                height,
+                max_depth,
+                max_time,
+                &passable,
+                &|x, y, z| { !passable(x, y, z) }
+            )
+            .is_some(),
             "benchmark setup produced no path; check the flat world",
         );
     }
@@ -100,8 +109,9 @@ fn bench_pathfinding(c: &mut Criterion) {
                         .entry((vx, vy, vz))
                         .or_insert_with(|| raw_passable(vx, vy, vz))
                 };
+                let ground = |x: i32, y: i32, z: i32| !passable(x, y, z);
                 black_box(find_path(
-                    start, goal, height, max_depth, max_time, &passable,
+                    start, goal, height, max_depth, max_time, &passable, &ground,
                 ));
             });
         });
@@ -118,8 +128,9 @@ fn bench_pathfinding(c: &mut Criterion) {
                         .entry((vx, vy, vz))
                         .or_insert_with(|| raw_passable(vx, vy, vz))
                 };
+                let ground = |x: i32, y: i32, z: i32| !passable(x, y, z);
                 black_box(find_path(
-                    start, goal, height, max_depth, max_time, &passable,
+                    start, goal, height, max_depth, max_time, &passable, &ground,
                 ));
             });
         });

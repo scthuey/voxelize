@@ -2,8 +2,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::{
-    find_path, Chunks, PathComp, Registry, RigidBodyComp, TargetComp, Vec3, VoxelAccess,
-    WorldConfig,
+    find_path, Chunks, PathComp, PathObstacles, Registry, RigidBodyComp, TargetComp, Vec3,
+    VoxelAccess, WorldConfig,
 };
 use specs::{ReadExpect, ReadStorage, System, WriteStorage};
 
@@ -17,13 +17,15 @@ impl<'a> System<'a> for PathFindingSystem {
         ReadStorage<'a, RigidBodyComp>,
         ReadStorage<'a, TargetComp>,
         WriteStorage<'a, PathComp>,
+        Option<ReadExpect<'a, PathObstacles>>,
     );
 
     fn run(&mut self, data: Self::SystemData) {
         use rayon::prelude::*;
         use specs::ParJoin;
 
-        let (chunks, registry, _config, bodies, targets, mut paths) = data;
+        let (chunks, registry, _config, bodies, targets, mut paths, obstacles) = data;
+        let obstacles = obstacles.as_deref();
 
         (&bodies, &targets, &mut paths)
             .par_join()
@@ -36,7 +38,7 @@ impl<'a> System<'a> for PathFindingSystem {
                 // parallel searches never contend on a shared lock.
                 let voxel_cache: RefCell<HashMap<(i32, i32, i32), bool>> =
                     RefCell::new(HashMap::new());
-                let is_passable = |vx: i32, vy: i32, vz: i32| -> bool {
+                let voxel_passable = |vx: i32, vy: i32, vz: i32| -> bool {
                     *voxel_cache
                         .borrow_mut()
                         .entry((vx, vy, vz))
@@ -46,6 +48,12 @@ impl<'a> System<'a> for PathFindingSystem {
                             block.is_passable || block.is_fluid
                         })
                 };
+                // Obstacles block the space a body needs; only voxels hold it up.
+                let is_passable = |vx: i32, vy: i32, vz: i32| -> bool {
+                    voxel_passable(vx, vy, vz)
+                        && !obstacles.is_some_and(|obstacles| obstacles.blocks(vx, vy, vz))
+                };
+                let is_ground = |vx: i32, vy: i32, vz: i32| -> bool { !voxel_passable(vx, vy, vz) };
 
                 // Lenient start check: allow standing on edges and non-full blocks.
                 let is_position_supported = |pos: &Vec3<i32>, aabb_width: f32| -> bool {
@@ -165,6 +173,7 @@ impl<'a> System<'a> for PathFindingSystem {
                     entity_path.max_depth_search,
                     entity_path.max_pathfinding_time,
                     &is_passable,
+                    &is_ground,
                 );
 
                 match path {
@@ -173,7 +182,7 @@ impl<'a> System<'a> for PathFindingSystem {
                             .iter()
                             .map(|p| Vec3(p.0, p.1, p.2))
                             .collect::<Vec<_>>();
-                        smooth_path(&mut path_nodes, &chunks, &registry, height);
+                        smooth_path(&mut path_nodes, &chunks, &registry, obstacles, height);
                         entity_path.path = Some(path_nodes);
                     }
                     _ => {
@@ -184,7 +193,13 @@ impl<'a> System<'a> for PathFindingSystem {
     }
 }
 
-fn smooth_path(path: &mut Vec<Vec3<i32>>, chunks: &Chunks, registry: &Registry, height: f32) {
+fn smooth_path(
+    path: &mut Vec<Vec3<i32>>,
+    chunks: &Chunks,
+    registry: &Registry,
+    obstacles: Option<&PathObstacles>,
+    height: f32,
+) {
     if path.len() < 3 {
         return;
     }
@@ -218,7 +233,7 @@ fn smooth_path(path: &mut Vec<Vec3<i32>>, chunks: &Chunks, registry: &Registry, 
             }
         }
 
-        if can_walk_directly_with_clearance(&from, &to, chunks, registry, height) {
+        if can_walk_directly_with_clearance(&from, &to, chunks, registry, obstacles, height) {
             validated_path.push(to.clone());
         } else {
             let original_idx = path.iter().position(|p| *p == from).unwrap_or(0);
@@ -295,9 +310,10 @@ fn can_walk_directly_with_clearance(
     to: &Vec3<i32>,
     chunks: &Chunks,
     registry: &Registry,
+    obstacles: Option<&PathObstacles>,
     height: f32,
 ) -> bool {
-    if !can_walk_directly(from, to, chunks, registry, height) {
+    if !can_walk_directly(from, to, chunks, registry, obstacles, height) {
         return false;
     }
 
@@ -331,7 +347,14 @@ fn can_walk_directly_with_clearance(
             (to.2 as f32 + offset_z).round() as i32,
         );
 
-        if !can_walk_directly(&offset_from, &offset_to, chunks, registry, height) {
+        if !can_walk_directly(
+            &offset_from,
+            &offset_to,
+            chunks,
+            registry,
+            obstacles,
+            height,
+        ) {
             return false;
         }
     }
@@ -379,6 +402,7 @@ fn can_walk_directly(
     to: &Vec3<i32>,
     chunks: &Chunks,
     registry: &Registry,
+    obstacles: Option<&PathObstacles>,
     height: f32,
 ) -> bool {
     let dx = to.0 - from.0;
@@ -407,7 +431,7 @@ fn can_walk_directly(
         let y = from.1 + ((dy as f32 * i as f32 / steps as f32).round() as i32);
 
         // Check if position is walkable
-        if !is_position_walkable(x, y, z, chunks, registry, height) {
+        if !is_position_walkable(x, y, z, chunks, registry, obstacles, height) {
             return false;
         }
 
@@ -420,9 +444,12 @@ fn can_walk_directly(
             // Check the two cells that form the "corner" when moving diagonally
             if x != prev_x && z != prev_z {
                 // We're moving diagonally, check if we can navigate the corner
-                let corner_clear = is_position_walkable(x, y, z, chunks, registry, height);
-                let side1_clear = is_position_walkable(prev_x, y, z, chunks, registry, height);
-                let side2_clear = is_position_walkable(x, y, prev_z, chunks, registry, height);
+                let corner_clear =
+                    is_position_walkable(x, y, z, chunks, registry, obstacles, height);
+                let side1_clear =
+                    is_position_walkable(prev_x, y, z, chunks, registry, obstacles, height);
+                let side2_clear =
+                    is_position_walkable(x, y, prev_z, chunks, registry, obstacles, height);
 
                 if !corner_clear && !side1_clear && !side2_clear {
                     return false;
@@ -441,6 +468,7 @@ fn is_position_walkable(
     z: i32,
     chunks: &Chunks,
     registry: &Registry,
+    obstacles: Option<&PathObstacles>,
     height: f32,
 ) -> bool {
     // Check ground below
@@ -458,7 +486,9 @@ fn is_position_walkable(
         let check_block = registry.get_block_by_id(check_voxel);
 
         // Space must be passable
-        if !check_block.is_passable {
+        if !check_block.is_passable
+            || obstacles.is_some_and(|obstacles| obstacles.blocks(x, y + h, z))
+        {
             return false;
         }
     }

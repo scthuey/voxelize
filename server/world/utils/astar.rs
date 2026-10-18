@@ -63,6 +63,10 @@ impl AStar {
 /// any ECS or chunk dependencies and the caller owns the voxel cache. Callers
 /// should back `is_passable` with a per-search cache (no shared locking) so
 /// concurrent searches never contend.
+///
+/// `is_ground` is whether a cell can be stood on. It is usually
+/// `!is_passable`, but a cell can be neither - an obstacle that blocks a body
+/// without being somewhere to stand (see `PathObstacles`).
 pub fn find_path(
     start: &Vec3<i32>,
     goal: &Vec3<i32>,
@@ -70,10 +74,11 @@ pub fn find_path(
     max_depth_search: i32,
     max_pathfinding_time: Duration,
     is_passable: &dyn Fn(i32, i32, i32) -> bool,
+    is_ground: &dyn Fn(i32, i32, i32) -> bool,
 ) -> Option<(Vec<PathNode>, u32)> {
     // Whether an entity of `height` can stand on top of the block at (vx, vy, vz).
     let walkable = |vx: i32, vy: i32, vz: i32| -> bool {
-        if is_passable(vx, vy, vz) {
+        if !is_ground(vx, vy, vz) {
             return false;
         }
         for i in 1..(height.ceil() as i32 + 1) {
@@ -271,4 +276,38 @@ pub fn find_path(
         // optimal while exploring far fewer nodes than a scaled-down estimate.
         &|p| p.distance(&PathNode(goal.0, goal.1, goal.2)),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Flat ground at y = 0, open air above, and a wall of obstacle cells
+    /// across x = 5 from z = -4 to 4, two cells high: blocked, not ground.
+    fn search(goal: Vec3<i32>) -> Option<Vec<PathNode>> {
+        let wall = |x: i32, y: i32, z: i32| x == 5 && (-4..=4).contains(&z) && (1..=2).contains(&y);
+        let is_passable = |x: i32, y: i32, z: i32| y > 0 && !wall(x, y, z);
+        let is_ground = |_: i32, y: i32, _: i32| y <= 0;
+        find_path(
+            &Vec3(0, 1, 0),
+            &goal,
+            1.0,
+            10_000,
+            Duration::from_secs(1),
+            &is_passable,
+            &is_ground,
+        )
+        .map(|(nodes, _)| nodes)
+    }
+
+    #[test]
+    fn a_path_goes_around_an_obstacle_and_never_over_it() {
+        let nodes = search(Vec3(10, 1, 0)).expect("a way round the wall");
+        assert!(nodes
+            .iter()
+            .all(|PathNode(x, y, z)| !(*x == 5 && (-4..=4).contains(z)) && *y == 1));
+        assert!(nodes.iter().any(|PathNode(_, _, z)| z.abs() > 4));
+        // The wall's top is not ground, so nothing up there can be reached.
+        assert!(search(Vec3(5, 3, 0)).is_none());
+    }
 }
