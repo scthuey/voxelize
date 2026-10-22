@@ -82,13 +82,12 @@ export class Chunk extends RawChunk {
 
         subMesh.geometry?.dispose();
 
-        if (subMesh.material) {
-          if (Array.isArray(subMesh.material)) {
-            subMesh.material.forEach((mat) => mat.dispose());
-          } else {
-            subMesh.material.dispose();
-          }
-        }
+        // The material is not this chunk's to dispose: every chunk mesh draws
+        // with a material the world shares across chunks and owns in
+        // `chunkRenderer.materials`, disposed with the world. Disposing it here
+        // made three.js release the shared shader program each time a chunk
+        // unloaded, and every chunk still using it recompiled synchronously on
+        // the next frame - a 100-300 ms stall per unload while walking.
 
         if (subMesh.parent) {
           subMesh.parent.remove(subMesh);
