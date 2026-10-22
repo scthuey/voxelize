@@ -2,7 +2,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use byteorder::{ByteOrder, LittleEndian};
 use hashbrown::{HashMap, HashSet};
 use libflate::zlib::{Decoder, Encoder};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use specs::Entity;
 use std::sync::Arc;
@@ -24,6 +24,7 @@ use super::{
     background_chunk_saver::{ChunkSaveData, CHUNK_FILE_VERSION},
     chunk::{Chunk, ChunkRenewal},
     space::{SpaceBuilder, SpaceOptions},
+    watch::VoxelWatch,
 };
 
 #[derive(Eq, PartialEq, Clone)]
@@ -91,14 +92,19 @@ fn backfill_waterlogged_voxels(chunk: &mut Chunk, registry: &Registry) -> bool {
     let Vec3(max_x, max_y, max_z) = chunk.max;
 
     let mut submerged = Vec::new();
+    let mut overfull = Vec::new();
     for vx in min_x..max_x {
         for vz in min_z..max_z {
             for vy in min_y..max_y {
                 let raw = chunk.get_raw_voxel(vx, vy, vz);
+                if registry.is_overfull_waterlog(raw) {
+                    overfull.push(Vec3(vx, vy, vz));
+                    continue;
+                }
                 if BlockUtils::extract_waterlogged(raw) {
                     continue;
                 }
-                if !registry.is_waterloggable(BlockUtils::extract_id(raw)) {
+                if !registry.is_waterloggable_voxel(raw) {
                     continue;
                 }
                 let touches_fluid = ORTHOGONAL_NEIGHBORS.iter().any(|[ox, oy, oz]| {
@@ -115,8 +121,66 @@ fn backfill_waterlogged_voxels(chunk: &mut Chunk, registry: &Registry) -> bool {
     for Vec3(vx, vy, vz) in &submerged {
         chunk.set_voxel_waterlogged(*vx, *vy, *vz, true);
     }
+    // A branch saved waterlogged at a stage that fills its voxel is invalid:
+    // it loads dry, and the water it held is reported lost.
+    for voxel in &overfull {
+        let Vec3(vx, vy, vz) = *voxel;
+        let raw = chunk.get_raw_voxel(vx, vy, vz);
+        error!(
+            "{} at {:?} was saved waterlogged at stage {}, which leaves it no room for water: \
+             loaded it dry, losing water at level {}",
+            registry.get_block_by_id(BlockUtils::extract_id(raw)).name,
+            voxel,
+            BlockUtils::extract_stage(raw),
+            BlockUtils::extract_waterlog_level(raw),
+        );
+        chunk.set_raw_voxel(
+            vx,
+            vy,
+            vz,
+            BlockUtils::insert_waterlog_level(BlockUtils::insert_waterlogged(raw, false), 0),
+        );
+    }
 
-    !submerged.is_empty()
+    !submerged.is_empty() || !overfull.is_empty()
+}
+
+/// Work carried past a tick's budget, from the tick it first was.
+#[derive(Clone, Debug)]
+pub(crate) struct CarriedBacklog {
+    pub since_tick: u64,
+    pub peak: usize,
+}
+
+/// One chunk's share of pending writes, see
+/// `Chunks::pending_update_head_report`.
+#[derive(Clone, Debug)]
+pub struct PendingUpdateHeadEntry {
+    pub lane: UpdateLane,
+    /// Waiting in `Chunks::parked_updates` for the chunk's light footprint,
+    /// rather than queued on the lane itself.
+    pub is_parked: bool,
+    pub coords: Vec2<i32>,
+    pub count: usize,
+    /// `Debug` form of the chunk status, or `unloaded` when the chunk is not
+    /// in the map at all.
+    pub status: String,
+    /// Chunks in the light footprint that are not `Ready`; the updating pass
+    /// waits on all of them, not only the target.
+    pub unready_neighbors: usize,
+}
+
+/// A write popped off its lane whose chunk was not ready, waiting in
+/// `Chunks::parked_updates` with the lane it goes back to.
+pub type ParkedUpdate = (Vec3<i32>, u32, UpdateLane);
+
+/// Which queue a pending voxel update drains from. See `Chunks::active_updates`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum UpdateLane {
+    /// Writes from outside the simulation: player edits, methods, commands.
+    External,
+    /// Writes the simulation produced: fluid steps, growth, active tickers.
+    Active,
 }
 
 /// A manager for all chunks in the Voxelize world.
@@ -131,6 +195,33 @@ pub struct Chunks {
     /// Staging area for new voxel updates (deduplicates before flushing to queue).
     pub(crate) updates_staging: HashMap<Vec3<i32>, u32>,
 
+    /// Voxel updates the world's own simulation produced — fluid steps,
+    /// growth, active-block tickers — waiting to be processed. A separate
+    /// lane from `updates` so a spreading lake and a bulk player build each
+    /// drain under their own per-tick budget (`max_updates_per_tick` vs
+    /// `max_active_updates_per_tick`) instead of queueing behind one another:
+    /// on a world budgeted at 100 external writes a tick, one large fill used
+    /// to freeze every fluid in the world for seconds.
+    pub(crate) active_updates: VecDeque<VoxelUpdate>,
+
+    /// Staging area for `active_updates`, deduplicated before flushing.
+    pub(crate) active_updates_staging: HashMap<Vec3<i32>, u32>,
+
+    /// Simulation writes an external write to the same voxel superseded,
+    /// since the world started (`superseded_active_updates`).
+    superseded_active_updates: u64,
+
+    /// Writes popped for a chunk whose light footprint was not ready, keyed
+    /// by that chunk. They wait here instead of back at the head of their
+    /// lane: handed back to the head, a stuck set larger than the per-tick
+    /// budget is all a tick ever pops, and every write behind it starves for
+    /// as long as the chunk stays unloaded (a 13k-voxel fill straddling one
+    /// unloaded neighbor froze a 4000-a-tick lane outright). Re-admitted to
+    /// the front of their lane, in order, the tick the footprint is ready.
+    /// Counted by `pending_updates_count` and named by
+    /// `pending_update_head_report`, so a park that never empties is visible.
+    pub(crate) parked_updates: HashMap<Vec2<i32>, Vec<ParkedUpdate>>,
+
     /// A list of chunks that are done meshing and ready to be sent.
     pub(crate) to_send: VecDeque<(Vec2<i32>, MessageType)>,
 
@@ -139,6 +230,45 @@ pub struct Chunks {
 
     pub(crate) active_voxel_heap: BinaryHeap<Reverse<ActiveVoxel>>,
     pub(crate) active_voxel_set: HashMap<Vec3<i32>, u64>,
+
+    /// Due voxels a tick's planning budget (`max_active_plan_ms_per_tick`)
+    /// did not reach, oldest first; they plan ahead of the next tick's own.
+    /// Popped off the schedule as if they had run on time, so a mark meanwhile
+    /// schedules a later run just as it would after one.
+    pub(crate) overdue_active_voxels: VecDeque<Vec3<i32>>,
+
+    /// Exactly the voxels in `overdue_active_voxels`: a voxel that comes due
+    /// again while it waits there runs once, not twice.
+    pub(crate) overdue_active_set: HashSet<Vec3<i32>>,
+
+    /// Due wakes of blocks that hand them to the game
+    /// (`Block::hands_off_wakes`), oldest first, until a game system takes
+    /// them ([`Self::take_handed_wakes`]). Exactly the voxels in
+    /// `handed_wake_set`: a voxel due twice before it is taken waits once.
+    pub(crate) handed_wakes: Vec<Vec3<i32>>,
+    pub(crate) handed_wake_set: HashSet<Vec3<i32>>,
+
+    /// Voxels a write touched (the written voxel and its neighbors) whose
+    /// active tickers are still to be asked when they next want to run, in
+    /// the order their ticks queued them. Drained under
+    /// `max_ticker_consult_ms_per_tick`; what a tick does not reach waits
+    /// here, ahead of the next tick's own.
+    pub(crate) ticker_consults: VecDeque<Vec3<i32>>,
+
+    /// Whether each queued consult is for a written voxel, which consults
+    /// whatever it became, rather than a neighbor, which only consults real
+    /// blocks and fluids. Holds exactly the voxels in `ticker_consults`.
+    pub(crate) ticker_consult_written: HashMap<Vec3<i32>, bool>,
+
+    /// Since when wake work (`overdue_active_voxels`, `ticker_consults`) has
+    /// been carried past a tick's budget, and the most that waited at once:
+    /// reported once the backlog clears.
+    pub(crate) wake_backlog: Option<CarriedBacklog>,
+
+    /// Since when external writes have been carried past a tick's write
+    /// budget (`max_update_ms_per_tick`), and the most that waited at once:
+    /// reported once the lane empties.
+    pub(crate) write_backlog: Option<CarriedBacklog>,
 
     /// A listener for when a chunk is done generating or meshing.
     pub(crate) listeners: HashMap<Vec2<i32>, Vec<Vec2<i32>>>,
@@ -150,7 +280,13 @@ pub struct Chunks {
 
     pub(crate) freshly_created: HashSet<Vec2<i32>>,
 
-    pub newly_generated: Vec<Vec2<i32>>,
+    /// Optional application work before an unobserved chunk becomes visible.
+    /// Kept separate from voxel readiness: physics can read a ready chunk while
+    /// its residents or other application state are still being initialized.
+    pub activation: ChunkActivation,
+
+    /// Writes and random-tick samples of the block ids a game system follows.
+    pub watch: VoxelWatch,
 
     config: WorldConfig,
 
@@ -158,6 +294,49 @@ pub struct Chunks {
     folder: Option<PathBuf>,
 
     waterlogging_rules: Option<Arc<WaterloggingRules>>,
+}
+
+/// A delivery barrier shared by generated, disk-loaded and cached chunks.
+/// Applications opt in and acknowledge each activation after their state is
+/// replicated. Worlds without activation hooks retain ordinary streaming.
+#[derive(Default)]
+pub struct ChunkActivation {
+    pub enabled: bool,
+    pending: Vec<Vec2<i32>>,
+    delivery: HashMap<Vec2<i32>, u64>,
+}
+impl ChunkActivation {
+    pub fn request(&mut self, coords: &Vec2<i32>) {
+        if self.enabled && !self.delivery.contains_key(coords) {
+            self.delivery.insert(coords.clone(), u64::MAX);
+            self.pending.push(coords.clone());
+        }
+    }
+    pub fn take_pending(&mut self) -> Vec<Vec2<i32>> {
+        std::mem::take(&mut self.pending)
+    }
+    pub fn complete(&mut self, coords: &Vec2<i32>, ready_dispatch: u64) {
+        if let Some(ready) = self.delivery.get_mut(coords) {
+            *ready = ready_dispatch;
+        }
+    }
+    pub fn blocks_delivery(&self, coords: &Vec2<i32>, dispatch: u64) -> bool {
+        self.enabled
+            && self
+                .delivery
+                .get(coords)
+                .is_some_and(|ready| dispatch < *ready)
+    }
+    pub fn release_completed(&mut self, dispatch: u64) {
+        self.delivery.retain(|_, ready| *ready > dispatch);
+    }
+    pub fn cancel(&mut self, coords: &Vec2<i32>) {
+        self.delivery.remove(coords);
+    }
+    pub fn clear(&mut self) {
+        self.pending.clear();
+        self.delivery.clear();
+    }
 }
 
 impl Chunks {
@@ -215,11 +394,20 @@ impl Chunks {
         self.to_save.clear();
         self.active_voxel_heap.clear();
         self.active_voxel_set.clear();
+        self.overdue_active_voxels.clear();
+        self.overdue_active_set.clear();
+        self.handed_wakes.clear();
+        self.handed_wake_set.clear();
+        self.ticker_consults.clear();
+        self.ticker_consult_written.clear();
+        self.wake_backlog = None;
+        self.write_backlog = None;
         self.listeners.clear();
         self.cache.clear();
         self.freshly_created.clear();
-        self.newly_generated.clear();
+        self.activation.clear();
         self.block_entities.clear();
+        self.watch.clear();
 
         if let Some(folder) = &self.folder {
             match fs::read_dir(folder) {
@@ -322,10 +510,11 @@ impl Chunks {
             Ok(data)
         };
 
-        let (voxels_result, height_map_result) = rayon::join(
-            || decode_base64(&data.voxels),
-            || decode_base64(&data.height_map),
-        );
+        // Sequential: the height map is a few KB, so splitting it off saved
+        // nothing, and from the world thread a `rayon::join` waited on the
+        // global pool.
+        let voxels_result = decode_base64(&data.voxels);
+        let height_map_result = decode_base64(&data.height_map);
 
         let voxels = match voxels_result {
             Ok(voxels) => voxels,
@@ -735,25 +924,235 @@ impl Chunks {
     /// committed before the half that depends on it. Random order let the
     /// dependent half commit first and watch its support "missing" for a tick.
     pub fn flush_staged_updates(&mut self) {
-        if self.updates_staging.is_empty() {
-            return;
+        if !self.updates_staging.is_empty() {
+            self.updates
+                .retain(|(v, _)| !self.updates_staging.contains_key(v));
+            // An external write to a voxel supersedes whatever the simulation
+            // still has queued for it: player intent wins, and the fluid or
+            // growth ticker that produced the stale write re-plans from the
+            // committed state on its next tick anyway. Each one counts, and
+            // names its voxel at debug, so a write that never landed (a block
+            // a felled tree left standing) can be traced to the one that won.
+            let staging = &self.updates_staging;
+            let mut superseded = 0u64;
+            let mut supersede = |voxel: &Vec3<i32>, raw: u32| {
+                let is_superseded = staging.contains_key(voxel);
+                if is_superseded {
+                    superseded += 1;
+                    debug!(
+                        "[chunk-updating] an external write to {voxel:?} supersedes the simulation's queued {raw:#x} there"
+                    );
+                }
+                !is_superseded
+            };
+            self.active_updates.retain(|(v, raw)| supersede(v, *raw));
+            self.active_updates_staging.retain(|v, raw| supersede(v, *raw));
+            for updates in self.parked_updates.values_mut() {
+                updates.retain(|(v, raw, lane)| match lane {
+                    UpdateLane::Active => supersede(v, *raw),
+                    UpdateLane::External => !staging.contains_key(v),
+                });
+            }
+            self.parked_updates.retain(|_, updates| !updates.is_empty());
+            self.superseded_active_updates += superseded;
+
+            let mut staged: Vec<(Vec3<i32>, u32)> = self.updates_staging.drain().collect();
+            staged.sort_by_key(|(voxel, _)| (voxel.1, voxel.0, voxel.2));
+            self.updates.extend(staged);
         }
 
-        self.updates
-            .retain(|(v, _)| !self.updates_staging.contains_key(v));
+        if !self.active_updates_staging.is_empty() {
+            self.active_updates
+                .retain(|(v, _)| !self.active_updates_staging.contains_key(v));
+            Self::retain_parked(&mut self.parked_updates, |(v, _, lane)| {
+                *lane != UpdateLane::Active || !self.active_updates_staging.contains_key(v)
+            });
 
-        let mut staged: Vec<(Vec3<i32>, u32)> = self.updates_staging.drain().collect();
-        staged.sort_by_key(|(voxel, _)| (voxel.1, voxel.0, voxel.2));
-
-        for (voxel, val) in staged {
-            self.updates.push_back((voxel, val));
+            let mut staged: Vec<(Vec3<i32>, u32)> = self.active_updates_staging.drain().collect();
+            staged.sort_by_key(|(voxel, _)| (voxel.1, voxel.0, voxel.2));
+            self.active_updates.extend(staged);
         }
+    }
+
+    /// Drop the simulation's queued and parked writes to `voxels`, each of
+    /// which an external write has just committed over: planned from the
+    /// world before it, they are stale, and the player's word is kept, as
+    /// for an external write staged after them (`flush_staged_updates`).
+    /// Each counts in `superseded_active_updates` and names its voxel at
+    /// debug. Returns how many went.
+    pub(crate) fn supersede_active_updates(&mut self, voxels: &HashSet<Vec3<i32>>) -> u64 {
+        let mut superseded = 0u64;
+        let mut supersede = |voxel: &Vec3<i32>, raw: u32| {
+            let is_superseded = voxels.contains(voxel);
+            if is_superseded {
+                superseded += 1;
+                debug!(
+                    "[chunk-updating] an external write committed at {voxel:?} supersedes the simulation's carried {raw:#x} there"
+                );
+            }
+            !is_superseded
+        };
+        self.active_updates.retain(|(voxel, raw)| supersede(voxel, *raw));
+        for updates in self.parked_updates.values_mut() {
+            updates.retain(|(voxel, raw, lane)| *lane != UpdateLane::Active || supersede(voxel, *raw));
+        }
+        self.parked_updates.retain(|_, updates| !updates.is_empty());
+        self.superseded_active_updates += superseded;
+        superseded
+    }
+
+    /// How many of the simulation's writes an external write to the same
+    /// voxel has superseded since the world started, staged after them or
+    /// committed while they were carried.
+    pub fn superseded_active_updates(&self) -> u64 {
+        self.superseded_active_updates
+    }
+
+    fn retain_parked(
+        parked: &mut HashMap<Vec2<i32>, Vec<ParkedUpdate>>,
+        mut keep: impl FnMut(&ParkedUpdate) -> bool,
+    ) {
+        for updates in parked.values_mut() {
+            updates.retain(|update| keep(update));
+        }
+        parked.retain(|_, updates| !updates.is_empty());
+    }
+
+    /// Whether writes into `coords` can commit now: the chunk and every chunk
+    /// its light can spill into are `Ready`.
+    pub fn is_update_footprint_ready(&self, coords: &Vec2<i32>) -> bool {
+        self.is_chunk_ready(coords)
+            && self
+                .light_traversed_chunks(coords)
+                .iter()
+                .all(|n| self.is_chunk_ready(n))
+    }
+
+    /// Set aside writes popped for a chunk whose footprint is not ready. See
+    /// `parked_updates`.
+    pub(crate) fn park_updates(&mut self, coords: Vec2<i32>, updates: Vec<ParkedUpdate>) {
+        self.parked_updates
+            .entry(coords)
+            .or_default()
+            .extend(updates);
+    }
+
+    /// Hand parked writes whose chunk footprint has become ready back to the
+    /// front of their lanes, in their original order. Returns how many moved.
+    pub(crate) fn readmit_parked_updates(&mut self) -> usize {
+        let ready: Vec<Vec2<i32>> = self
+            .parked_updates
+            .keys()
+            .filter(|coords| self.is_update_footprint_ready(coords))
+            .cloned()
+            .collect();
+        let mut readmitted = 0;
+        for coords in ready {
+            let Some(updates) = self.parked_updates.remove(&coords) else {
+                continue;
+            };
+            readmitted += updates.len();
+            for (voxel, raw, lane) in updates.into_iter().rev() {
+                self.lane_queue(lane).push_front((voxel, raw));
+            }
+        }
+        readmitted
     }
 
     pub fn update_voxels(&mut self, voxels: &[(Vec3<i32>, u32)]) {
         for (voxel, val) in voxels {
             self.update_voxel(voxel, *val);
         }
+    }
+
+    /// Queue a write produced by the world's own simulation (an active
+    /// updater or random tick) on the simulation lane. See `active_updates`.
+    pub fn update_active_voxel(&mut self, voxel: &Vec3<i32>, val: u32) {
+        self.active_updates_staging.insert(voxel.to_owned(), val);
+    }
+
+    pub fn update_active_voxels(&mut self, voxels: &[(Vec3<i32>, u32)]) {
+        for (voxel, val) in voxels {
+            self.update_active_voxel(voxel, *val);
+        }
+    }
+
+    /// The flushed queue of one lane.
+    pub(crate) fn lane_queue(&mut self, lane: UpdateLane) -> &mut VecDeque<VoxelUpdate> {
+        match lane {
+            UpdateLane::External => &mut self.updates,
+            UpdateLane::Active => &mut self.active_updates,
+        }
+    }
+
+    pub fn cancel_pending_updates_in_bounds(&mut self, min: &Vec3<i32>, max: &Vec3<i32>) -> usize {
+        let is_inside = |voxel: &Vec3<i32>| {
+            voxel.0 >= min.0
+                && voxel.0 <= max.0
+                && voxel.1 >= min.1
+                && voxel.1 <= max.1
+                && voxel.2 >= min.2
+                && voxel.2 <= max.2
+        };
+        let previous_count = self.pending_updates_count();
+        self.updates_staging.retain(|voxel, _| !is_inside(voxel));
+        self.updates.retain(|(voxel, _)| !is_inside(voxel));
+        self.active_updates_staging
+            .retain(|voxel, _| !is_inside(voxel));
+        self.active_updates.retain(|(voxel, _)| !is_inside(voxel));
+        Self::retain_parked(&mut self.parked_updates, |(voxel, _, _)| !is_inside(voxel));
+        previous_count - self.pending_updates_count()
+    }
+
+    pub fn pending_updates_in_bounds(
+        &self,
+        min: &Vec3<i32>,
+        max: &Vec3<i32>,
+    ) -> HashMap<Vec3<i32>, u32> {
+        let is_inside = |voxel: &Vec3<i32>| {
+            voxel.0 >= min.0
+                && voxel.0 <= max.0
+                && voxel.1 >= min.1
+                && voxel.1 <= max.1
+                && voxel.2 >= min.2
+                && voxel.2 <= max.2
+        };
+        let mut pending = HashMap::new();
+        // Simulation lane first so an external write to the same voxel is the
+        // one reported, matching the precedence `flush_staged_updates` applies.
+        // Parked writes precede their lane's queue for the same reason: a
+        // later write to the voxel is what would have displaced them.
+        for (voxel, value, lane) in self.parked_updates.values().flatten() {
+            if *lane == UpdateLane::Active && is_inside(voxel) {
+                pending.insert(voxel.clone(), *value);
+            }
+        }
+        for (voxel, value) in &self.active_updates {
+            if is_inside(voxel) {
+                pending.insert(voxel.clone(), *value);
+            }
+        }
+        for (voxel, value) in &self.active_updates_staging {
+            if is_inside(voxel) {
+                pending.insert(voxel.clone(), *value);
+            }
+        }
+        for (voxel, value, lane) in self.parked_updates.values().flatten() {
+            if *lane == UpdateLane::External && is_inside(voxel) {
+                pending.insert(voxel.clone(), *value);
+            }
+        }
+        for (voxel, value) in &self.updates {
+            if is_inside(voxel) {
+                pending.insert(voxel.clone(), *value);
+            }
+        }
+        for (voxel, value) in &self.updates_staging {
+            if is_inside(voxel) {
+                pending.insert(voxel.clone(), *value);
+            }
+        }
+        pending
     }
 
     /// Schedule `voxel` to become active at absolute tick `active_at`.
@@ -795,9 +1194,199 @@ impl Chunks {
         self.active_voxel_set.len()
     }
 
-    /// Number of voxel updates staged or queued but not yet committed.
+    /// Due voxels still to plan, carried from ticks that spent their
+    /// planning budget before reaching them. Not in `active_voxel_count`:
+    /// they are off the schedule, waiting to run.
+    pub fn overdue_active_voxel_count(&self) -> usize {
+        self.overdue_active_voxels.len()
+    }
+
+    /// Queue a due voxel to plan, unless it is already waiting to.
+    pub(crate) fn queue_overdue_active_voxel(&mut self, voxel: Vec3<i32>) {
+        if self.overdue_active_set.insert(voxel.clone()) {
+            self.overdue_active_voxels.push_back(voxel);
+        }
+    }
+
+    /// Hand a due wake to the game, once however often it comes due before
+    /// the game takes it.
+    pub(crate) fn hand_off_wake(&mut self, voxel: Vec3<i32>) {
+        if self.handed_wake_set.insert(voxel.clone()) {
+            self.handed_wakes.push(voxel);
+        }
+    }
+
+    /// Every wake handed to the game since the last take, oldest first: the
+    /// due voxels of blocks declared with `BlockBuilder::hand_off_wakes`.
+    /// Each is what the voxel was when it came due; the game reads the world
+    /// as it stands when it acts on one.
+    pub fn take_handed_wakes(&mut self) -> Vec<Vec3<i32>> {
+        self.handed_wake_set.clear();
+        std::mem::take(&mut self.handed_wakes)
+    }
+
+    /// The oldest due voxel still to plan.
+    pub(crate) fn pop_overdue_active_voxel(&mut self) -> Option<Vec3<i32>> {
+        let voxel = self.overdue_active_voxels.pop_front()?;
+        self.overdue_active_set.remove(&voxel);
+        Some(voxel)
+    }
+
+    /// Queue `voxel`'s active ticker to be consulted after the writes that
+    /// touched it have committed. A written voxel consults whatever it
+    /// became; a neighbor, only a real block or a fluid. A voxel is queued
+    /// once however many writes touch it, as written if any did.
+    pub(crate) fn queue_ticker_consult(&mut self, voxel: Vec3<i32>, is_written: bool) {
+        if let Some(written) = self.ticker_consult_written.get_mut(&voxel) {
+            *written |= is_written;
+            return;
+        }
+        self.ticker_consult_written
+            .insert(voxel.clone(), is_written);
+        self.ticker_consults.push_back(voxel);
+    }
+
+    /// The oldest queued consult, and whether it is for a written voxel.
+    pub(crate) fn pop_ticker_consult(&mut self) -> Option<(Vec3<i32>, bool)> {
+        let voxel = self.ticker_consults.pop_front()?;
+        let is_written = match self.ticker_consult_written.remove(&voxel) {
+            Some(is_written) => is_written,
+            None => {
+                error!(
+                    "ticker consult for {:?} was queued without its kind; consulting it as a written voxel",
+                    voxel
+                );
+                true
+            }
+        };
+        Some((voxel, is_written))
+    }
+
+    /// Ticker consults still owed, carried from ticks that spent their
+    /// consult budget before reaching them.
+    pub fn pending_ticker_consults(&self) -> usize {
+        self.ticker_consults.len()
+    }
+
+    /// Note the wake work still carried as `tick` ends. Once a backlog
+    /// clears, returns for how many ticks it was carried and the most that
+    /// waited at once.
+    pub(crate) fn note_wake_backlog(&mut self, tick: u64) -> Option<(u64, usize)> {
+        let carried = self.overdue_active_voxels.len() + self.ticker_consults.len();
+        if carried == 0 {
+            return self
+                .wake_backlog
+                .take()
+                .map(|backlog| (tick.saturating_sub(backlog.since_tick), backlog.peak));
+        }
+        let backlog = self.wake_backlog.get_or_insert(CarriedBacklog {
+            since_tick: tick,
+            peak: 0,
+        });
+        backlog.peak = backlog.peak.max(carried);
+        None
+    }
+
+    /// Note the external writes still queued as `tick` ends; `is_cut` when
+    /// the tick's write budget, rather than its count, stopped the lane. A
+    /// backlog starts on a cut tick and lasts until the lane empties; then
+    /// this returns for how many ticks it was carried and the most that
+    /// waited at once.
+    pub(crate) fn note_write_backlog(&mut self, tick: u64, is_cut: bool) -> Option<(u64, usize)> {
+        let waiting = self.updates.len();
+        if waiting == 0 {
+            return self
+                .write_backlog
+                .take()
+                .map(|backlog| (tick.saturating_sub(backlog.since_tick), backlog.peak));
+        }
+        if is_cut || self.write_backlog.is_some() {
+            let backlog = self.write_backlog.get_or_insert(CarriedBacklog {
+                since_tick: tick,
+                peak: 0,
+            });
+            backlog.peak = backlog.peak.max(waiting);
+        }
+        None
+    }
+
+    /// Number of voxel updates staged or queued but not yet committed, on
+    /// both the external and the simulation lane.
     pub fn pending_updates_count(&self) -> usize {
-        self.updates.len() + self.updates_staging.len()
+        self.updates.len()
+            + self.updates_staging.len()
+            + self.active_updates.len()
+            + self.active_updates_staging.len()
+            + self.parked_updates_count()
+    }
+
+    /// Simulation-lane share of `pending_updates_count`.
+    pub fn pending_active_updates_count(&self) -> usize {
+        self.active_updates.len()
+            + self.active_updates_staging.len()
+            + self
+                .parked_updates
+                .values()
+                .flatten()
+                .filter(|(_, _, lane)| *lane == UpdateLane::Active)
+                .count()
+    }
+
+    /// Writes waiting in `parked_updates` for a chunk footprint to load.
+    pub fn parked_updates_count(&self) -> usize {
+        self.parked_updates.values().map(Vec::len).sum()
+    }
+
+    /// Where the head of each lane is waiting. The updating pass pops the
+    /// first `budget` entries per tick and hands back any whose chunk (or
+    /// light footprint) is not ready, so a queue whose depth never falls has
+    /// a reason at its head; this names it, per chunk, for the operator.
+    pub fn pending_update_head_report(&self, limit: usize) -> Vec<PendingUpdateHeadEntry> {
+        let mut groups: HashMap<(UpdateLane, bool, Vec2<i32>), usize> = HashMap::new();
+        for (lane, queue) in [
+            (UpdateLane::External, &self.updates),
+            (UpdateLane::Active, &self.active_updates),
+        ] {
+            for (voxel, _) in queue.iter().take(limit) {
+                let coords = ChunkUtils::map_voxel_to_chunk(
+                    voxel.0,
+                    voxel.1,
+                    voxel.2,
+                    self.config.chunk_size,
+                );
+                *groups.entry((lane, false, coords)).or_insert(0) += 1;
+            }
+        }
+        for (coords, updates) in &self.parked_updates {
+            for (_, _, lane) in updates {
+                *groups.entry((*lane, true, coords.clone())).or_insert(0) += 1;
+            }
+        }
+
+        let mut report: Vec<PendingUpdateHeadEntry> = groups
+            .into_iter()
+            .map(|((lane, is_parked, coords), count)| {
+                let status = match self.raw(&coords) {
+                    None => "unloaded".to_owned(),
+                    Some(chunk) => format!("{:?}", chunk.status),
+                };
+                let unready_neighbors = self
+                    .light_traversed_chunks(&coords)
+                    .into_iter()
+                    .filter(|n| !self.is_chunk_ready(n))
+                    .count();
+                PendingUpdateHeadEntry {
+                    lane,
+                    is_parked,
+                    coords,
+                    count,
+                    status,
+                    unready_neighbors,
+                }
+            })
+            .collect();
+        report.sort_by(|a, b| b.count.cmp(&a.count));
+        report
     }
 
     /// Add a chunk to be saved. A world that does not save discards the request
@@ -894,6 +1483,7 @@ impl VoxelAccess for Chunks {
     fn set_raw_voxel(&mut self, vx: i32, vy: i32, vz: i32, id: u32) -> bool {
         if let Some(chunk) = self.raw_chunk_by_voxel_mut(vx, vy, vz) {
             chunk.set_raw_voxel(vx, vy, vz, id);
+            chunk.write_epoch = chunk.write_epoch.wrapping_add(1);
             self.add_updated_level_at(vx, vy, vz);
 
             return true;
@@ -919,6 +1509,7 @@ impl VoxelAccess for Chunks {
     fn set_raw_light(&mut self, vx: i32, vy: i32, vz: i32, level: u32) -> bool {
         if let Some(chunk) = self.raw_chunk_by_voxel_mut(vx, vy, vz) {
             chunk.set_raw_light(vx, vy, vz, level);
+            chunk.write_epoch = chunk.write_epoch.wrapping_add(1);
             self.add_updated_level_at(vx, vy, vz);
 
             return true;
@@ -1123,6 +1714,218 @@ mod pending_save_queue_tests {
             chunks.to_save.is_empty(),
             "a queue nothing drains must never be filled"
         );
+    }
+}
+
+#[cfg(test)]
+mod pending_update_projection_tests {
+    use super::*;
+    use crate::WorldConfig;
+
+    fn empty_chunks() -> Chunks {
+        Chunks::new(&WorldConfig::new().build())
+    }
+
+    #[test]
+    fn cancel_pending_updates_in_bounds_removes_queued_and_staged_work() {
+        let mut chunks = empty_chunks();
+        chunks.update_voxel(&Vec3(1, 1, 1), 2);
+        chunks.update_voxel(&Vec3(10, 1, 1), 2);
+        chunks.flush_staged_updates();
+        chunks.update_voxel(&Vec3(2, 2, 2), 3);
+        chunks.update_voxel(&Vec3(11, 2, 2), 3);
+
+        let removed = chunks.cancel_pending_updates_in_bounds(&Vec3(0, 0, 0), &Vec3(5, 5, 5));
+
+        assert_eq!(removed, 2);
+        assert_eq!(chunks.pending_updates_count(), 2);
+        assert_eq!(chunks.updates.front(), Some(&(Vec3(10, 1, 1), 2)));
+        assert_eq!(chunks.updates_staging.get(&Vec3(11, 2, 2)), Some(&3));
+    }
+
+    #[test]
+    fn pending_updates_in_bounds_reports_the_latest_projected_values() {
+        let mut chunks = empty_chunks();
+        chunks.update_voxel(&Vec3(1, 1, 1), 2);
+        chunks.update_voxel(&Vec3(10, 1, 1), 2);
+        chunks.flush_staged_updates();
+        chunks.update_voxel(&Vec3(1, 1, 1), 0);
+        chunks.update_voxel(&Vec3(2, 2, 2), 3);
+
+        let pending = chunks.pending_updates_in_bounds(&Vec3(0, 0, 0), &Vec3(5, 5, 5));
+
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending.get(&Vec3(1, 1, 1)), Some(&0));
+        assert_eq!(pending.get(&Vec3(2, 2, 2)), Some(&3));
+    }
+}
+
+#[cfg(test)]
+mod update_lane_tests {
+    use super::*;
+    use crate::WorldConfig;
+
+    fn empty_chunks() -> Chunks {
+        Chunks::new(&WorldConfig::new().build())
+    }
+
+    #[test]
+    fn simulation_writes_flush_onto_their_own_lane() {
+        let mut chunks = empty_chunks();
+        chunks.update_voxel(&Vec3(1, 1, 1), 2);
+        chunks.update_active_voxel(&Vec3(5, 1, 1), 7);
+        chunks.update_active_voxel(&Vec3(5, 0, 1), 7);
+        chunks.flush_staged_updates();
+
+        assert_eq!(chunks.updates.len(), 1);
+        assert_eq!(chunks.active_updates.len(), 2);
+        // Bottom-up like the external lane, so a cut batch never commits a
+        // dependent half before its support.
+        assert_eq!(chunks.active_updates.front(), Some(&(Vec3(5, 0, 1), 7)));
+        assert_eq!(chunks.pending_updates_count(), 3);
+        assert_eq!(chunks.pending_active_updates_count(), 2);
+    }
+
+    #[test]
+    fn an_external_write_supersedes_queued_simulation_writes_to_the_same_voxel() {
+        let mut chunks = empty_chunks();
+        chunks.update_active_voxel(&Vec3(1, 1, 1), 7);
+        chunks.flush_staged_updates();
+        chunks.update_active_voxel(&Vec3(2, 1, 1), 7);
+        chunks.update_voxel(&Vec3(1, 1, 1), 3);
+        chunks.update_voxel(&Vec3(2, 1, 1), 3);
+        chunks.flush_staged_updates();
+
+        assert!(chunks.active_updates.is_empty());
+        assert_eq!(chunks.updates.len(), 2);
+        let pending = chunks.pending_updates_in_bounds(&Vec3(0, 0, 0), &Vec3(5, 5, 5));
+        assert_eq!(pending.get(&Vec3(1, 1, 1)), Some(&3));
+        assert_eq!(pending.get(&Vec3(2, 1, 1)), Some(&3));
+    }
+
+    #[test]
+    fn a_newer_simulation_write_replaces_its_own_queued_predecessor_only() {
+        let mut chunks = empty_chunks();
+        chunks.update_voxel(&Vec3(1, 1, 1), 3);
+        chunks.update_active_voxel(&Vec3(1, 1, 1), 7);
+        chunks.flush_staged_updates();
+        chunks.update_active_voxel(&Vec3(1, 1, 1), 8);
+        chunks.flush_staged_updates();
+
+        assert_eq!(chunks.updates.front(), Some(&(Vec3(1, 1, 1), 3)));
+        assert_eq!(chunks.active_updates.len(), 1);
+        assert_eq!(chunks.active_updates.front(), Some(&(Vec3(1, 1, 1), 8)));
+        // The external word is the one reported: it commits last.
+        let pending = chunks.pending_updates_in_bounds(&Vec3(0, 0, 0), &Vec3(5, 5, 5));
+        assert_eq!(pending.get(&Vec3(1, 1, 1)), Some(&3));
+    }
+
+    #[test]
+    fn cancelling_a_region_clears_both_lanes() {
+        let mut chunks = empty_chunks();
+        chunks.update_active_voxel(&Vec3(1, 1, 1), 7);
+        chunks.update_active_voxel(&Vec3(10, 1, 1), 7);
+        chunks.flush_staged_updates();
+        chunks.update_active_voxel(&Vec3(2, 2, 2), 7);
+        chunks.update_voxel(&Vec3(3, 3, 3), 3);
+
+        let removed = chunks.cancel_pending_updates_in_bounds(&Vec3(0, 0, 0), &Vec3(5, 5, 5));
+
+        assert_eq!(removed, 3);
+        assert_eq!(chunks.pending_updates_count(), 1);
+        assert_eq!(chunks.active_updates.front(), Some(&(Vec3(10, 1, 1), 7)));
+    }
+
+    fn insert_ready_chunk(chunks: &mut Chunks, cx: i32, cz: i32) {
+        let config = chunks.config.clone();
+        let mut chunk = crate::Chunk::new(
+            "test",
+            cx,
+            cz,
+            &crate::ChunkOptions {
+                size: config.chunk_size,
+                max_height: config.max_height,
+                sub_chunks: config.sub_chunks,
+            },
+        );
+        chunk.status = ChunkStatus::Ready;
+        chunks.map.insert(Vec2(cx, cz), chunk);
+    }
+
+    #[test]
+    fn parked_writes_stay_counted_and_return_in_order_once_the_footprint_is_ready() {
+        let mut chunks = empty_chunks();
+        let parked = vec![
+            (Vec3(1, 0, 1), 2, UpdateLane::External),
+            (Vec3(1, 1, 1), 3, UpdateLane::External),
+            (Vec3(2, 0, 1), 7, UpdateLane::Active),
+        ];
+        chunks.park_updates(Vec2(0, 0), parked);
+        chunks.update_voxel(&Vec3(40, 1, 1), 5);
+        chunks.flush_staged_updates();
+
+        // Nothing in the lanes for chunk (0,0), so its writes cannot occupy
+        // a tick's budget; they are still pending and still visible.
+        assert_eq!(chunks.updates.len(), 1);
+        assert_eq!(chunks.pending_updates_count(), 4);
+        assert_eq!(chunks.pending_active_updates_count(), 1);
+        assert_eq!(chunks.parked_updates_count(), 3);
+        assert_eq!(chunks.readmit_parked_updates(), 0);
+        let report = chunks.pending_update_head_report(100);
+        let parked_entry = report
+            .iter()
+            .find(|entry| entry.is_parked && entry.lane == UpdateLane::External)
+            .expect("parked external writes are reported");
+        assert_eq!(parked_entry.count, 2);
+        assert_eq!(parked_entry.status, "unloaded");
+
+        // A newer external write to a parked voxel supersedes it, on either
+        // lane, exactly as it would a queued one.
+        chunks.update_voxel(&Vec3(2, 0, 1), 9);
+        chunks.flush_staged_updates();
+        assert_eq!(chunks.parked_updates_count(), 2);
+
+        let extended =
+            (chunks.config.max_light_level as f32 / chunks.config.chunk_size as f32).ceil() as i32;
+        for cx in -extended..=extended {
+            for cz in -extended..=extended {
+                insert_ready_chunk(&mut chunks, cx, cz);
+            }
+        }
+        assert!(chunks.is_update_footprint_ready(&Vec2(0, 0)));
+        assert_eq!(chunks.readmit_parked_updates(), 2);
+        assert_eq!(chunks.parked_updates_count(), 0);
+        // Ahead of the write that was already queued, in their original order.
+        let queued: Vec<_> = chunks.updates.iter().cloned().collect();
+        assert_eq!(
+            queued,
+            vec![
+                (Vec3(1, 0, 1), 2),
+                (Vec3(1, 1, 1), 3),
+                (Vec3(40, 1, 1), 5),
+                (Vec3(2, 0, 1), 9)
+            ]
+        );
+    }
+
+    #[test]
+    fn cancelling_a_region_clears_parked_writes_too() {
+        let mut chunks = empty_chunks();
+        chunks.park_updates(
+            Vec2(0, 0),
+            vec![
+                (Vec3(1, 1, 1), 2, UpdateLane::External),
+                (Vec3(9, 1, 1), 2, UpdateLane::External),
+            ],
+        );
+
+        let removed = chunks.cancel_pending_updates_in_bounds(&Vec3(0, 0, 0), &Vec3(5, 5, 5));
+
+        assert_eq!(removed, 1);
+        assert_eq!(chunks.parked_updates_count(), 1);
+        let pending = chunks.pending_updates_in_bounds(&Vec3(0, 0, 0), &Vec3(20, 5, 5));
+        assert_eq!(pending.get(&Vec3(9, 1, 1)), Some(&2));
+        assert_eq!(pending.get(&Vec3(1, 1, 1)), None);
     }
 }
 

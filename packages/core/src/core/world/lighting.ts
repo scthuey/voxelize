@@ -29,6 +29,13 @@ export type LightJob = {
   lightOps: {
     removals: Coords3[];
     floods: LightNode[];
+    /**
+     * Removal-BFS nodes left over from a prior job that hit the worker's
+     * node budget (see `light-worker.ts`'s `removeLightsBatch`). Unlike
+     * `removals`, these already had their own light zeroed and must not be
+     * re-read/re-zeroed — only their neighbours still need visiting.
+     */
+    pendingRemovals?: LightNode[];
   };
   boundingBox: BoundingBox;
   startSequenceId: number;
@@ -39,6 +46,7 @@ export type LightJob = {
 export type LightBatchResult = {
   color: LightColor;
   modifiedChunks: LightWorkerModifiedChunk[];
+  borderNeighbors: LightWorkerBorderNeighbor[];
   boundingBox: BoundingBox;
 };
 
@@ -88,9 +96,31 @@ export type ProcessedUpdate = {
 export type LightWorkerResult = {
   jobId: string;
   modifiedChunks: LightWorkerModifiedChunk[];
+  /**
+   * Chunks the job did not write light into but whose meshes read a voxel
+   * it did: a light set in a chunk's border column shades the faces of the
+   * chunk next door (and the diagonal one at a corner). They carry no
+   * lights to merge — only the y-range to remesh.
+   */
+  borderNeighbors: LightWorkerBorderNeighbor[];
   appliedDeltas: {
     lastSequenceId: number;
   };
+  /**
+   * Set when the worker hit its node budget mid-flood (e.g. a long open
+   * sunlight shaft under a floating island) and deferred the rest of the
+   * BFS rather than dropping it. The caller resubmits these as a follow-up
+   * job on the same bounding box so the region ends up fully lit instead of
+   * permanently partial.
+   */
+  pendingFloods?: LightNode[];
+  pendingRemovals?: LightNode[];
+};
+
+export type LightWorkerBorderNeighbor = {
+  coords: Coords2;
+  minY: number;
+  maxY: number;
 };
 
 export type LightWorkerModifiedChunk = {
@@ -416,6 +446,7 @@ export function removeLightsBatch(
 
   const queue: LightNode[] = [];
   const fill: LightNode[] = [];
+  const emitters: LightNode[] = [];
 
   // Initialise the queue with all voxels to be cleared.
   voxels.forEach(([vx, vy, vz]) => {
@@ -455,13 +486,17 @@ export function removeLightsBatch(
         rotation,
       );
 
+      const emissionLevel = isSunlight
+        ? 0
+        : BlockUtils.getBlockTorchLightLevelAt(nBlock, color, [nvx, nvy, nvz], {
+            getVoxelAt: (x, y, z) => world.getVoxelAt(x, y, z),
+            getVoxelRotationAt: (x, y, z) => world.getVoxelRotationAt(x, y, z),
+            getVoxelStageAt: (x, y, z) => world.getVoxelStageAt(x, y, z),
+          });
+
       if (
         !isSunlight &&
-        BlockUtils.getBlockTorchLightLevelAt(nBlock, color, [nvx, nvy, nvz], {
-          getVoxelAt: (x, y, z) => world.getVoxelAt(x, y, z),
-          getVoxelRotationAt: (x, y, z) => world.getVoxelRotationAt(x, y, z),
-          getVoxelStageAt: (x, y, z) => world.getVoxelStageAt(x, y, z),
-        }) === 0 &&
+        emissionLevel === 0 &&
         !LightUtils.canEnterInto(nTransparency, ox, oy, oz)
       ) {
         continue;
@@ -471,6 +506,13 @@ export function removeLightsBatch(
         ? world.getSunlightAt(nvx, nvy, nvz)
         : world.getTorchLightAt(nvx, nvy, nvz, color);
       if (nl === 0) continue;
+
+      // Mirrors the light worker's removeLightsBatch: a remaining emitter the
+      // front crosses is reseeded at its own level, and light at or above the
+      // front is refill boundary, never zeroed.
+      if (emissionLevel > 0) {
+        emitters.push({ voxel: [nvx, nvy, nvz], level: emissionLevel });
+      }
 
       if (
         nl < level ||
@@ -486,34 +528,7 @@ export function removeLightsBatch(
           world.setTorchLightAt(nvx, nvy, nvz, 0, color);
         }
       } else if (isSunlight && oy === -1 ? nl > level : nl >= level) {
-        if (isSunlight) {
-          fill.push({ voxel: [nvx, nvy, nvz], level: nl });
-          continue;
-        }
-
-        const emissionLevel = BlockUtils.getBlockTorchLightLevelAt(
-          nBlock,
-          color,
-          [nvx, nvy, nvz],
-          {
-            getVoxelAt: (x, y, z) => world.getVoxelAt(x, y, z),
-            getVoxelRotationAt: (x, y, z) => world.getVoxelRotationAt(x, y, z),
-            getVoxelStageAt: (x, y, z) => world.getVoxelStageAt(x, y, z),
-          },
-        );
-        if (typeof emissionLevel !== "number" || emissionLevel <= 0) {
-          queue.push({ voxel: [nvx, nvy, nvz], level: nl });
-          world.setTorchLightAt(nvx, nvy, nvz, 0, color);
-          continue;
-        }
-
-        if (nl === emissionLevel) {
-          fill.push({ voxel: [nvx, nvy, nvz], level: emissionLevel });
-          continue;
-        }
-
-        queue.push({ voxel: [nvx, nvy, nvz], level: nl });
-        world.setTorchLightAt(nvx, nvy, nvz, 0, color);
+        fill.push({ voxel: [nvx, nvy, nvz], level: nl });
       }
     }
   }
@@ -523,7 +538,7 @@ export function removeLightsBatch(
       ? world.getSunlightAt(vx, vy, vz)
       : world.getTorchLightAt(vx, vy, vz, color),
   );
-  const dedupedFill = LightUtils.dedupeFillQueue(liveFill);
+  const dedupedFill = LightUtils.dedupeFillQueue(liveFill.concat(emitters));
   for (const node of dedupedFill) {
     const [vx, vy, vz] = node.voxel;
     if (isSunlight) {
@@ -693,6 +708,29 @@ export function analyzeLightOperations(
       newRotation,
     );
 
+    // Light only reads four things about a voxel: opacity, which faces let
+    // light through, attenuation, and emission. When none of those changed
+    // the field already holds what a removal + reflood would recompute, so
+    // skip both. A fluid changing level, or air becoming non-attenuating
+    // water, used to tear down the cell's whole sunlight column and flood
+    // it back to identical values — one BFS per cell per step, the dominant
+    // client cost of a spreading lake. Blocks with dynamic patterns may emit
+    // conditionally, so they keep the full analysis. Mirrors the server's
+    // `light_invariant` skip in `process_pending_updates`.
+    const lightInvariant =
+      !oldBlock.isLight &&
+      !newBlock.isLight &&
+      !oldBlock.dynamicPatterns &&
+      !newBlock.dynamicPatterns &&
+      oldBlock.isOpaque === newBlock.isOpaque &&
+      oldBlock.lightAttenuation === newBlock.lightAttenuation &&
+      currentTransparency.every(
+        (side, index) => side === updatedTransparency[index],
+      );
+    if (lightInvariant) {
+      continue;
+    }
+
     if (newBlock.isOpaque || newBlock.lightAttenuation > 0) {
       if (world.getSunlightAt(vx, vy, vz) > 0) {
         sunlightRemoval.push(voxel);
@@ -852,6 +890,20 @@ export function analyzeLightOperations(
         });
       }
     } else if (oldBlock.isOpaque && !newBlock.isOpaque) {
+      // The immediate seeds below read the neighbours' light as it stands on
+      // the main thread now. A neighbour opened by an earlier packet may be
+      // waiting on a flood that has not landed yet and read zero, and a cell
+      // seeded from nothing is never revisited — so the opened cell also
+      // carries a seed that the flood resolves against its own snapshot,
+      // where every earlier batch's light is already present.
+      const deferred = { level: LightUtils.LEVEL_FROM_NEIGHBORS };
+      sunFlood.push({ voxel: [vx, vy, vz], ...deferred });
+      if (!isRemovedLightSource) {
+        redFlood.push({ voxel: [vx, vy, vz], ...deferred });
+        greenFlood.push({ voxel: [vx, vy, vz], ...deferred });
+        blueFlood.push({ voxel: [vx, vy, vz], ...deferred });
+      }
+
       for (const [ox, oy, oz] of VOXEL_NEIGHBORS) {
         const nvy = vy + oy;
 
@@ -975,6 +1027,69 @@ export function analyzeLightOperations(
     },
     hasOperations,
   };
+}
+
+/** Every removal and flood seed across all colors — the work a batch buys. */
+export function countLightSeeds(ops: LightOperations): number {
+  const { removals, floods } = ops;
+  return (
+    removals.sunlight.length +
+    removals.red.length +
+    removals.green.length +
+    removals.blue.length +
+    floods.sunlight.length +
+    floods.red.length +
+    floods.green.length +
+    floods.blue.length
+  );
+}
+
+const LIGHT_OPS_KEY: Record<LightColor, keyof LightOperations["removals"]> = {
+  SUNLIGHT: "sunlight",
+  RED: "red",
+  GREEN: "green",
+  BLUE: "blue",
+};
+
+/**
+ * Put built jobs back into an operation set — the inverse of
+ * {@link buildLightJobs}.
+ *
+ * A memory-pressure shed drops a job's serialized chunk copies, which is the
+ * allocation that matters, but it must not drop the seeds the job carried:
+ * they describe voxel changes that are already applied and already meshed
+ * with their old light, and nothing else ever comes back for them. A pit cut
+ * into stone under pressure used to stay black until a reload, because the
+ * shed nulled the pending ops and the log counted them as zero. Boxes and
+ * clusters are recomputed when the seeds are built into jobs again, so only
+ * the seeds need to survive.
+ */
+export function foldLightJobsBack(
+  accumulated: LightOperations | null,
+  jobs: Pick<LightJob, "color" | "lightOps">[],
+): LightOperations | null {
+  if (jobs.length === 0) return accumulated;
+
+  const folded: LightOperations = accumulated
+    ? mergeLightOperations(accumulated, {
+        removals: { sunlight: [], red: [], green: [], blue: [] },
+        floods: { sunlight: [], red: [], green: [], blue: [] },
+        hasOperations: accumulated.hasOperations,
+      })
+    : {
+        removals: { sunlight: [], red: [], green: [], blue: [] },
+        floods: { sunlight: [], red: [], green: [], blue: [] },
+        hasOperations: false,
+      };
+
+  for (const { color, lightOps } of jobs) {
+    const key = LIGHT_OPS_KEY[color];
+    folded.removals[key] = folded.removals[key].concat(lightOps.removals);
+    folded.floods[key] = folded.floods[key].concat(lightOps.floods);
+  }
+
+  folded.hasOperations = countLightSeeds(folded) > 0;
+  return folded.hasOperations ? folded : accumulated;
 }
 
 export function mergeLightOperations(

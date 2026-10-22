@@ -8,21 +8,29 @@ import {
   Group,
   LoopOnce,
   MathUtils,
+  Matrix4,
+  Mesh,
   Object3D,
   Quaternion,
   Vector3,
+  Vector4,
 } from "three";
 
 import {
+  EntityShadowUniforms,
   ShaderLightingUniforms,
   updateEntityShadowUniforms,
 } from "../core/world/entity-shadow-uniforms";
 import { AnimationUtils, MathUtils as VoxMathUtils } from "../utils";
 
-import { CanvasBox, CanvasBoxOptions } from "./canvas-box";
+import { BoxLayer, CanvasBox, CanvasBoxOptions } from "./canvas-box";
 import { NameTag, NameTagOptions } from "./nametag";
+import { SpriteText } from "./sprite-text";
 
 const CHARACTER_SCALE = 0.9;
+
+// The name `setArmHoldingObject` gives a held object, so `dispose` can skip it.
+const HELD_OBJECT_NAME = "armObject";
 
 // The frame rate the lerp option factors (positionLerp, rotationLerp) are
 // defined against. update() renormalizes them to the real frame delta so
@@ -32,6 +40,10 @@ const LERP_REFERENCE_FPS = 60;
 const identityQuaternion = new Quaternion();
 const headBodyInverse = new Quaternion();
 const ridePivotScratch = new Vector3();
+const shadowBoundsCenter = new Vector3();
+const shadowFitToLocal = new Matrix4();
+const shadowFitMeshToLocal = new Matrix4();
+const shadowFitVertex = new Vector3();
 // Ride attitude pushes arrive once per mount render frame; tolerating a
 // few frames without one keeps update-order differences from flickering
 // the lean while still decaying promptly after a dismount.
@@ -251,6 +263,21 @@ export type CharacterOptions = {
    * Whether this character should receive shadows. Defaults to `false`.
    */
   receiveShadows?: boolean;
+
+  /**
+   * Slack in blocks around the body's bounding sphere
+   * ({@link Character.shadowSelfBounds}) for the shadow-map filter's reach
+   * and a frame of motion. Defaults to `0.1`.
+   */
+  shadowSelfBoundsMargin?: number;
+
+  /**
+   * Draw each body part in one call instead of six (`CanvasBoxOptions.mergeFaces`).
+   * Painting is unchanged; a consumer that swaps or re-reads the parts'
+   * per-face materials as draw state needs the per-face path. Defaults to
+   * `false`.
+   */
+  mergeBoxFaces?: boolean;
 };
 
 export const defaultCharacterOptions: CharacterOptions = {
@@ -262,6 +289,7 @@ export const defaultCharacterOptions: CharacterOptions = {
   swimEnterLerp: 0.12,
   swimExitLerp: 0.05,
   idleArmSwing: 0.06,
+  shadowSelfBoundsMargin: 0.1,
 };
 
 export const defaultHeadOptions: HeadOptions = {
@@ -478,6 +506,23 @@ export class Character extends Group {
   public readonly rideOffset = new Vector3();
 
   /**
+   * The body's bounding sphere in world space (centre xyz, radius w). Every
+   * part's entity shadow uniforms read it as `uShadowSelfBounds`, so no face
+   * is shaded by the body it belongs to while anything beyond the body
+   * still shades it. Kept current by {@link update} and
+   * {@link updateShadowUniforms}; {@link bindShadowSelfBounds} shares it
+   * with an accessory's uniforms.
+   */
+  public readonly shadowSelfBounds = new Vector4();
+
+  /**
+   * How far the farthest mesh under the parts reaches from the centre of
+   * {@link shadowSelfBounds}, in the body's own unscaled frame, as measured
+   * by {@link fitShadowSelfBounds}; 0 until then.
+   */
+  private shadowSelfReach = 0;
+
+  /**
    * A listener called when a character starts moving.
    */
   onMove: () => void;
@@ -553,6 +598,13 @@ export class Character extends Group {
       this.userData.receiveShadows = true;
     }
 
+    for (const part of this.shadowParts()) {
+      for (const layer of part.boxLayers) {
+        this.bindShadowSelfBounds(layer.shadowUniforms);
+      }
+    }
+    this.refreshShadowSelfBounds();
+
     const position = this.rightArmGroup.position;
     const quaternion = this.rightArmGroup.quaternion;
 
@@ -603,6 +655,7 @@ export class Character extends Group {
     }
 
     this.lerpAll(delta);
+    this.refreshShadowSelfBounds();
   }
 
   snapToTarget() {
@@ -619,6 +672,7 @@ export class Character extends Group {
       this.headGroup.rotation.setFromQuaternion(this.newDirection);
       this.bodyGroup.quaternion.copy(this.newBodyDirection);
     }
+    this.refreshShadowSelfBounds();
   }
 
   /**
@@ -738,7 +792,102 @@ export class Character extends Group {
   updateShadowUniforms(lightingUniforms: ShaderLightingUniforms): void {
     if (!this.options.receiveShadows) return;
 
-    const parts = [
+    this.refreshShadowSelfBounds();
+    for (const part of this.shadowParts()) {
+      if (part?.shadowUniforms) {
+        updateEntityShadowUniforms(part.shadowUniforms, lightingUniforms);
+      }
+    }
+  }
+
+  /**
+   * Have `uniforms` read this body's {@link shadowSelfBounds}: for an
+   * accessory with a shadowed material of its own (armour, a hat), so it is
+   * shaded like the body it is worn on.
+   */
+  bindShadowSelfBounds(uniforms: EntityShadowUniforms | null | undefined) {
+    if (uniforms) uniforms.uShadowSelfBounds.value = this.shadowSelfBounds;
+  }
+
+  /**
+   * Recompute {@link shadowSelfBounds} from the current pose: a sphere about
+   * the middle of the body that holds every part however the arms swing,
+   * carried, turned and scaled with the root (a swimmer lies along it, a
+   * fallen body rolls with it).
+   */
+  refreshShadowSelfBounds() {
+    const { head, body, arms } = this.options;
+    const bodyHalf = Math.max(body.width, body.depth) / 2;
+    const lateral =
+      bodyHalf + (arms.shoulderGap ?? 0) + Math.max(arms.width, arms.depth);
+    const reach = Math.max(
+      bodyHalf,
+      arms.height,
+      Math.max(head.width, head.depth) / 2,
+    );
+    const vertical = this.totalHeight / 2;
+
+    const center = shadowBoundsCenter
+      .set(0, vertical - this.eyeHeight, 0)
+      .multiply(this.scale)
+      .applyQuaternion(this.quaternion)
+      .add(this.position);
+    let scale = Math.max(this.scale.x, this.scale.y, this.scale.z);
+    if (this.parent) {
+      center.applyMatrix4(this.parent.matrixWorld);
+      scale *= this.parent.matrixWorld.getMaxScaleOnAxis();
+    }
+
+    this.shadowSelfBounds.set(
+      center.x,
+      center.y,
+      center.z,
+      Math.max(Math.hypot(lateral, vertical, reach), this.shadowSelfReach) *
+        scale +
+        this.options.shadowSelfBoundsMargin,
+    );
+  }
+
+  /**
+   * Grow {@link shadowSelfBounds} to hold every mesh under the parts as
+   * posed now: for a body whose attachments reach past its anatomical boxes
+   * (splayed legs, a tail, a crest). Call once the body is built; the reach
+   * is measured in the body's own frame, so it turns and scales with it.
+   */
+  fitShadowSelfBounds() {
+    this.updateMatrixWorld(true);
+    shadowFitToLocal.copy(this.matrixWorld).invert();
+    const center = shadowBoundsCenter.set(
+      0,
+      this.totalHeight / 2 - this.eyeHeight,
+      0,
+    );
+    let reach = 0;
+    for (const part of this.shadowParts()) {
+      part.traverse((object) => {
+        const mesh = object as Mesh;
+        const position = mesh.isMesh
+          ? mesh.geometry.getAttribute("position")
+          : undefined;
+        if (!position) return;
+        shadowFitMeshToLocal.multiplyMatrices(
+          shadowFitToLocal,
+          mesh.matrixWorld,
+        );
+        for (let i = 0; i < position.count; i++) {
+          shadowFitVertex
+            .fromBufferAttribute(position, i)
+            .applyMatrix4(shadowFitMeshToLocal);
+          reach = Math.max(reach, shadowFitVertex.distanceTo(center));
+        }
+      });
+    }
+    this.shadowSelfReach = reach;
+    this.refreshShadowSelfBounds();
+  }
+
+  private shadowParts() {
+    return [
       this.head,
       this.body,
       this.leftArm,
@@ -746,12 +895,6 @@ export class Character extends Group {
       this.leftLeg,
       this.rightLeg,
     ];
-
-    for (const part of parts) {
-      if (part?.shadowUniforms) {
-        updateEntityShadowUniforms(part.shadowUniforms, lightingUniforms);
-      }
-    }
   }
 
   set legColor(color: string | Color) {
@@ -861,12 +1004,14 @@ export class Character extends Group {
    */
   private createModel = () => {
     const receiveShadows = this.options.receiveShadows ?? false;
+    const merged = this.options.mergeBoxFaces ? { mergeFaces: true } : {};
 
     const head = new CanvasBox({
       ...defaultHeadOptions,
       ...(this.options.head ? this.options.head : {}),
       receiveShadows,
       underwaterFog: true,
+      ...merged,
     });
 
     const body = new CanvasBox({
@@ -874,6 +1019,7 @@ export class Character extends Group {
       ...(this.options.body ? this.options.body : {}),
       receiveShadows,
       underwaterFog: true,
+      ...merged,
     });
 
     const leftArm = new CanvasBox({
@@ -881,6 +1027,7 @@ export class Character extends Group {
       ...(this.options.arms ? this.options.arms : {}),
       receiveShadows,
       underwaterFog: true,
+      ...merged,
     });
 
     const rightArm = new CanvasBox({
@@ -888,6 +1035,7 @@ export class Character extends Group {
       ...(this.options.arms ? this.options.arms : {}),
       receiveShadows,
       underwaterFog: true,
+      ...merged,
     });
 
     const leftLeg = new CanvasBox({
@@ -895,6 +1043,7 @@ export class Character extends Group {
       ...(this.options.legs ? this.options.legs : {}),
       receiveShadows,
       underwaterFog: true,
+      ...merged,
     });
 
     const rightLeg = new CanvasBox({
@@ -902,6 +1051,7 @@ export class Character extends Group {
       ...(this.options.legs ? this.options.legs : {}),
       receiveShadows,
       underwaterFog: true,
+      ...merged,
     });
 
     this.headGroup = new Group();
@@ -1269,6 +1419,25 @@ export class Character extends Group {
   };
 
   /**
+   * Free the GPU resources this character owns: every canvas box layer
+   * under it (its six body parts and any hat, cape or extra hung on them)
+   * and every sprite label (the nametag, a speech bubble). Objects held in
+   * the hands are left alone: they are usually clones of cached block
+   * meshes that share geometry and materials with the rest of the world.
+   * Call once, after the character has left the scene for good.
+   */
+  dispose() {
+    const visit = (object: Object3D) => {
+      if (object.name === HELD_OBJECT_NAME) return;
+      if (object instanceof BoxLayer || object instanceof SpriteText) {
+        object.dispose();
+      }
+      for (const child of object.children) visit(child);
+    };
+    visit(this);
+  }
+
+  /**
    * Set the character's arm holding object.
    *
    * @param object The object to set as the arm holding object.
@@ -1277,7 +1446,7 @@ export class Character extends Group {
     object: Object3D | undefined,
     side: "left" | "right" = "right",
   ) => {
-    const objectName = "armObject";
+    const objectName = HELD_OBJECT_NAME;
 
     let armGroup = this.rightArmGroup;
     if (side === "left") {

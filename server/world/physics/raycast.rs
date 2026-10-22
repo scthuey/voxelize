@@ -163,8 +163,8 @@ pub fn trace(
 /// filter is [`sweep`](super::sweep::sweep)'s own — fluid, empty, and
 /// passable blocks never collide — and inside a surviving cell the ray is
 /// tested against the block's actual rotated AABBs. Cell flags alone cannot
-/// answer this question: the water beside a waterlogged wave-maker housing
-/// or between coral pillar columns is open to a body while the furniture
+/// answer this question: the water beside a waterlogged machine housing
+/// or between decorative pillar columns is open to a body while the furniture
 /// itself is not, and both truths live in one cell. Panics on a zero
 /// direction, like [`trace`].
 pub fn trace_solids(
@@ -200,7 +200,7 @@ pub fn trace_solids(
             return false;
         }
 
-        let rotation = space.get_voxel_rotation(vx, vy, vz);
+        let rotation = block.rotation_of(space.get_raw_voxel(vx, vy, vz));
         let mut cell_nearest = f32::MAX;
         for aabb in &aabbs {
             let mut solid = rotation.rotate_aabb(aabb, true, true);

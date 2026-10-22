@@ -3,6 +3,7 @@ import {
   ClampToEdgeWrapping,
   Color,
   NearestFilter,
+  NearestMipmapNearestFilter,
   SRGBColorSpace,
   Texture,
   Vector3,
@@ -11,6 +12,18 @@ import {
 
 import { ThreeUtils } from "../../utils";
 
+import {
+  type FaceAnimationFrame,
+  faceAnimationFrameAt,
+} from "./face-animation-frame";
+import {
+  classifyTexels,
+  mergeTexelClasses,
+  readImagePixels,
+  type TexelAlphaCuts,
+  type TexelClasses,
+  UNREADABLE_TEXELS,
+} from "./see-through-texels";
 import { UV } from "./uv";
 
 type AtlasAnimationPatch = {
@@ -20,6 +33,36 @@ type AtlasAnimationPatch = {
   size: number;
   dstPosition: Vector3;
 };
+
+/** See `WorldOptions.blockTextureFiltering`. */
+export type AtlasFilteringMode = "nearest" | "mip-aniso";
+
+/** The glancing-angle fix's anisotropy: enough to kill the streak without
+ * paying for the GPU's full max (8 or 16 on most hardware). */
+const MIP_ANISO_LEVEL = 4;
+
+/**
+ * The filter/mip/anisotropy settings for a mode, pulled out of
+ * `AtlasTexture.applyFiltering` so the mapping is testable without a
+ * canvas or a GL context.
+ */
+export function resolveAtlasFiltering(mode: AtlasFilteringMode): {
+  minFilter: typeof NearestFilter | typeof NearestMipmapNearestFilter;
+  magFilter: typeof NearestFilter;
+  generateMipmaps: boolean;
+  anisotropy: number;
+} {
+  const isMipAniso = mode === "mip-aniso";
+  return {
+    minFilter: isMipAniso ? NearestMipmapNearestFilter : NearestFilter,
+    // Magnification (up close) is untouched either way: nearest-only, so a
+    // texel stays a hard-edged square right in front of the camera. Only
+    // minification (a wall far off axis) ever reaches a lower mip level.
+    magFilter: NearestFilter,
+    generateMipmaps: isMipAniso,
+    anisotropy: isMipAniso ? MIP_ANISO_LEVEL : 1,
+  };
+}
 
 /**
  * A texture atlas is a collection of textures that are packed into a single texture.
@@ -69,12 +112,149 @@ export class AtlasTexture extends CanvasTexture {
   /**
    * The list of block animations that are being used by this texture atlas.
    */
-  public animations: { animation: FaceAnimation; timer: any }[] = [];
+  public animations: {
+    animation: FaceAnimation;
+    /** Unused: frames come from {@link animationClock}, not timers. */
+    timer: null;
+    patch: AtlasAnimationPatch;
+    durationsMs: number[];
+    /** The frame last drawn, as index * (fades + 1) + step; -1 for none. */
+    drawnFrame: number;
+  }[] = [];
+
+  /**
+   * Seconds the animated faces read their frame from. The world points it
+   * at its shared shader clock, so every client shows the same frame of the
+   * same water at the same moment; on its own it runs on local time.
+   */
+  public animationClock: () => number = () => performance.now() / 1000;
+
+  private readonly scratchFrame: FaceAnimationFrame = {
+    index: 0,
+    next: 0,
+    fadeStep: 0,
+  };
 
   private pendingAnimationPatches = new Map<
     FaceAnimation,
     AtlasAnimationPatch
   >();
+
+  /**
+   * Ranges something has drawn into since the atlas was built. Every slot
+   * starts as the unknown checker; a slot missing from this set is still
+   * wearing it, which is what {@link isRangePainted} answers for the texture
+   * census. Shared with clones, which share the pixels too.
+   */
+  private paintedRangeKeys = new Set<string>();
+
+  /**
+   * Ranges painted by a fallback fill rather than by their own art. Kept
+   * apart from {@link paintedRangeKeys} so the census can still report them
+   * as missing their real texture; a real draw clears the mark.
+   */
+  private fallbackRangeKeys = new Set<string>();
+
+  /**
+   * {@link rangeTexelClasses} answers by range and cuts, dropped for a range
+   * whenever something draws into it. Shared with clones, like the pixels.
+   */
+  private texelClassCache = new Map<string, TexelClasses>();
+
+  private static rangeKey(range: UV) {
+    return `${range.startU}|${range.startV}|${range.endU}|${range.endV}`;
+  }
+
+  /** Whether anything has been drawn into `range` since the atlas was built. */
+  isRangePainted(range: UV) {
+    return this.paintedRangeKeys.has(AtlasTexture.rangeKey(range));
+  }
+
+  /** Whether `range` wears a fallback fill instead of its own texture. */
+  isRangeFallback(range: UV) {
+    return this.fallbackRangeKeys.has(AtlasTexture.rangeKey(range));
+  }
+
+  /**
+   * The RGBA8 pixels painted inside `range` (its texture, without the
+   * margin around it), or null while nothing has been painted there. One
+   * small read of the atlas canvas.
+   */
+  readRangePixels(range: UV): Uint8ClampedArray | null {
+    if (!this.isRangePainted(range)) return null;
+    const context = this.canvas.getContext("2d");
+    if (!context) return null;
+    const size = Math.max(1, Math.round(this.dimension * this.atlasRatio));
+    const x = Math.round(
+      (range.startU - this.atlasOffset) * this.canvas.width + this.atlasMargin,
+    );
+    const y = Math.round(
+      (1 - range.endV - this.atlasOffset) * this.canvas.height +
+        this.atlasMargin,
+    );
+    return context.getImageData(x, y, size, size).data;
+  }
+
+  /**
+   * Whether `range` holds solid or translucent texels (see
+   * `classifyTexels`): its painted pixels, every keyframe of an animation
+   * playing there, or the opaque unknown checker while nothing is painted.
+   */
+  rangeTexelClasses(range: UV, cuts: TexelAlphaCuts): TexelClasses {
+    const key = `${AtlasTexture.rangeKey(range)}|${cuts.hole}|${cuts.solid}`;
+    const cached = this.texelClassCache.get(key);
+    if (cached) return { ...cached };
+
+    const rangeKey = AtlasTexture.rangeKey(range);
+    const animation = this.animations.find(
+      (entry) => AtlasTexture.rangeKey(entry.animation.range) === rangeKey,
+    );
+    let classes: TexelClasses;
+    if (animation) {
+      classes = { solid: false, translucent: false };
+      for (const [, frame] of animation.animation.keyframes) {
+        if ((frame as Color).isColor) {
+          classes.solid = true;
+          continue;
+        }
+        const pixels = readImagePixels(frame);
+        mergeTexelClasses(
+          classes,
+          pixels ? classifyTexels(pixels, cuts) : UNREADABLE_TEXELS,
+        );
+      }
+    } else if (!this.isRangePainted(range)) {
+      classes = { solid: true, translucent: false };
+    } else {
+      const pixels = this.readRangePixels(range);
+      classes = pixels
+        ? classifyTexels(pixels, cuts)
+        : { ...UNREADABLE_TEXELS };
+    }
+    this.texelClassCache.set(key, classes);
+    return { ...classes };
+  }
+
+  private forgetTexelClasses(range?: UV) {
+    if (!range) {
+      this.texelClassCache.clear();
+      return;
+    }
+    const prefix = `${AtlasTexture.rangeKey(range)}|`;
+    for (const key of this.texelClassCache.keys()) {
+      if (key.startsWith(prefix)) this.texelClassCache.delete(key);
+    }
+  }
+
+  /**
+   * Paint `range` with a stand-in colour and remember that it is one, so a
+   * later census still lists the slot as unpainted by its own art.
+   */
+  fillRangeAsFallback(range: UV, color: Color) {
+    this.drawImageToRange(range, color);
+    this.fallbackRangeKeys.add(AtlasTexture.rangeKey(range));
+    this.needsUpdate = true;
+  }
 
   /**
    * Create a new texture this.
@@ -94,6 +274,7 @@ export class AtlasTexture extends CanvasTexture {
     countPerSide = 1,
     dimension = 1,
     canvas = document.createElement("canvas"),
+    filtering: AtlasFilteringMode = "nearest",
   ) {
     super(canvas);
 
@@ -143,9 +324,7 @@ export class AtlasTexture extends CanvasTexture {
     this.makeCanvasPowerOfTwo(this.canvas);
     this.wrapS = ClampToEdgeWrapping;
     this.wrapT = ClampToEdgeWrapping;
-    this.minFilter = NearestFilter;
-    this.magFilter = NearestFilter;
-    this.generateMipmaps = false;
+    this.applyFiltering(filtering);
     this.needsUpdate = true;
     this.colorSpace = SRGBColorSpace;
 
@@ -165,6 +344,21 @@ export class AtlasTexture extends CanvasTexture {
   }
 
   /**
+   * Switches how this atlas samples at glancing angles. Safe to call on a
+   * live atlas already bound to chunk materials (sets `needsUpdate` so the
+   * next upload carries the new filter/mip settings) — an A/B run can flip
+   * this without rebuilding the world. See `WorldOptions.blockTextureFiltering`.
+   */
+  applyFiltering(mode: AtlasFilteringMode): void {
+    const settings = resolveAtlasFiltering(mode);
+    this.minFilter = settings.minFilter;
+    this.magFilter = settings.magFilter;
+    this.generateMipmaps = settings.generateMipmaps;
+    this.anisotropy = settings.anisotropy;
+    this.needsUpdate = true;
+  }
+
+  /**
    * Carries the atlas geometry so `clone()` yields a faithful atlas view
    * sharing the source's pixels, with independently settable repeat/offset
    * (how the held torch windows its flame strip). Animations deliberately do
@@ -179,6 +373,9 @@ export class AtlasTexture extends CanvasTexture {
     this.atlasMargin = source.atlasMargin;
     this.atlasOffset = source.atlasOffset;
     this.atlasRatio = source.atlasRatio;
+    this.paintedRangeKeys = source.paintedRangeKeys;
+    this.fallbackRangeKeys = source.fallbackRangeKeys;
+    this.texelClassCache = source.texelClassCache;
     return this;
   }
 
@@ -226,6 +423,12 @@ export class AtlasTexture extends CanvasTexture {
       return;
     }
 
+    const rangeKey = AtlasTexture.rangeKey(range);
+    this.paintedRangeKeys.add(rangeKey);
+    this.fallbackRangeKeys.delete(rangeKey);
+    if (range.startU === 0 && range.endU === 1) this.forgetTexelClasses();
+    else this.forgetTexelClasses(range);
+
     const context = this.canvas.getContext("2d");
 
     context.save();
@@ -262,38 +465,65 @@ export class AtlasTexture extends CanvasTexture {
       return;
     }
 
-    // Draw a background first.
-
-    if (clearRect) {
-      context.drawImage(
-        image2,
-        (startU - this.atlasOffset) * canvasWidth,
-        (1 - endV - this.atlasOffset) * canvasHeight,
-        this.dimension * this.atlasRatio + 2 * this.atlasMargin,
-        this.dimension * this.atlasRatio + 2 * this.atlasMargin,
-      );
-
-      // Carve out the middle.
-      context.clearRect(
-        (startU - this.atlasOffset) * canvasWidth + this.atlasMargin,
-        (1 - endV - this.atlasOffset) * canvasHeight + this.atlasMargin,
-        this.dimension * this.atlasRatio,
-        this.dimension * this.atlasRatio,
-      );
-    }
-
-    // Draw the actual texture.
-    context.drawImage(
+    this.drawPaddedTile(
+      context,
       image2,
-      (startU - this.atlasOffset) * canvasWidth + this.atlasMargin,
-      (1 - endV - this.atlasOffset) * canvasHeight + this.atlasMargin,
-      this.dimension * this.atlasRatio,
-      this.dimension * this.atlasRatio,
+      (startU - this.atlasOffset) * canvasWidth,
+      (1 - endV - this.atlasOffset) * canvasHeight,
     );
 
     context.restore();
 
     this.needsUpdate = true;
+  }
+
+  /**
+   * Draws a texture into the cell whose top-left corner is (x, y): the
+   * texture in the middle and its edge texels repeated out across the
+   * margin. A sample that lands just past the tile's edge (an antialiased
+   * pixel centre outside a quad, a mip or anisotropic tap) reads the edge's
+   * own texel. The margin used to hold the whole texture stretched over the
+   * cell, so the texel next to the edge came from a few texels in: on a
+   * plant, whose edges are clear, petals and leaves drew as dashed lines
+   * along every quad's border.
+   */
+  private drawPaddedTile(
+    context: CanvasRenderingContext2D,
+    source: CanvasImageSource,
+    x: number,
+    y: number,
+  ) {
+    const margin = this.atlasMargin;
+    const inner = this.dimension * this.atlasRatio;
+    const sourceWidth =
+      (source as HTMLImageElement).naturalWidth ||
+      (source as { width: number }).width;
+    const sourceHeight =
+      (source as HTMLImageElement).naturalHeight ||
+      (source as { height: number }).height;
+
+    context.drawImage(source, x + margin, y + margin, inner, inner);
+
+    if (margin <= 0 || !sourceWidth || !sourceHeight) return;
+
+    const right = sourceWidth - 1;
+    const bottom = sourceHeight - 1;
+    const far = x + margin + inner;
+    const low = y + margin + inner;
+    // [sx, sy, sw, sh, dx, dy, dw, dh]: four edge strips, four corners.
+    const pieces: number[][] = [
+      [0, 0, 1, sourceHeight, x, y + margin, margin, inner],
+      [right, 0, 1, sourceHeight, far, y + margin, margin, inner],
+      [0, 0, sourceWidth, 1, x + margin, y, inner, margin],
+      [0, bottom, sourceWidth, 1, x + margin, low, inner, margin],
+      [0, 0, 1, 1, x, y, margin, margin],
+      [right, 0, 1, 1, far, y, margin, margin],
+      [0, bottom, 1, 1, x, low, margin, margin],
+      [right, bottom, 1, 1, far, low, margin, margin],
+    ];
+    for (const [sx, sy, sw, sh, dx, dy, dw, dh] of pieces) {
+      context.drawImage(source, sx, sy, sw, sh, dx, dy, dw, dh);
+    }
   }
 
   registerAnimation(
@@ -303,69 +533,64 @@ export class AtlasTexture extends CanvasTexture {
   ) {
     const animation = new FaceAnimation(range, keyframes, fadeFrames);
 
-    const entry = { animation, timer: null };
+    // Animation frames never set `needsUpdate` on this texture: doing so
+    // re-uploads the entire atlas canvas to the GPU every frame change,
+    // which for a fading animation means a multi-megabyte texSubImage2D
+    // stall on nearly every frame. Frames are composited on a per-animation
+    // scratch canvas instead, mirrored onto the atlas canvas (so full
+    // uploads stay coherent), and queued as a small sub-rectangle GPU patch
+    // that the world flushes before rendering.
+    const entry = {
+      animation,
+      timer: null as null,
+      patch: this.makeAnimationPatch(animation),
+      durationsMs: animation.keyframes.map(([duration]) => duration),
+      drawnFrame: -1,
+    };
+    this.animations.push(entry);
+    this.forgetTexelClasses(range);
+    this.tickAnimation(entry, this.animationClock());
+  }
 
-    // Animation ticks never set `needsUpdate` on this texture: doing so
-    // re-uploads the entire atlas canvas to the GPU every tick, which for a
-    // fading animation means a multi-megabyte texSubImage2D stall on nearly
-    // every frame. Frames are composited on a per-animation scratch canvas
-    // instead, mirrored onto the atlas canvas (so full uploads stay
-    // coherent), and queued as a small sub-rectangle GPU patch that the
-    // world flushes before rendering.
-    const patch = this.makeAnimationPatch(animation);
+  /**
+   * Draws whichever animated faces changed frame since the last call, read
+   * off {@link animationClock}. Called once a frame by the world; a face
+   * whose frame has not changed costs a lookup and nothing else.
+   */
+  tickAnimations(seconds = this.animationClock()) {
+    for (const entry of this.animations) this.tickAnimation(entry, seconds);
+  }
 
-    const start = (index = 0) => {
-      const keyframe = animation.keyframes[index];
+  private tickAnimation(
+    entry: AtlasTexture["animations"][number],
+    seconds: number,
+  ) {
+    const { animation, patch } = entry;
+    const fades = animation.fadeFrames;
+    const frame = faceAnimationFrameAt(
+      entry.durationsMs,
+      fades,
+      seconds * 1000,
+      this.scratchFrame,
+    );
+    const drawn = frame.index * (fades + 1) + frame.fadeStep;
+    if (drawn === entry.drawnFrame) return;
+    entry.drawnFrame = drawn;
 
+    const current = animation.keyframes[frame.index][1];
+    if (frame.fadeStep === 0) {
+      this.drawAnimationKeyframe(patch, current, this.countPerSide !== 1, 1);
+    } else {
+      const fraction = frame.fadeStep / (fades + 1);
       this.drawAnimationKeyframe(
         patch,
-        keyframe[1],
-        this.countPerSide !== 1,
-        1,
+        animation.keyframes[frame.next][1],
+        true,
+        fraction,
       );
-      this.commitAnimationPatch(animation, patch);
-
-      entry.timer = setTimeout(() => {
-        clearTimeout(entry.timer);
-
-        const nextIndex = (index + 1) % animation.keyframes.length;
-
-        if (fadeFrames > 0) {
-          const nextKeyframe = animation.keyframes[nextIndex];
-
-          const fade = (fraction = 0) => {
-            if (fraction > fadeFrames) {
-              start(nextIndex);
-              return;
-            }
-
-            requestAnimationFrame(() => fade(fraction + 1));
-
-            this.drawAnimationKeyframe(
-              patch,
-              nextKeyframe[1],
-              true,
-              fraction / fadeFrames,
-            );
-            this.drawAnimationKeyframe(
-              patch,
-              keyframe[1],
-              false,
-              1 - fraction / fadeFrames,
-            );
-            this.commitAnimationPatch(animation, patch);
-          };
-
-          fade();
-        } else {
-          start(nextIndex);
-        }
-      }, keyframe[0]);
-    };
-
-    this.animations.push(entry);
-
-    start();
+      this.drawAnimationKeyframe(patch, current, false, 1 - fraction);
+    }
+    this.commitAnimationPatch(animation, patch);
   }
 
   private makeAnimationPatch(animation: FaceAnimation): AtlasAnimationPatch {
@@ -402,7 +627,6 @@ export class AtlasTexture extends CanvasTexture {
   ) {
     const context = patch.scratch.getContext("2d");
     const size = patch.size;
-    const inner = this.dimension * this.atlasRatio;
 
     context.save();
     context.globalAlpha = opacity;
@@ -419,16 +643,7 @@ export class AtlasTexture extends CanvasTexture {
       return;
     }
 
-    const source = image as HTMLImageElement;
-
-    // Same margin-bleed layout as drawImageToRange: a padded backdrop, a
-    // carved center, then the actual texture in the center.
-    if (clearRect) {
-      context.drawImage(source, 0, 0, size, size);
-      context.clearRect(this.atlasMargin, this.atlasMargin, inner, inner);
-    }
-
-    context.drawImage(source, this.atlasMargin, this.atlasMargin, inner, inner);
+    this.drawPaddedTile(context, image as HTMLImageElement, 0, 0);
 
     context.restore();
   }
@@ -442,6 +657,12 @@ export class AtlasTexture extends CanvasTexture {
     const context = this.canvas.getContext("2d");
     context.clearRect(patch.x, patch.y, patch.size, patch.size);
     context.drawImage(patch.scratch, patch.x, patch.y);
+
+    // An animated slot is painted by its keyframes, never by
+    // drawImageToRange; the census must count it as dressed all the same.
+    const rangeKey = AtlasTexture.rangeKey(animation.range);
+    this.paintedRangeKeys.add(rangeKey);
+    this.fallbackRangeKeys.delete(rangeKey);
 
     this.pendingAnimationPatches.set(animation, patch);
   }
@@ -487,6 +708,17 @@ export class AtlasTexture extends CanvasTexture {
       );
     });
     this.pendingAnimationPatches.clear();
+
+    // texSubImage2D only ever touches mip level 0. With mips on
+    // (`mip-aniso`), every level above it would otherwise keep whatever
+    // frame was baked in at the last full upload forever — a flowing lava
+    // or water tile the moment it is more than a few blocks off would show
+    // a stuck frame while everything up close animated normally. The whole
+    // point of the sub-rect patch is to skip a full re-upload, so this
+    // regenerates the chain only when one is actually in use.
+    if (this.generateMipmaps) {
+      gl.generateMipmap(gl.TEXTURE_2D);
+    }
 
     renderer.state.unbindTexture();
   }

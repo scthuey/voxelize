@@ -1,0 +1,28 @@
+---
+description: No frame spikes once the player is playing; heavy one-time work belongs to the load phase under a budgeted drain
+globs: packages/**/src/**/*.ts
+alwaysApply: false
+---
+
+# No Frame Spikes Once The Player Is Playing
+
+a decent loading time is acceptable. a hitch during play is not. this is a hard requirement, not a preference to trade away for convenience.
+
+heavy one-time work therefore has exactly one correct home: the **load phase**, sliced across frames under a named budget, with the player held out of the world until it drains. not one multi-second blocking frame, and not deferred into gameplay.
+
+- `createBudgetedDrain` (`packages/core/src/libs/instancing/frame-budget.ts`) is the mechanism. it runs at least one unit per frame and ends the slice once accumulated cost reaches the budget — the budget is checked *after* a unit, because a unit that cannot be split cannot be refused, and a budget that could refuse every unit would never drain. a hidden tab is served no frames, so a host installs `setHiddenTabTicker` (the engine's `setWorkerInterval` fits) or a drain awaited there strands its caller.
+- instanced entity pools are the worked example: `InstancedEntityRoster.warm()` bakes every variant a slice per frame, the host's join flow awaits it, and `noteLazyBake` / `noteLazyWork` (`libs/instancing/pool-warmup.ts`) warn loudly if a bake lands after `markPlayInteractive()`. on-demand baking survives only as a correctness fallback, never as the plan. the roster discovers warmable pools by duck-typing `WarmablePool`, so a pool that does not implement `warmNextVariant` is silently excluded and bakes mid-play.
+- **lazy is not the fix for a slow load.** baking a variant the first time it is seen converts one loading stall into a hitch every time a new variant walks into view. moving cost out of load and into play makes the problem worse, not smaller.
+- never iterate a chunk's voxels synchronously on the client main thread. same rule, different scale: offload to a worker, or chunk it across frames.
+
+measure rather than assert. the agent's `measureFrameRate({ warmupMs, durationMs })` against a busy scene is what makes a frame-rate claim true, and a measurement keeps its exact repro inputs (world, camera, warmup, duration, thresholds). the `voxelize-instanced-entities` skill covers the warmup contract end to end.
+
+## uploads during play, on a Mac
+
+every browser on a Mac draws WebGL through ANGLE's Metal backend, and three things it does there turn a small upload into a cost of the whole buffer. the far layer lost most of its frame rate to them while it streamed tiles (`far-terrain-batch.ts`):
+
+- a `bufferSubData` into a buffer the GPU still draws from (anything drawn in the last frames) allocates a new buffer of the whole size and copies all of the old one into it. a buffer that takes uploads during play stays small: page it (the far layer's batch is pages of a million vertices), don't grow one.
+- an indexed draw from an index buffer that changed waits for the GPU and scans the whole buffer for primitive-restart markers on the CPU. a buffer that changes during play draws without an index.
+- a vertex stride that is not a multiple of four bytes (an `Int16` vec3) is converted into an aligned copy of the whole buffer, again after every upload into it. pad to four components.
+
+texture uploads go through a freshly allocated staging buffer, and three's `BatchedMesh` re-uploads its draw-id texture on every pass it culls or sorts, and re-reads and transforms every instance's bounds as it does. a batch whose instances rarely move (chunk sections, far tiles) is a `StaticBatchedMesh` (`static-batched-mesh.ts`): bounds kept until an instance moves or is rewritten, the draw-id texture uploaded only when the list in it changed. count batches as well as draw calls. to see any of this, run macOS `sample <pid>` on the browser's GPU process (`--type=gpu-process`) during the motion: ANGLE is stripped, but Metal's `waitUntilCompleted`, `commandBuffer` waits and `AGXBuffer` allocations show by name.

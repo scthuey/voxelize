@@ -5,12 +5,20 @@ import {
   Mesh,
   MeshBasicMaterial,
   ShaderMaterial,
+  Vector2,
   Vector3,
 } from "three";
 
 import { CanvasBox, CanvasBoxOptions } from "../../libs/canvas-box";
 import SkyFragmentShader from "../../shaders/sky/fragment.glsl?raw";
 import SkyVertexShader from "../../shaders/sky/vertex.glsl?raw";
+
+import { markNeverCaster } from "./shadow-casters";
+import {
+  createSkyGlowStatements,
+  SKY_GLOW_UNIFORM_DECLARATIONS,
+} from "./sky-fog";
+import { WATER_OPTICS } from "./water-optics";
 
 export type SkyShadingCycleData = {
   start: number;
@@ -49,6 +57,60 @@ export type SkyOptions = {
   textureBloomIntensity: number;
 };
 
+/**
+ * The sky's own light, drawn by the dome and by every fogged surface from
+ * one set of uniform objects (`createSkyGlowStatements`), so the haze in
+ * front of a sunset wears exactly the light of the sky behind it. Colours
+ * are linear and already scaled by their strength; all black, the default,
+ * adds nothing. The world keeps `sunDirection` on the drawn disc each frame
+ * (`getSunDiscDirection`); a host paints the colours.
+ */
+export type SkyGlowUniforms = {
+  /** Toward the sun's disc, never clamped or tilted; the moon is opposite. */
+  sunDirection: { value: Vector3 };
+  /** The broad aura round the sun and the band along the horizon under it. */
+  color: { value: Color };
+  /** The halo the haze scatters round the sun's disc. */
+  sunHaloColor: { value: Color };
+  /** The halo round the moon's disc. */
+  moonHaloColor: { value: Color };
+  /**
+   * The discs as the host draws them in the sky (colour times how much of
+   * it shows), for the fog to carry: terrain hides the drawn disc by depth
+   * even where its haze has made it the sky's own colour.
+   */
+  sunDiscColor: { value: Color };
+  moonDiscColor: { value: Color };
+  /** The discs' angular radii in radians: x the sun, y the moon. */
+  discRadii: { value: Vector2 };
+};
+
+export const createSkyGlowUniforms = (): SkyGlowUniforms => ({
+  sunDirection: { value: new Vector3(0, 1, 0) },
+  color: { value: new Color(0, 0, 0) },
+  sunHaloColor: { value: new Color(0, 0, 0) },
+  moonHaloColor: { value: new Color(0, 0, 0) },
+  sunDiscColor: { value: new Color(0, 0, 0) },
+  moonDiscColor: { value: new Color(0, 0, 0) },
+  discRadii: { value: new Vector2(0.07, 0.07) },
+});
+
+/** The glow as a shader binds it; black for a host that paints none. */
+export const bindSkyGlowUniforms = (
+  glow: SkyGlowUniforms = createSkyGlowUniforms(),
+) => ({
+  uSkyGlowSunDirection: glow.sunDirection,
+  uSkyGlowColor: glow.color,
+  uSkySunHaloColor: glow.sunHaloColor,
+  uSkyMoonHaloColor: glow.moonHaloColor,
+  uSkySunDiscColor: glow.sunDiscColor,
+  uSkyMoonDiscColor: glow.moonDiscColor,
+  uSkyDiscRadii: glow.discRadii,
+});
+
+/** Marks where the dome's shader takes the glow statements. */
+const SKY_GLOW_INCLUDE = "#include <sky_glow>";
+
 const defaultOptions: SkyOptions = {
   dimension: 2000,
   lerpFactor: 0.1,
@@ -56,6 +118,61 @@ const defaultOptions: SkyOptions = {
   textureBloomThreshold: 0.72,
   textureBloomIntensity: 2,
 };
+
+/**
+ * Direction from the viewer to the centre of the painted sun disc for a
+ * time of day (0 midnight, 0.25 sunrise, 0.5 noon, 0.75 sunset). The disc
+ * is the centre of the sky box's bottom face, and {@link Sky.update} spins
+ * the box about Z by one turn per day, so the sun points straight down at
+ * midnight, rises along +X, stands at the zenith at noon and sets along -X.
+ * The moon is the top face, diametrically opposite.
+ *
+ * This is where the disc is *drawn*. The shading light
+ * (`ShaderLightingUniforms.sunDirection`) is deliberately not this: it is
+ * held above a minimum elevation, tilted off the sun's plane, and blended
+ * toward the moon through twilight so terrain shading and shadows stay
+ * readable. Anything that has to line up with the disc the player sees — a
+ * reflection on water — reads this instead.
+ */
+export function getSunDiscDirection(
+  timeOfDay: number,
+  target: Vector3,
+): Vector3 {
+  const angle = timeOfDay * Math.PI * 2 - Math.PI / 2;
+  return target.set(Math.cos(angle), Math.sin(angle), 0);
+}
+
+/**
+ * The celestial disc above the horizon: the sun while it is up, the moon
+ * (its antipode) once it has set. The choice flips at the instant both sit
+ * on the horizon, and nothing shows it: a disc at zero elevation only
+ * mirrors into a ray that is itself horizontal.
+ */
+export function getVisibleDiscDirection(
+  timeOfDay: number,
+  target: Vector3,
+): Vector3 {
+  getSunDiscDirection(timeOfDay, target);
+  if (target.y < 0) {
+    target.negate();
+  }
+  return target;
+}
+
+/**
+ * The dome's fragment shader with the sky's glow spliced in: the same
+ * statements the fog runs, along the dome's own view ray.
+ */
+export function composeSkyFragmentShader(): string {
+  if (!SkyFragmentShader.includes(SKY_GLOW_INCLUDE)) {
+    throw new Error(`Sky: the dome shader lost its ${SKY_GLOW_INCLUDE} line`);
+  }
+  return `${SKY_GLOW_UNIFORM_DECLARATIONS}
+${SkyFragmentShader.replace(
+  SKY_GLOW_INCLUDE,
+  createSkyGlowStatements("normalize(skyPosition)", "skyGlow"),
+)}`;
+}
 
 /**
  * Sky consists of both a large dodecahedron used to render the 3-leveled sky gradient and a {@link CanvasBox} that renders custom sky textures (
@@ -133,17 +250,46 @@ export class Sky extends CanvasBox {
    */
   public uUnderwaterFade = { value: 0 };
 
+  /**
+   * 1 while the camera is under water: the dome then shows the sky only
+   * through the Snell window, refracted, and the water's in-scatter
+   * everywhere else.
+   */
+  public uUnderwaterSubmerged = { value: 0 };
+
+  /** The celestial disc's direction, colour and light, for the refracted
+   * disc the dome draws inside the Snell window. */
+  public uCelestialDirection = { value: new Vector3(0, 1, 0) };
+  public uSunColor = { value: new Color(1, 1, 1) };
+  public uSunlightIntensity = { value: 1 };
+  /** The share of the disc's light that reaches the world as a beam (the
+   * chunk renderer's `directSunlight`): a veiled disc is not drawn. */
+  public uDirectSunlight = { value: 1 };
+
+  /**
+   * The sky's own light (see {@link SkyGlowUniforms}). The world shares these
+   * objects with the fog of every surface it draws.
+   */
+  public readonly glow: SkyGlowUniforms;
+
   public shadingData: SkyShadingCycleData[] = [];
 
   private textureBloomMaterials = new WeakSet<MeshBasicMaterial>();
+
+  /** The gradient dome (`createSkyShading`), the sky's own ShaderMaterial. */
+  private shading: Mesh<DodecahedronGeometry, ShaderMaterial> | null = null;
 
   /**
    * Create a new sky instance.
    *
    * @param dimension The dimension of the dodecahedron sky. The inner canvas box is 0.8 times this dimension.
    * @param lerpFactor The lerp factor for the sky gradient. The sky gradient is updated every frame by lerping the current color to the target color.
+   * @param glow The glow's uniform objects, to share them with the fog.
    */
-  constructor(options: Partial<SkyOptions> = {}) {
+  constructor(
+    options: Partial<SkyOptions> = {},
+    glow: SkyGlowUniforms = createSkyGlowUniforms(),
+  ) {
     super({
       width:
         (options.dimension ? options.dimension : defaultOptions.dimension) *
@@ -161,6 +307,8 @@ export class Sky extends CanvasBox {
       ...options,
     };
 
+    this.glow = glow;
+
     this.uTextureBloomThreshold = {
       value: this.options.textureBloomThreshold,
     };
@@ -171,6 +319,7 @@ export class Sky extends CanvasBox {
     this.boxMaterials.forEach((m) => (m.depthWrite = false));
     this.frustumCulled = false;
     this.renderOrder = -1;
+    markNeverCaster(this);
 
     this.boxLayers.forEach((layer) => {
       layer.renderOrder = -1;
@@ -249,13 +398,6 @@ export class Sky extends CanvasBox {
     this.applyTextureBloomToMaterials();
 
     this.rotation.z = Math.PI * 2 * (time / timePerDay);
-
-    ["top", "right", "left", "front", "back"].forEach((face) => {
-      const mat = this.boxMaterials.get(face);
-      if (mat) {
-        // Update sky opacity to hide stars when the sun is up.
-      }
-    });
 
     this.position.copy(position);
 
@@ -419,9 +561,18 @@ export class Sky extends CanvasBox {
         uExponent2: { value: 1.2 },
         uUnderwaterAmbient: this.uUnderwaterAmbient,
         uUnderwaterFade: this.uUnderwaterFade,
+        uUnderwaterSubmerged: this.uUnderwaterSubmerged,
+        uUnderwaterInScatterTilt: {
+          value: WATER_OPTICS.underwaterInScatterTilt,
+        },
+        uCelestialDirection: this.uCelestialDirection,
+        uSunColor: this.uSunColor,
+        uSunlightIntensity: this.uSunlightIntensity,
+        uDirectSunlight: this.uDirectSunlight,
+        ...bindSkyGlowUniforms(this.glow),
       },
       vertexShader: SkyVertexShader,
-      fragmentShader: SkyFragmentShader,
+      fragmentShader: composeSkyFragmentShader(),
       depthWrite: false,
       side: BackSide,
     });
@@ -431,7 +582,22 @@ export class Sky extends CanvasBox {
 
     // We use attach here so that the sky shading is not affected by the box's rotation.
     this.attach(shadingMesh);
+    this.shading = shadingMesh;
   };
+
+  /**
+   * Frees the box's layers (geometry, face canvases and materials, atlas)
+   * and the gradient dome's geometry and shader. Call once the sky has left
+   * the scene for good.
+   */
+  dispose() {
+    super.dispose();
+    if (this.shading) {
+      this.shading.geometry.dispose();
+      this.shading.material.dispose();
+      this.shading = null;
+    }
+  }
 
   private applyTextureBloomToMaterials = () => {
     this.boxLayers.forEach((layer) => {

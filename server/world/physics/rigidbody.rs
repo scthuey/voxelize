@@ -106,6 +106,21 @@ pub struct RigidBody {
     /// so nothing double-applies when it unfreezes. Velocity is preserved as
     /// the captured motion state the body resumes from.
     pub is_frozen: bool,
+
+    /// Whether this body sits out the entity-to-entity repulsion for now:
+    /// its collider is disabled in the contact step, so it neither shoves
+    /// nor is shoved by other bodies, while voxel collision is untouched.
+    /// For a body deliberately overlapping another — an insect perched on a
+    /// creature's hand or head — which the repulsion would otherwise push
+    /// off the perch every tick. Off by default; the behavior that puts a
+    /// body on another sets it, and clears it when the body leaves.
+    pub is_repulsion_exempt: bool,
+
+    /// Constrain entity contact separation to the horizontal plane. Ground
+    /// creatures use this so crowds make room sideways instead of launching
+    /// smaller creatures upward. Voxel physics, gravity and jumps still act
+    /// in three dimensions. Set before registering this body with Physics.
+    pub horizontal_repulsion: bool,
 }
 
 impl RigidBody {
@@ -216,6 +231,7 @@ pub struct RigidBodyBuilder {
     gravity_multiplier: f32,
     auto_step: bool,
     prow_clearance: f32,
+    horizontal_repulsion: bool,
 }
 
 impl RigidBodyBuilder {
@@ -268,6 +284,11 @@ impl RigidBodyBuilder {
         self
     }
 
+    pub fn horizontal_repulsion(mut self, horizontal_repulsion: bool) -> Self {
+        self.horizontal_repulsion = horizontal_repulsion;
+        self
+    }
+
     pub fn build(self) -> RigidBody {
         RigidBody {
             collision: None,
@@ -297,6 +318,8 @@ impl RigidBodyBuilder {
             prow_clearance: self.prow_clearance,
             is_placement_validated: false,
             is_frozen: false,
+            is_repulsion_exempt: false,
+            horizontal_repulsion: self.horizontal_repulsion,
         }
     }
 }

@@ -6,8 +6,20 @@ import type {
   FrameRateMeasurementOptions,
 } from "./bridge";
 import { ensureCaptureDir } from "./capture-dir";
+import type { FillBox, FillLandingReport } from "./fill-landing";
+import type { ProfileSummary } from "./profile-summary";
+
+export type { ProfileSummary } from "./profile-summary";
 
 export type Vec3Tuple = [number, number, number];
+
+export type ArenaFillOptions = {
+  rotation?: "py" | "ny" | "px" | "nx" | "pz" | "nz";
+  yRotation?: number;
+  stage?: number;
+  /** false sends the fill without reading it back. */
+  isVerifying?: boolean;
+};
 
 export type EntitySnapshot = {
   id: string;
@@ -30,16 +42,49 @@ export type BlockInfo = {
   yRotation: number;
 };
 
+/**
+ * The server methods an arena drives. The SDK owns this contract: a host
+ * server implements these four methods under the default names, or maps
+ * them to its own through `ArenaOptions.methods`. Nothing here assumes a
+ * particular game's block set or world; anything game-specific goes through
+ * `Arena.call`.
+ *
+ * - `fill`: `{ min, max, block, rotation?, yRotation?, stage? }` writes a box
+ *   of one block (name or "air").
+ * - `spawn`: `{ kind, position, scenarioId, metadata?, ...payload }` creates
+ *   a scenario-owned entity; `SpawnOptions.payload` carries host-defined
+ *   fields.
+ * - `despawn`: `{ scenarioId }` removes every entity the scenario spawned.
+ * - `announce`: `{ name, arenaIndex, event }` broadcasts a scenario
+ *   lifecycle marker for observers.
+ */
+export type ArenaMethodNames = {
+  fill: string;
+  spawn: string;
+  despawn: string;
+  announce: string;
+};
+
+export const DEFAULT_ARENA_METHODS: ArenaMethodNames = {
+  fill: "test:fill",
+  spawn: "test:spawn",
+  despawn: "test:despawn",
+  announce: "test:announce",
+};
+
 export type ArenaOptions = {
   agentUrl?: string;
   index?: number;
   size?: Vec3Tuple;
   scenarioId?: string;
+  /** Host method names, when the server does not use the defaults. */
+  methods?: Partial<ArenaMethodNames>;
 };
 
 export type SpawnOptions = {
   metadata?: Record<string, boolean | number | string | null>;
-  waterSeekChance?: number;
+  /** Extra host-defined fields merged into the spawn payload. */
+  payload?: Record<string, boolean | number | string | null>;
 };
 
 // Match the CLI's daemon resolution: explicit AGENT_URL beats AGENT_PORT
@@ -99,12 +144,14 @@ export class Arena {
   public readonly index: number;
   public readonly size: Vec3Tuple;
   public readonly scenarioId: string;
+  public readonly methods: ArenaMethodNames;
 
   constructor(opts: ArenaOptions = {}) {
     this.agentUrl = opts.agentUrl ?? DEFAULT_AGENT_URL;
     this.index = opts.index ?? 0;
     this.size = opts.size ?? DEFAULT_ARENA_SIZE;
     this.scenarioId = opts.scenarioId ?? randomScenarioId();
+    this.methods = { ...DEFAULT_ARENA_METHODS, ...opts.methods };
   }
 
   get origin(): Vec3Tuple {
@@ -129,53 +176,116 @@ export class Arena {
     return [cx, cy + this.size[1] + 6, cz];
   }
 
+  /**
+   * Writes a box and reads it back until every voxel holds the block (see
+   * the daemon's `fill` act): a call the connection lost is sent again,
+   * and a fill that never lands throws, naming what is missing. Returns the
+   * landing report, or null when `isVerifying` is false.
+   */
   async fill(
     min: Vec3Tuple,
     max: Vec3Tuple,
     block: string,
-    options: {
-      rotation?: "py" | "ny" | "px" | "nx" | "pz" | "nz";
-      yRotation?: number;
-      stage?: number;
-    } = {},
-  ): Promise<void> {
-    await this.call("test:fill", {
-      min: this.worldPos(min),
-      max: this.worldPos(max),
-      block,
-      ...(options.rotation !== undefined && { rotation: options.rotation }),
-      ...(options.yRotation !== undefined && {
-        yRotation: options.yRotation,
-      }),
-      ...(options.stage !== undefined && { stage: options.stage }),
-    });
+    options: ArenaFillOptions = {},
+  ): Promise<FillLandingReport | null> {
+    return this.fillBoxes(
+      [
+        {
+          min: this.worldPos(min),
+          max: this.worldPos(max),
+          block,
+          ...(options.rotation !== undefined && { rotation: options.rotation }),
+          ...(options.yRotation !== undefined && {
+            yRotation: options.yRotation,
+          }),
+          ...(options.stage !== undefined && { stage: options.stage }),
+        },
+      ],
+      options.isVerifying,
+    );
   }
 
-  async cage(block: string): Promise<void> {
+  async cage(block: string): Promise<FillLandingReport | null> {
     const [sx, sy, sz] = this.size;
     const mx = sx - 1;
     const my = sy - 1;
     const mz = sz - 1;
-    await this.fill([0, 1, 0], [0, my, mz], block);
-    await this.fill([mx, 1, 0], [mx, my, mz], block);
-    await this.fill([1, 1, 0], [mx - 1, my, 0], block);
-    await this.fill([1, 1, mz], [mx - 1, my, mz], block);
-    await this.fill([1, my, 1], [mx - 1, my, mz - 1], block);
+    const walls: [Vec3Tuple, Vec3Tuple][] = [
+      [
+        [0, 1, 0],
+        [0, my, mz],
+      ],
+      [
+        [mx, 1, 0],
+        [mx, my, mz],
+      ],
+      [
+        [1, 1, 0],
+        [mx - 1, my, 0],
+      ],
+      [
+        [1, 1, mz],
+        [mx - 1, my, mz],
+      ],
+      [
+        [1, my, 1],
+        [mx - 1, my, mz - 1],
+      ],
+    ];
+    return this.fillBoxes(
+      walls.map(([min, max]) => ({
+        min: this.worldPos(min),
+        max: this.worldPos(max),
+        block,
+      })),
+    );
   }
 
-  async wipe(): Promise<void> {
+  async wipe(): Promise<FillLandingReport | null> {
     const [ox, oy, oz] = this.origin;
     const max = MAX_ARENA_FOOTPRINT;
     // The ceiling must clear the tallest thing a scenario can build: a
     // cage() lid sits at rel size[1] - 1, which for tall arenas is above
-    // the flat WIPE_Y_ABOVE — leaving an invisible Barrier lid floating
-    // over the slot for every later scenario (found the hard way).
+    // the flat WIPE_Y_ABOVE — leaving a lid (invisible, when the cage block
+    // is see-through) floating over the slot for every later scenario
+    // (found the hard way).
     const wipeTop = Math.max(WIPE_Y_ABOVE, this.size[1] + 1);
-    await this.call("test:fill", {
-      min: [ox - WIPE_PAD, oy - WIPE_Y_BELOW, oz - WIPE_PAD],
-      max: [ox + max + WIPE_PAD, oy + wipeTop, oz + max + WIPE_PAD],
-      block: "air",
+    return this.fillBoxes([
+      {
+        min: [ox - WIPE_PAD, oy - WIPE_Y_BELOW, oz - WIPE_PAD],
+        max: [ox + max + WIPE_PAD, oy + wipeTop, oz + max + WIPE_PAD],
+        block: "air",
+      },
+    ]);
+  }
+
+  private async fillBoxes(
+    fills: FillBox[],
+    isVerifying = true,
+  ): Promise<FillLandingReport | null> {
+    const res = await fetch(`${this.agentUrl}/act`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        type: "fill",
+        method: this.methods.fill,
+        fills,
+        isVerifying,
+      }),
     });
+    const text = await res.text();
+    let body: { ok?: boolean; error?: string; result?: unknown } | null = null;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      body = null;
+    }
+    if (!res.ok || !body?.ok) {
+      throw new Error(
+        `agent fill (${this.methods.fill}) failed: ${res.status} ${body?.error ?? text}`,
+      );
+    }
+    return isVerifying ? (body.result as FillLandingReport) : null;
   }
 
   async spawn(
@@ -184,6 +294,7 @@ export class Arena {
     opts: SpawnOptions = {},
   ): Promise<EntityHandle> {
     const payload: Record<string, unknown> = {
+      ...opts.payload,
       kind,
       position: this.worldPos(rel),
       scenarioId: this.scenarioId,
@@ -191,26 +302,19 @@ export class Arena {
     if (opts.metadata) {
       payload.metadata = opts.metadata;
     }
-    if (opts.waterSeekChance !== undefined) {
-      payload.waterSeekChance = opts.waterSeekChance;
-    }
-    await this.call("test:spawn", payload);
+    await this.call(this.methods.spawn, payload);
     return new EntityHandle(this, kind, rel);
   }
 
   async despawn(): Promise<void> {
-    await this.call("test:despawn", { scenarioId: this.scenarioId });
-  }
-
-  async forceWaterSeek(): Promise<void> {
-    await this.call("test:force-water-seek", { scenarioId: this.scenarioId });
+    await this.call(this.methods.despawn, { scenarioId: this.scenarioId });
   }
 
   async announce(
     name: string,
     event: "start" | "pass" | "fail",
   ): Promise<void> {
-    await this.call("test:announce", {
+    await this.call(this.methods.announce, {
       name,
       arenaIndex: this.index,
       event,
@@ -335,6 +439,18 @@ export type AgentControls = {
   measureFrameRate(
     opts?: FrameRateMeasurementOptions,
   ): Promise<FrameRateMeasurement>;
+  /**
+   * GET /profile: main-thread time per function per rendered frame over a
+   * sampling window, optionally with allocation churn. `watch` is a regex
+   * (case-insensitive) over `functionName file:line` labels; the matching
+   * functions come back in `watch` so a gate can assert on exactly them.
+   */
+  profile(opts?: {
+    durationMs?: number;
+    isSamplingAllocations?: boolean;
+    watch?: string;
+    top?: number;
+  }): Promise<ProfileSummary>;
   screenshot(label: string, opts?: { isPure?: boolean }): Promise<string>;
 };
 
@@ -419,6 +535,34 @@ function createAgentControls(
         throw new Error(`frame-rate failed: ${res.status} ${await res.text()}`);
       }
       return (await res.json()) as FrameRateMeasurement;
+    },
+    async profile(opts = {}) {
+      const params = new URLSearchParams();
+      if (opts.durationMs !== undefined) {
+        params.set("durationMs", String(opts.durationMs));
+      }
+      if (opts.isSamplingAllocations) params.set("alloc", "1");
+      if (opts.watch) params.set("watch", opts.watch);
+      if (opts.top !== undefined) params.set("top", String(opts.top));
+      const query = params.size > 0 ? `?${params}` : "";
+      // The window itself plus the profiler's own start/stop overhead.
+      const timeoutMs = (opts.durationMs ?? 10_000) + 30_000;
+      const res = await fetch(`${agentUrl}/profile${query}`, {
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!res.ok) {
+        throw new Error(`profile failed: ${res.status} ${await res.text()}`);
+      }
+      const summary = (await res.json()) as ProfileSummary;
+      log(
+        `profile: ${summary.frames} frames, busy ${summary.busyMsPerFrame.toFixed(2)} ms/frame, ` +
+          `gc ${summary.gcMsPerFrame.toFixed(2)} ms/frame${
+            summary.allocation
+              ? `, alloc ${summary.allocation.totalMBPerSecond.toFixed(1)} MB/s`
+              : ""
+          }`,
+      );
+      return summary;
     },
     async screenshot(label, opts) {
       const safe = label.replace(/[^a-z0-9_-]/gi, "_");

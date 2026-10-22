@@ -30,6 +30,12 @@ export type GeometryProtocol = {
   indices: Uint32Array;
   lights: Uint32Array;
   normals?: Float32Array | Int8Array;
+  /**
+   * Per-vertex quad light twist, four bytes per vertex, derived on the
+   * client from `lights` and `indices` (see the core's quad-light.ts).
+   * Absent on the wire; the mesh worker fills it in.
+   */
+  lightTwist?: Uint8Array;
   bsCenter?: [number, number, number];
   bsRadius?: number;
 };
@@ -47,6 +53,8 @@ export type ChunkProtocol = {
   meshes: MeshProtocol[];
   voxels: Uint32Array;
   lights: Uint32Array;
+  /** Four x-fast RGB corner multipliers, byte / 128.0; absent on older worlds. */
+  biomeTints?: Uint8Array;
 };
 
 export type PeerProtocol<T> = {
@@ -113,6 +121,38 @@ export type ChatProtocol = {
   metadata?: string;
   traceId?: string;
   tSendMs?: number;
+  /**
+   * Position in the world's chat log, stamped by the server on every public
+   * line it keeps; zero (or absent) for a line it does not.
+   */
+  seq?: number;
+  /** Unix milliseconds the server logged the line at; zero when unlogged. */
+  sentAt?: number;
+};
+
+/**
+ * One line of a world's chat history, as the server replays it on join (the
+ * INIT `chatHistory` key) and pages it (`vox-builtin:chat-history`).
+ */
+export type ChatHistoryEntry = {
+  seq: number;
+  sentAt: number;
+  /** Who spoke as the server knows it: "player", "system", or a game kind. */
+  kind: string;
+  senderId: string;
+  senderName: string;
+  /** The chat protocol type the line was broadcast with. */
+  type: string;
+  sender: string;
+  body: string;
+  metadata: string;
+};
+
+/** A page of chat history, oldest first. */
+export type ChatHistoryPage = {
+  entries: ChatHistoryEntry[];
+  /** Whether the server holds lines older than the first entry. */
+  hasMore: boolean;
 };
 
 export type MessageProtocol<
@@ -159,4 +199,10 @@ export type MessageProtocol<
   bulkUpdate?: BulkUpdateProtocol;
   perfByteSize?: number;
   perfTraceId?: string;
+  /**
+   * `performance.now()` when this message's raw bytes reached the client,
+   * before queueing and decode. Lets a chunk's timeline separate the server
+   * and wire from the client's own decode queue.
+   */
+  perfArrivedAt?: number;
 };

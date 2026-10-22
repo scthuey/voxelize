@@ -186,9 +186,15 @@ impl World {
 
             drop(interests);
 
+            // Nobody wants these any more: drop their queued stages and
+            // meshes, but let work already running land on the chunk, and
+            // keep the stages of a chunk a neighbor is waiting on. Pulling
+            // in-flight work out threw its result away and left neighbors
+            // waiting on a stage nothing would run.
             to_remove.into_iter().for_each(|coords| {
-                self.pipeline_mut().remove_chunk(coords);
-                self.mesher_mut().remove_chunk(coords);
+                let is_awaited = self.chunks().listeners.contains_key(coords);
+                self.pipeline_mut().release_unwanted(coords, is_awaited);
+                self.mesher_mut().drop_queued(coords);
             })
         }
     }
@@ -196,122 +202,134 @@ impl World {
     /// Handler for `Update` type messages.
     pub(super) fn on_update(&mut self, client_id: &str, data: Message) {
         let chunk_size = self.config().chunk_size;
-        let mut chunks = self.chunks_mut();
 
-        if let Some(bulk) = data.bulk_update {
-            let lengths = [
-                bulk.vx.len(),
-                bulk.vy.len(),
-                bulk.vz.len(),
-                bulk.voxels.len(),
-            ];
-            if lengths.iter().any(|length| *length != lengths[0]) {
-                warn!(
-                    "Ignoring malformed bulk voxel update from {client_id}: \
-                     vx/vy/vz/voxel lengths were {:?}",
-                    lengths
-                );
-                return;
-            }
+        let writes: Vec<(Vec3<i32>, u32)> = {
+            let chunks = self.chunks();
+            let is_within = |vx: i32, vy: i32, vz: i32| {
+                chunks.is_within_world(&ChunkUtils::map_voxel_to_chunk(vx, vy, vz, chunk_size))
+            };
 
-            for (((vx, vy), vz), voxel) in bulk
-                .vx
-                .into_iter()
-                .zip(bulk.vy)
-                .zip(bulk.vz)
-                .zip(bulk.voxels)
-            {
-                let coords = ChunkUtils::map_voxel_to_chunk(vx, vy, vz, chunk_size);
-
-                if !chunks.is_within_world(&coords) {
-                    continue;
-                }
-
-                chunks.update_voxel(&Vec3(vx, vy, vz), voxel);
-            }
-        } else {
-            data.updates.into_iter().for_each(|update| {
-                let coords =
-                    ChunkUtils::map_voxel_to_chunk(update.vx, update.vy, update.vz, chunk_size);
-
-                if !chunks.is_within_world(&coords) {
+            if let Some(bulk) = data.bulk_update {
+                let lengths = [
+                    bulk.vx.len(),
+                    bulk.vy.len(),
+                    bulk.vz.len(),
+                    bulk.voxels.len(),
+                ];
+                if lengths.iter().any(|length| *length != lengths[0]) {
+                    warn!(
+                        "Ignoring malformed bulk voxel update from {client_id}: \
+                         vx/vy/vz/voxel lengths were {:?}",
+                        lengths
+                    );
                     return;
                 }
 
-                chunks.update_voxel(&Vec3(update.vx, update.vy, update.vz), update.voxel);
-            });
+                bulk.vx
+                    .into_iter()
+                    .zip(bulk.vy)
+                    .zip(bulk.vz)
+                    .zip(bulk.voxels)
+                    .filter(|(((vx, vy), vz), _)| is_within(*vx, *vy, *vz))
+                    .map(|(((vx, vy), vz), voxel)| (Vec3(vx, vy, vz), voxel))
+                    .collect()
+            } else {
+                data.updates
+                    .into_iter()
+                    .filter(|update| is_within(update.vx, update.vy, update.vz))
+                    .map(|update| (Vec3(update.vx, update.vy, update.vz), update.voxel))
+                    .collect()
+            }
+        };
+
+        // The game may refuse or prepare for some writes first (see
+        // `set_raw_update_guard`).
+        let guard = self
+            .ecs()
+            .try_fetch::<super::handles::RawUpdateGuard>()
+            .map(|guard| guard.0.clone());
+        let writes = match guard {
+            Some(guard) if !writes.is_empty() => guard(self, client_id, writes),
+            _ => writes,
+        };
+
+        let mut chunks = self.chunks_mut();
+        for (voxel, raw) in writes {
+            chunks.update_voxel(&voxel, raw);
         }
     }
 
     /// Handler for `Method` type messages.
     pub(super) fn on_method(&mut self, client_id: &str, data: Message) {
         if let Some(method) = data.method {
-            let key = method.name.to_lowercase();
-            let Some(handle) = self.method_handles.get(&key).map(|h| h.to_owned()) else {
-                warn!(
-                    "`Method` type messages received of name {}, but no method handler set.",
-                    method.name
-                );
-                return;
-            };
-
-            // Method payloads are client-supplied input. A panicking handler
-            // (e.g. an unknown block name lookup) must not unwind through the
-            // actor and take the whole world down with it.
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                handle(self, client_id, &method.payload);
-            }));
-
-            if let Err(panic) = result {
-                let reason = panic
-                    .downcast_ref::<String>()
-                    .map(|s| s.as_str())
-                    .or_else(|| panic.downcast_ref::<&str>().copied())
-                    .unwrap_or("unknown panic");
-                warn!(
-                    "Method handler '{}' panicked in world '{}': {}. Continuing.",
-                    method.name, self.name, reason
-                );
-            }
+            self.dispatch_method(client_id, &method.name, &method.payload);
         }
     }
 
     /// Handler for `Event` type messages.
     pub(super) fn on_event(&mut self, client_id: &str, data: Message) {
         let client_ent = self.clients().get(client_id).map(|c| c.entity.to_owned());
+        let is_transport = self.read_resource::<Transports>().contains_key(client_id);
 
         data.events.into_iter().for_each(|event| {
-            if !self.event_handles.contains_key(&event.name.to_lowercase()) {
-                let location = client_ent.and_then(|ent| {
-                    self.read_component::<CurrentChunkComp>()
-                        .get(ent)
-                        .map(|c| c.coords.clone())
-                });
-
-                let mut event_builder = if event.name == VOXELIZE_BUILTIN_SOUND_EFFECT_EVENT {
-                    let Ok(payload) = serde_json::from_str::<SoundEffectEvent>(&event.payload)
-                    else {
-                        return;
-                    };
-                    Event::sound_effect(payload.source_client_id(client_id))
-                        .filter(ClientFilter::Exclude(vec![client_id.to_owned()]))
-                } else {
-                    Event::new(&event.name).payload(event.payload)
-                };
-                if let Some(loc) = location {
-                    event_builder = event_builder.location(loc);
-                }
-                self.events_mut().dispatch(event_builder.build());
+            let key = event.name.to_lowercase();
+            if let Some(handle) = self.event_handles.get(&key).cloned() {
+                handle(self, client_id, &event.payload);
                 return;
             }
 
-            let handle = self.event_handles.get(&event.name).unwrap().to_owned();
-            handle(self, client_id, &event.payload);
+            if key == VOXELIZE_BUILTIN_RELAY_EVENT && !is_transport {
+                if let Some(relayed) = self.relay_request(client_id, &event.payload) {
+                    self.events_mut().dispatch(relayed);
+                }
+                return;
+            }
+
+            if !is_transport && !self.is_relayed_client_event(&key) {
+                warn!(
+                    "[event-relay] refused {} from {} in world {}: clients may only relay {:?}; nothing sent",
+                    event.name,
+                    client_id,
+                    self.name,
+                    self.relayed_client_events()
+                );
+                return;
+            }
+
+            let location = client_ent.and_then(|ent| {
+                self.read_component::<CurrentChunkComp>()
+                    .get(ent)
+                    .map(|c| c.coords.clone())
+            });
+
+            let mut event_builder = if key == VOXELIZE_BUILTIN_SOUND_EFFECT_EVENT {
+                let Ok(payload) = serde_json::from_str::<SoundEffectEvent>(&event.payload) else {
+                    return;
+                };
+                Event::sound_effect(payload.source_client_id(client_id))
+                    .filter(ClientFilter::Exclude(vec![client_id.to_owned()]))
+            } else if is_transport {
+                Event::new(&event.name).payload(event.payload)
+            } else if key == VOXELIZE_BUILTIN_ARM_SWING_EVENT {
+                Event::new(&key).payload(client_id.to_owned())
+            } else {
+                // The sender drew its own copy; peers get this one.
+                Event::new(&key)
+                    .payload(event.payload)
+                    .filter(ClientFilter::Exclude(vec![client_id.to_owned()]))
+            };
+            if let Some(loc) = location {
+                event_builder = event_builder.location(loc);
+            }
+            self.events_mut().dispatch(event_builder.build());
         });
     }
 
-    /// Handler for `Chat` type messages.
-    pub(super) fn on_chat(&mut self, id: &str, data: Message) {
+    /// Handler for `Chat` type messages. Commands go to the command handler
+    /// and are never logged; every other line is public, so it joins the
+    /// world's chat history (stamped with its position) before it is
+    /// broadcast.
+    pub(super) fn on_chat(&mut self, id: &str, mut data: Message) {
         if let Some(chat) = data.chat.clone() {
             let sender = chat.sender.clone();
             let body = chat.body.clone();
@@ -327,6 +345,20 @@ impl World {
                     warn!("Clients are sending commands, but no command handler set.");
                 }
             } else {
+                // The game may read, rewrite or drop the line first (see
+                // `set_chat_guard`).
+                let guard = self
+                    .ecs()
+                    .try_fetch::<super::handles::ChatGuard>()
+                    .map(|guard| guard.0.clone());
+                if let (Some(guard), Some(chat)) = (guard, data.chat.as_mut()) {
+                    if !guard(self, id, chat) {
+                        return;
+                    }
+                }
+                if let Some(chat) = data.chat.as_mut() {
+                    self.log_inbound_chat(id, chat);
+                }
                 self.broadcast(data, ClientFilter::All);
             }
         }
@@ -341,12 +373,39 @@ impl World {
         saved_is_ghost: Option<bool>,
         saved_is_swimming: Option<bool>,
         is_for_transport: bool,
+        known_registry_digest: Option<&str>,
+    ) -> (Message, Vec<String>) {
+        self.generate_timed_init_message(
+            id,
+            saved_position,
+            saved_direction,
+            saved_is_flying,
+            saved_is_ghost,
+            saved_is_swimming,
+            is_for_transport,
+            known_registry_digest,
+            None,
+        )
+    }
+
+    /// [`Self::generate_init_message`], with the join's `serverTiming` as the
+    /// INIT's last key ([`crate::server::INIT_SERVER_TIMING_KEY`]).
+    pub(super) fn generate_timed_init_message(
+        &self,
+        id: &str,
+        saved_position: Option<[f32; 3]>,
+        saved_direction: Option<[f32; 3]>,
+        saved_is_flying: Option<bool>,
+        saved_is_ghost: Option<bool>,
+        saved_is_swimming: Option<bool>,
+        is_for_transport: bool,
+        known_registry_digest: Option<&str>,
+        server_timing: Option<&crate::server::InitServerTiming>,
     ) -> (Message, Vec<String>) {
         let config = (*self.config()).to_owned();
         let mut json = HashMap::new();
 
         json.insert("id".to_owned(), json!(id));
-        json.insert("blocks".to_owned(), json!(self.registry().blocks_by_name));
         json.insert("options".to_owned(), json!(config));
         json.insert(
             "stats".to_owned(),
@@ -375,6 +434,14 @@ impl World {
 
         for (key, value) in &self.extra_init_data {
             json.insert(key.clone(), value.clone());
+        }
+
+        // The chat said before this client arrived, in the same message as
+        // everything else it joins with: it lands ahead of any live line.
+        if !is_for_transport {
+            if let Some(history) = self.chat_history_for_init() {
+                json.insert(CHAT_HISTORY_INIT_KEY.to_owned(), history);
+            }
         }
 
         /* ------------------------ Loading other the clients ----------------------- */
@@ -426,14 +493,61 @@ impl World {
         drop(etypes);
         drop(metadatas);
 
+        // The block registry is the bulk of INIT. A client whose JOIN named
+        // this exact registry already holds it: say so instead of sending it.
+        // Everyone else (old clients, transports, a stale or absent digest)
+        // gets it in full, with the digest to name it by next time.
+        let registry = self.init_registry();
+        let payload = if !is_for_transport && registry.is_known_by(known_registry_digest) {
+            json.insert(INIT_REGISTRY_DIGEST_KEY.to_owned(), json!(registry.digest));
+            json.insert(INIT_REGISTRY_CACHED_KEY.to_owned(), json!(true));
+            if let Some(timing) = server_timing {
+                json.insert(
+                    crate::server::INIT_SERVER_TIMING_KEY.to_owned(),
+                    timing.to_value(),
+                );
+            }
+            serde_json::to_string(&json)
+        } else {
+            json.insert(
+                INIT_REGISTRY_LENGTH_KEY.to_owned(),
+                json!(registry.utf16_len),
+            );
+            serde_json::to_string(&InitPayload {
+                blocks: &registry.blocks,
+                registry_digest: &registry.digest,
+                rest: &json,
+                server_timing,
+            })
+        }
+        .expect("the INIT payload serializes");
+
         (
             Message::new(&MessageType::Init)
                 .world_name(&self.name)
-                .json(&serde_json::to_string(&json).unwrap())
+                .json(&payload)
                 .peers(&peers)
                 .entities(&entities)
                 .build(),
             entity_ids,
         )
     }
+}
+
+/// The INIT JSON object: the cached, pre-serialized block registry spliced in
+/// next to the per-join fields, without re-parsing or re-walking it. Field
+/// order is part of the wire contract: the text always starts `{"blocks":`,
+/// the registry text follows ([`INIT_REGISTRY_LENGTH_KEY`] says how long),
+/// and `,"registryDigest":"<digest>"` comes right after it, so a client can
+/// cut the registry text out and know the cut is exact.
+#[derive(Serialize)]
+struct InitPayload<'a> {
+    blocks: &'a RawValue,
+    #[serde(rename = "registryDigest")]
+    registry_digest: &'a str,
+    #[serde(flatten)]
+    rest: &'a HashMap<String, Value>,
+    /// Last, so its `buildMs` is taken after the registry text is written.
+    #[serde(rename = "serverTiming", skip_serializing_if = "Option::is_none")]
+    server_timing: Option<&'a crate::server::InitServerTiming>,
 }

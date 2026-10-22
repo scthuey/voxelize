@@ -4,9 +4,9 @@ use hashbrown::{HashMap, HashSet};
 use log::info;
 use serde::{Deserialize, Serialize};
 
-use crate::{BlockFace, Vec3, VoxelAccess, VoxelUpdate};
+use crate::{BlockFace, BlockUtils, Vec3, VoxelAccess, VoxelUpdate};
 
-use super::voxels::Block;
+use super::voxels::{assert_coupled_blocks_consistent, Block};
 
 /// Serializable struct representing a UV coordinate.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -84,6 +84,11 @@ pub struct Registry {
     /// The block waterlogged voxels are filled with, claimed by whichever
     /// block sets `is_waterlogging_fluid`.
     waterlogging_fluid_id: Option<u32>,
+
+    /// Whether any registered block declares `coupled_parts`, so the update
+    /// intake can skip the coupled-unit pass entirely for registries that
+    /// have none.
+    has_coupled_blocks: bool,
 }
 
 impl Registry {
@@ -122,20 +127,42 @@ impl Registry {
     }
 
     /// Generate the UV coordinates of the blocks. Call this before the server starts!
+    ///
+    /// Also the registry's last chance to refuse a mis-declared block set:
+    /// coupled units are checked here so a one-sided or anchorless pair
+    /// fails the server at startup rather than a player in the world.
     pub fn generate(&mut self) {
-        let all_blocks = self.blocks_by_id.values_mut().collect::<Vec<_>>();
+        assert_coupled_blocks_consistent(self);
 
-        let mut texture_groups: HashSet<String> = HashSet::new();
+        // Slots are handed out in block-id order, faces in declared order and
+        // groups by first use, so every process lays out the same atlas. The
+        // ranges ship in INIT, and a reconnecting client compares them against
+        // the ones it already drew its atlas with.
+        let mut all_blocks = self.blocks_by_id.values_mut().collect::<Vec<_>>();
+        all_blocks.sort_unstable_by_key(|block| block.id);
+
+        let mut texture_groups: Vec<String> = Vec::new();
+        let mut seen_groups: HashSet<String> = HashSet::new();
         let mut ungrouped_faces = 0;
 
         for block in all_blocks.iter() {
-            for face in block.faces.iter() {
+            let stage_faces = block
+                .stage_faces
+                .iter()
+                .flat_map(|stage| stage.faces.iter());
+            let tufts = block
+                .tufts
+                .iter()
+                .flat_map(|tufts| tufts.faces.iter().chain(tufts.stage_faces.iter()));
+            for face in block.faces.iter().chain(stage_faces).chain(tufts) {
                 if face.independent || face.isolated {
                     continue;
                 }
 
                 if let Some(group) = &face.texture_group {
-                    texture_groups.insert(group.clone());
+                    if seen_groups.insert(group.clone()) {
+                        texture_groups.push(group.clone());
+                    }
                 } else {
                     ungrouped_faces += 1;
                 }
@@ -190,7 +217,15 @@ impl Registry {
         }
 
         for block in all_blocks {
-            for face in block.faces.iter_mut() {
+            let stage_faces = block
+                .stage_faces
+                .iter_mut()
+                .flat_map(|stage| stage.faces.iter_mut());
+            let tufts = block
+                .tufts
+                .iter_mut()
+                .flat_map(|tufts| tufts.faces.iter_mut().chain(tufts.stage_faces.iter_mut()));
+            for face in block.faces.iter_mut().chain(stage_faces).chain(tufts) {
                 if face.independent || face.isolated {
                     continue;
                 }
@@ -225,6 +260,8 @@ impl Registry {
                 .get_mut(&block.name.to_lowercase())
                 .unwrap();
             block_by_name.faces = block.faces.clone();
+            block_by_name.stage_faces = block.stage_faces.clone();
+            block_by_name.tufts = block.tufts.clone();
             block_by_name.dynamic_patterns = block.dynamic_patterns.clone();
         });
     }
@@ -267,6 +304,12 @@ impl Registry {
 
         if self.blocks_by_id.contains_key(&block.id) {
             panic!("Duplicated key: {}-{}", block.name, block.id);
+        }
+        if let Some(existing) = self.blocks_by_name.get(&block.name.to_lowercase()) {
+            panic!(
+                "Duplicated block name: {} (ids {} and {}); the name-keyed client registry would lose one block",
+                block.name, existing.id, block.id
+            );
         }
 
         self.record_block(&block);
@@ -366,6 +409,26 @@ impl Registry {
         self.get_block_by_id(id).is_waterloggable
     }
 
+    /// Whether this voxel can hold the waterlogging fluid alongside itself:
+    /// its block can, and a branch voxel's wood leaves it room at its stage
+    /// ([`BranchShape::holds_water`]).
+    pub fn is_waterloggable_voxel(&self, raw: u32) -> bool {
+        let block = self.get_block_by_id(BlockUtils::extract_id(raw));
+        block.is_waterloggable
+            && block
+                .branch
+                .as_ref()
+                .is_none_or(|shape| shape.holds_water(BlockUtils::extract_stage(raw)))
+    }
+
+    /// Whether `raw` holds water its own voxel has no room for: a waterlogged
+    /// branch of a waterloggable block at a stage that fills the voxel.
+    pub fn is_overfull_waterlog(&self, raw: u32) -> bool {
+        BlockUtils::extract_waterlogged(raw)
+            && self.is_waterloggable(BlockUtils::extract_id(raw))
+            && !self.is_waterloggable_voxel(raw)
+    }
+
     /// The block waterlogging fills voxels with, or `None` in a registry that
     /// never declared one — in which case nothing ever waterlogs.
     pub fn waterlogging_fluid(&self) -> Option<&Block> {
@@ -392,6 +455,28 @@ impl Registry {
             fluid_id,
             waterloggable_ids,
         })
+    }
+
+    /// Whether any registered block is part of a coupled unit.
+    pub fn has_coupled_blocks(&self) -> bool {
+        self.has_coupled_blocks
+    }
+
+    /// The anchor of the coupled unit `id` belongs to — the part that is
+    /// placed, picked and dropped. A block that is not coupled, or is the
+    /// anchor itself, resolves to its own id, so drop and item paths can
+    /// call this for every block.
+    pub fn coupled_anchor_id(&self, id: u32) -> u32 {
+        let block = self.get_block_by_id(id);
+        if block.is_coupled_anchor {
+            return id;
+        }
+        block
+            .coupled_parts
+            .iter()
+            .map(|part| part.id)
+            .find(|part_id| self.get_block_by_id(*part_id).is_coupled_anchor)
+            .unwrap_or(id)
     }
 
     /// Get type map of all blocks.
@@ -463,6 +548,10 @@ impl Registry {
             self.waterlogging_fluid_id = None;
         }
 
+        if !block.coupled_parts.is_empty() {
+            self.has_coupled_blocks = true;
+        }
+
         for (idx, side) in faces.iter().enumerate() {
             self.textures.insert((*id, idx, side.independent));
         }
@@ -512,5 +601,92 @@ impl Registry {
             .collect();
 
         voxelize_mesher::Registry::new(blocks_by_id)
+    }
+}
+
+#[cfg(test)]
+mod atlas_layout_tests {
+    use super::*;
+    use crate::BlockFaces;
+
+    const SHARED_GROUP: &str = "shared";
+    const GROUPED_IDS: [u32; 2] = [7, 31];
+    const BLOCK_COUNT: u32 = 40;
+
+    fn blocks() -> Vec<Block> {
+        (1..=BLOCK_COUNT)
+            .map(|id| {
+                let faces = if GROUPED_IDS.contains(&id) {
+                    BlockFaces::six_faces().texture_group(SHARED_GROUP).build()
+                } else {
+                    BlockFaces::six_faces().build()
+                };
+                Block::new(&format!("Block {id}"))
+                    .id(id)
+                    .faces(&faces)
+                    .build()
+            })
+            .collect()
+    }
+
+    fn generated(reverse: bool) -> Registry {
+        let mut blocks = blocks();
+        if reverse {
+            blocks.reverse();
+        }
+        let mut registry = Registry::new();
+        registry.register_blocks(&blocks);
+        registry.generate();
+        registry
+    }
+
+    fn layout(registry: &Registry) -> Vec<(u32, String, UV)> {
+        let mut ids = registry.blocks_by_id.keys().copied().collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.into_iter()
+            .flat_map(|id| {
+                let block = registry.get_block_by_id(id);
+                block
+                    .faces
+                    .iter()
+                    .map(move |face| (id, face.name.clone(), face.range.clone()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn two_generations_lay_out_the_same_atlas() {
+        let first = generated(false);
+        let second = generated(true);
+        assert_eq!(layout(&first), layout(&second));
+
+        for block in first.blocks_by_name.values() {
+            let by_id = first.get_block_by_id(block.id);
+            for (named, keyed) in block.faces.iter().zip(by_id.faces.iter()) {
+                assert_eq!(named.range, keyed.range, "{} {}", block.name, named.name);
+            }
+        }
+    }
+
+    #[test]
+    fn groups_come_first_then_faces_in_block_id_order() {
+        let registry = generated(true);
+        let slot = |uv: &UV| (uv.start_v.to_bits(), uv.start_u.to_bits());
+        let faces = layout(&registry);
+        let first_slot = faces.iter().map(|(_, _, uv)| slot(uv)).min().unwrap();
+        let mut previous = first_slot;
+
+        for (id, face, range) in faces {
+            if GROUPED_IDS.contains(&id) {
+                assert_eq!(slot(&range), first_slot, "block {id} {face} left its group");
+                continue;
+            }
+            let current = slot(&range);
+            assert!(
+                current > previous,
+                "block {id} {face} was allocated out of order"
+            );
+            previous = current;
+        }
     }
 }

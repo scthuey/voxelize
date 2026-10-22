@@ -1,0 +1,2567 @@
+import { MessageProtocol } from "@voxelize/protocol";
+import {
+  Color,
+  DataArrayTexture,
+  DataTexture,
+  DoubleSide,
+  FloatType,
+  Group,
+  HalfFloatType,
+  LinearFilter,
+  LinearMipmapLinearFilter,
+  Mesh,
+  NearestFilter,
+  PlaneGeometry,
+  RedFormat,
+  RepeatWrapping,
+  RGBAFormat,
+  ShaderMaterial,
+  SRGBColorSpace,
+  Texture,
+  UnsignedByteType,
+  Vector2,
+  Vector3,
+  Vector4,
+} from "three";
+
+import { WorkerPool } from "../../libs/worker-pool";
+
+import { type Block, facesAt } from "./block";
+import { FarBatch, type FarBatchSlot } from "./far-terrain-batch";
+import {
+  DEFAULT_FAR_LOD,
+  FarLodOptions,
+  FarLodPlan,
+  planFarLod,
+} from "./far-terrain-lod";
+import {
+  buildFarMaterialTable,
+  FAR_LAYER_SIZE,
+  FAR_MATERIAL_TEXELS,
+  FAR_TINTED_LAYER,
+  farFaceKey,
+  farMaterialFaces,
+  FarMaterialTable,
+  farPaletteTable,
+} from "./far-terrain-materials";
+import {
+  FAR_FACE_KIND,
+  FarMeshCounts,
+  FarMeshData,
+  FarMeshInput,
+} from "./far-terrain-mesh";
+import {
+  FAR_SEAM_FUNCTIONS,
+  FAR_SEAM_UNIFORM_DECLARATIONS,
+  farSeamScale,
+} from "./far-terrain-seam";
+import { FAR_SHADOW_NONE, type FarShadowInput } from "./far-terrain-shadow";
+import {
+  buildCoverageMask,
+  decodeFarTerrainReply,
+  FarFaceLook,
+  FarFaceSide,
+  FarTerrainDescriptor,
+  FarTileData,
+  farTileId,
+  FarTileKey,
+  farTileSpan,
+  meanLinearRgb,
+  pendingChunksWithin,
+} from "./far-terrain-tiles";
+import { bindSkyGlowUniforms, type SkyGlowUniforms } from "./sky";
+import {
+  createSkyAtmosphereFragment,
+  createSkyGlowStatements,
+  SKY_FOG_UNIFORM_DECLARATIONS,
+} from "./sky-fog";
+import {
+  createSurfaceWeatherUniforms,
+  SURFACE_WEATHER_FAR_ALBEDO_FRAGMENT,
+  SURFACE_WEATHER_FAR_DECLARATIONS,
+  type SurfaceWeatherUniforms,
+} from "./surface-weather";
+import { AtlasTexture } from "./textures";
+import {
+  createUnderwaterFogFragment,
+  WATER_DOWNWELLING_EXTINCTION_GLSL,
+  WATER_OPTICS,
+} from "./water-optics";
+import FarTerrainWorker from "./workers/far-terrain-worker.ts?worker&inline";
+
+/** The method a client calls for far-terrain tiles, and its reply's name. */
+export const FAR_TERRAIN_METHOD = "vox-builtin:far-terrain";
+
+/** Texels per side of the chunk-coverage mask (chunk columns). */
+const COVERAGE_SIZE = 128;
+
+/**
+ * While columns are still on their way the mask is rebuilt on this cadence
+ * as well as on every change, so a column that outlives its grace
+ * (`CHUNK_PENDING_GRACE_MS`) uncovers without waiting for another chunk to
+ * load.
+ */
+const PENDING_RECHECK_MS = 500;
+
+/**
+ * The sea-depth map the far water reads: texels per side, blocks per texel
+ * (2048 blocks across, past any reach), the depth one byte spans, and how
+ * far the viewer may drift from its centre before it is laid out again.
+ */
+const DEPTH_TEXELS = 256;
+const DEPTH_BLOCKS_PER_TEXEL = 8;
+const DEPTH_RANGE = 32;
+const DEPTH_RECENTER = 256;
+
+/**
+ * The far sun shadows: blocks a shadow may reach along the ground, the
+ * blocks its edge softens over and the lift that keeps a surface clear of
+ * its own texel's line, and how far the sun turns (as a unit vector) or how
+ * long passes before the lines are cast again.
+ */
+const FAR_SHADOW_REACH = 512;
+const FAR_SHADOW_SOFT = "1.5";
+const FAR_SHADOW_BIAS = "1.0";
+const FAR_SHADOW_SUN_TURN = 0.004;
+const FAR_SHADOW_MIN_INTERVAL_MS = 400;
+
+/** How far the viewer moves, or how long passes, before the plan is redone. */
+const PLAN_MOVE_BLOCKS = 4;
+const PLAN_MAX_AGE_MS = 500;
+
+/** Blocks of sea below which the far water plane leaves the land's top be. */
+const FAR_SEA_MIN_DEPTH = "0.25";
+
+type ShaderUniform<T> = { value: T };
+
+/** Uniforms the far layer shares with the chunk shader, by reference. */
+export type FarTerrainSharedUniforms = {
+  fogColor: ShaderUniform<Color>;
+  fogNear: ShaderUniform<number>;
+  fogFar: ShaderUniform<number>;
+  fogHeightOrigin: ShaderUniform<number>;
+  fogHeightDensity: ShaderUniform<number>;
+  fogVerticalBlend: ShaderUniform<number>;
+  skyFogTopColor: ShaderUniform<Color>;
+  skyFogMiddleColor: ShaderUniform<Color>;
+  skyFogBottomColor: ShaderUniform<Color>;
+  skyFogOffset: ShaderUniform<number>;
+  skyFogVoidOffset: ShaderUniform<number>;
+  skyFogExponent: ShaderUniform<number>;
+  skyFogExponent2: ShaderUniform<number>;
+  skyFogDimension: ShaderUniform<number>;
+  skyFogStrength: ShaderUniform<number>;
+  sunlightIntensity: ShaderUniform<number>;
+  /** The share of the sun reaching the world as a beam (the weather's). */
+  directSunlight?: ShaderUniform<number>;
+  /** The sky's own light, so the far hills haze into the glow behind them. */
+  skyGlow?: SkyGlowUniforms;
+  minLightLevel: ShaderUniform<number>;
+  baseAmbient: ShaderUniform<number>;
+  faceShades: ShaderUniform<{ x: number; y: number; z: number; w: number }>;
+  cameraSubmersion: ShaderUniform<number>;
+  cameraWaterPlaneY: ShaderUniform<number>;
+  underwaterAmbient: ShaderUniform<Color>;
+  underwaterViewScale: ShaderUniform<number>;
+  sunDirection: ShaderUniform<Vector3>;
+  sunColor: ShaderUniform<Color>;
+  ambientColor: ShaderUniform<Color>;
+  /**
+   * The sky the chunk water mirrors and how strongly it does, so the far
+   * sea mirrors the same sky; without them it mirrors none.
+   */
+  skyTopColor?: ShaderUniform<Color>;
+  skyMiddleColor?: ShaderUniform<Color>;
+  waterFresnelStrength?: ShaderUniform<number>;
+  /**
+   * The chunk water's tint, which its surface takes more of with distance;
+   * without it the far water keeps its own colour at every distance.
+   */
+  waterTint?: ShaderUniform<Color>;
+  /**
+   * The chunk shader's side of the seam, written here: the coverage mask,
+   * its placement `(originCx, originCz, chunkSize, texels)` and the seam
+   * band's ramp scale (0 while the layer is off).
+   */
+  farCoverMask: ShaderUniform<Texture | null>;
+  farCover: ShaderUniform<Vector4>;
+  farSeam: ShaderUniform<number>;
+  /**
+   * The weather on surfaces the chunks draw (surface-weather.ts), so the
+   * far land wears the same coat and wet ground; without them it wears
+   * none.
+   */
+  surfaceWeather?: SurfaceWeatherUniforms["surfaceWeather"];
+  surfaceWeatherMap?: SurfaceWeatherUniforms["surfaceWeatherMap"];
+  surfaceWeatherWindow?: SurfaceWeatherUniforms["surfaceWeatherWindow"];
+  surfaceWeatherLine?: SurfaceWeatherUniforms["surfaceWeatherLine"];
+  surfaceCoatColor?: SurfaceWeatherUniforms["surfaceCoatColor"];
+  surfaceWind?: SurfaceWeatherUniforms["surfaceWind"];
+};
+
+/** A tile's meshes, built off the main thread. */
+export type FarBuiltTile = {
+  land: FarMeshData | null;
+  sky: FarMeshData | null;
+  buildMs: number;
+};
+
+export type FarTerrainOptions = {
+  /**
+   * How far past the viewer the layer reaches, in blocks; 0 turns it off.
+   */
+  distance: number;
+  /**
+   * Linear RGB per class, flattened, for a server whose descriptor names no
+   * `materials`. A class past the end takes the last entry; an empty
+   * palette draws grey.
+   */
+  palette: ArrayLike<number>;
+  /**
+   * What a block face looks like from afar, texels included (the world
+   * reads them off the atlas), or null while its texture is not painted
+   * yet. Used to paint the descriptor's `materials`.
+   */
+  faceLook:
+    | ((block: number, side: FarFaceSide, stage: number) => FarFaceLook | null)
+    | null;
+  /**
+   * How long a face may stay unreadable before the layer paints it grey and
+   * says so, rather than never drawing.
+   */
+  faceLookTimeoutMs: number;
+  /** The far water plane's colour. */
+  waterColor: Color | string | number;
+  /**
+   * Colour of floating land's top and of its underside and walls, when the
+   * descriptor names no `skyMaterial`.
+   */
+  skyTopColor: Color | string | number;
+  skySideColor: Color | string | number;
+  /**
+   * The outer share of the reach across which the layer thins into the
+   * haze, reaching it at the reach, so its edge never cuts against the sky.
+   */
+  edgeBand: number;
+  /** How the layer chooses each tile's level of detail. */
+  lod: FarLodOptions;
+  /** How long a tile takes to dissolve in or out when the detail changes. */
+  fadeMs: number;
+  /** Tiles kept resident at most; the least recently drawn leave first. */
+  maxResidentTiles: number;
+  /**
+   * A tile no plan has drawn for this long leaves even under the cap: long
+   * enough that a trip away and back (a teleport home) finds the tiles it
+   * left still resident.
+   */
+  evictAfterMs: number;
+  /**
+   * Chunk columns nearer the viewer's than this, in chunks, show sky and
+   * fog while still on their way, whatever tile could stand in: right by
+   * the viewer, a coarse tile shows through the walls of a canyon. Further
+   * out any drawn tile stands in. 0 lets one stand in everywhere. The
+   * default 1 guards only the viewer's own column: a wider guard opened
+   * holes of fog right ahead of anyone flying faster than chunks load.
+   */
+  pendingGuardRadius: number;
+  /** Tile builds in flight at once. */
+  maxBuildsInFlight: number;
+  /**
+   * Builds a tile's meshes; the default hands it to a worker. A test, or a
+   * host without workers, passes its own.
+   */
+  buildMesh: ((input: FarMeshInput) => Promise<FarBuiltTile | null>) | null;
+  /**
+   * Casts the sun shadow lines (far-terrain-shadow), as half floats; the
+   * default hands it to the mesh workers. A host that builds its own meshes
+   * gets no shadows unless it passes this too.
+   */
+  castShadow:
+    | ((
+        input: FarShadowInput,
+      ) => Promise<{ lines: Uint16Array; buildMs: number } | null>)
+    | null;
+  /** Tiles one request may name; the server caps it too. */
+  maxTilesPerRequest: number;
+  /** Least time between two requests. */
+  requestIntervalMs: number;
+  /** A requested tile that has not arrived in this long is asked again. */
+  retryAfterMs: number;
+  /**
+   * Tiles of the server's budget (`descriptor.budget`) never spent, so a
+   * request that arrives sooner after the last than it was sent is not
+   * refused for the difference.
+   */
+  budgetHeadroom: number;
+  /** Main-thread time one update may spend reading faces. */
+  buildBudgetMs: number;
+  /**
+   * Blocks of the loaded area's outer edge that hand over to the far layer
+   * across a dithered band, up to half a chunk; 0 (the default) keeps the
+   * edge hard (see `WorldOptions.farTerrainSeamBand`).
+   */
+  seamBand: number;
+};
+
+const DEFAULT_OPTIONS: FarTerrainOptions = {
+  distance: 0,
+  palette: [],
+  faceLook: null,
+  faceLookTimeoutMs: 10000,
+  waterColor: "#2d6a9a",
+  skyTopColor: "#6f9d4e",
+  skySideColor: "#6e665c",
+  edgeBand: 0.1,
+  lod: DEFAULT_FAR_LOD,
+  fadeMs: 450,
+  maxResidentTiles: 640,
+  evictAfterMs: 60_000,
+  pendingGuardRadius: 1,
+  maxBuildsInFlight: 4,
+  buildMesh: null,
+  castShadow: null,
+  maxTilesPerRequest: 16,
+  requestIntervalMs: 120,
+  retryAfterMs: 6000,
+  budgetHeadroom: 1,
+  buildBudgetMs: 0.6,
+  seamBand: 0,
+};
+
+/**
+ * What a block's upward (`top`) or sideways (`side`) face looks like from
+ * far away, for `FarTerrainOptions.faceLook`: the texels the chunks paint
+ * it with (read off the atlas its chunk material samples), their mean in
+ * linear RGB, and whether it takes the regional tint. Null while its
+ * texture is not painted yet. A block the registry lacks, or a face whose
+ * material is not an atlas, answers grey and says so: the far layer still
+ * draws. A game's world and the world viewer both read faces through it.
+ */
+export function readFarFaceLook(
+  block: Block | undefined,
+  blockId: number,
+  side: FarFaceSide,
+  stage: number,
+  materialOf: (block: Block, faceName: string) => { map?: unknown } | undefined,
+): FarFaceLook | null {
+  const grey: FarFaceLook = { color: [0.5, 0.5, 0.5], isTinted: false };
+  if (!block || block.faces.length === 0) {
+    console.warn(
+      `[far-terrain] block ${blockId} has no faces; its far colour is grey`,
+    );
+    return grey;
+  }
+  const wanted: [number, number, number] =
+    side === "top" ? [0, 1, 0] : [1, 0, 0];
+  const faces = facesAt(block, stage);
+  const face =
+    faces.find(
+      ({ dir }) =>
+        dir[0] === wanted[0] && dir[1] === wanted[1] && dir[2] === wanted[2],
+    ) ?? faces[0];
+  const atlas = materialOf(block, face.name)?.map;
+  if (!(atlas instanceof AtlasTexture)) {
+    console.warn(
+      `[far-terrain] ${block.name}'s ${face.name} face has no atlas; its far colour is grey`,
+    );
+    return grey;
+  }
+  const pixels = atlas.readRangePixels(face.range);
+  if (!pixels) return null;
+  const color = meanLinearRgb(pixels);
+  if (!color) return null;
+  return {
+    color,
+    isTinted: (face.stageTintMask ?? 0) !== 0,
+    pixels,
+    size: Math.round(Math.sqrt(pixels.length / 4)),
+  };
+}
+
+/** Counters a harness can read to prove the budget. */
+export type FarTerrainStats = {
+  isActive: boolean;
+  distance: number;
+  /** Detail levels drawn this frame. */
+  rings: number;
+  tilesRequested: number;
+  tilesReceived: number;
+  tilesRejected: number;
+  bytesReceived: number;
+  tilesBuilt: number;
+  tilesResident: number;
+  /** Tiles drawn this frame, and those the detail rules want. */
+  tilesDrawn: number;
+  tilesWanted: number;
+  /** Tiles drawn this frame at each level, finest first. */
+  levelCounts: number[];
+  /** Tile meshes (land + sky) shown. */
+  meshes: number;
+  /** Pages of the batch the tile meshes are drawn from, one draw call each. */
+  batchPages: number;
+  /** Main-thread ms the last update spent (planning, requests, mask). */
+  lastUpdateMs: number;
+  /** Highest `lastUpdateMs` since the counters were last read. */
+  peakUpdateMs: number;
+  /** Main-thread ms spent across every update, and how many there were. */
+  totalUpdateMs: number;
+  updates: number;
+  /** Mask rebuilds. */
+  maskRebuilds: number;
+  /** Chunk columns inside the render radius the last mask covered because
+   * they were still on their way (not loaded yet), inside the guard radius
+   * or under no drawn tile: 0 once everything inside has landed. */
+  pendingCovered: number;
+  /** Loaded chunks hidden while the far layer stands in for their unfinished meshes. */
+  chunksHeld: number;
+  /**
+   * Chunk columns still on their way the last mask left to the far layer,
+   * under drawn tiles: the strip a flight brings inside the render radius,
+   * or the ground around a teleport's end, keeps the terrain it showed.
+   */
+  pendingStoodIn: number;
+  /** Triangles across every built tile mesh in the scene. */
+  triangles: number;
+  /** Worker ms the last tile build took, and the highest since the peaks were reset. */
+  lastBuildMs: number;
+  peakBuildMs: number;
+  /** Builds handed to the worker and not back yet. */
+  buildsInFlight: number;
+  /** Main-thread ms the last built tile took to become a mesh, and the highest. */
+  lastUploadMs: number;
+  peakUploadMs: number;
+  /** Worker ms the last cast of the far sun shadows took. */
+  lastShadowMs: number;
+  /** Bytes of vertex and index data across resident meshes. */
+  meshBytes: number;
+  /** Quads of the drawn land by what they are. */
+  quads: FarMeshCounts;
+  /**
+   * Block faces read for the descriptor's materials, those still waiting
+   * for their texture, those painted grey because they never became
+   * readable, and the main-thread ms the reads took.
+   */
+  facesResolved: number;
+  facesPending: number;
+  facesMissing: number;
+  faceLookMs: number;
+};
+
+const VERTEX_SHADER = `
+#include <batching_pars_vertex>
+attribute vec2 aFarColumn;
+attribute vec4 aFarMaterial;
+attribute vec4 aFarTint;
+varying vec3 vWorldPosition;
+varying float vFarOcclusion;
+flat varying vec4 vFarMaterial;
+flat varying vec2 vFarColumn;
+flat varying vec3 vFarTint;
+flat varying float vFarStep;
+flat varying vec2 vFarFade;
+void main() {
+  #include <batching_vertex>
+  vec4 local = vec4(position, 1.0);
+  #ifdef USE_BATCHING
+    local = batchingMatrix * local;
+  #endif
+  vec4 worldPosition = modelMatrix * local;
+  // The tile's fade, from its instance colour (far-terrain-batch): its
+  // opacity, and whether it is the one dissolving in.
+  #ifdef USE_BATCHING_COLOR
+    vec4 fade = getBatchingColor(getIndirectIndex(gl_DrawID));
+    vFarFade = vec2(fade.r, fade.g > 0.5 ? 1.0 : -1.0);
+  #else
+    vFarFade = vec2(1.0);
+  #endif
+  vWorldPosition = worldPosition.xyz;
+  vFarMaterial = aFarMaterial;
+  vFarOcclusion = aFarMaterial.z / 255.0;
+  vFarColumn = aFarColumn;
+  vFarTint = aFarTint.rgb * (1.0 / 128.0);
+  vFarStep = aFarTint.a;
+  gl_Position = projectionMatrix * viewMatrix * worldPosition;
+}
+`;
+
+const WATER_VERTEX_SHADER = `
+varying vec3 vWorldPosition;
+void main() {
+  vec4 worldPosition = modelMatrix * vec4(position, 1.0);
+  vWorldPosition = worldPosition.xyz;
+  gl_Position = projectionMatrix * viewMatrix * worldPosition;
+}
+`;
+
+/**
+ * The chunk fragment's daylight terms for an open face in full sun (the
+ * block after `#include <envmap_fragment>` in shaders.ts: no shadow, no
+ * occlusion, no block light), as the literals both shaders carry. The chunk
+ * shader is the source of truth; far-terrain.test.ts reads it and fails when
+ * either side changes alone.
+ */
+export const CHUNK_DAYLIGHT = {
+  /** `max(rawNdotL * 0.85 + 0.15, 0.0)`: the wrapped sun. */
+  sunWrap: { scale: "0.85", bias: "0.15" },
+  /** `smoothstep(0.75, 0.95, texLuma)`: how bright a texture counts as. */
+  brightTexture: { from: "0.75", to: "0.95" },
+  /** `mix(1.0, 0.7, isBrightTex)`: the sun a bright texture keeps. */
+  brightTextureSun: "0.7",
+  /** `uAmbientColor * 0.4`: the sky ambient a face looking down gets. */
+  groundAmbient: "0.4",
+  /** `mix(0.72, 1.0, shadow)`: the sky ambient a shaded face keeps. */
+  shadedAmbient: "0.72",
+  /** `uAmbientColor * 0.04 * (1.0 - shadow)`: light bounced into shade. */
+  bounce: "0.04",
+  /** `vec3(0.025, 0.03, 0.04) * sunVisibility`: starlight under open sky. */
+  starlight: "0.025, 0.03, 0.04",
+  /** `vec3 coolTint = vec3(1.0, 1.0, 1.0)`: daylight white balance. */
+  daylightBalance: "1.0, 1.0, 1.0",
+  /** The ACES fit `(x (2.51 x + 0.03)) / (x (2.43 x + 0.59) + 0.14)`. */
+  toneMap: { a: "2.51", b: "0.03", c: "2.43", d: "0.59", e: "0.14" },
+} as const;
+
+const D = CHUNK_DAYLIGHT;
+
+/**
+ * What a crown's inside keeps of the light on its leaves: the leaves deeper
+ * in a canopy, seen through the gaps of those outside them.
+ */
+const FAR_CROWN_INSIDE = "0.75";
+
+/**
+ * How a crown's leaves lose the sun with depth below its top: the share lit
+ * falls off over `depth` blocks toward `floor`, measured against generated
+ * trees in loaded chunks at the same pose (far-terrain-textures.ts with
+ * RENDER_RADIUS=16).
+ */
+const FAR_CROWN_SUN = { depth: "8.0", floor: "0.35" } as const;
+
+/** The face kinds as GLSL integer constants. */
+const KIND_GLSL = Object.entries(FAR_FACE_KIND)
+  .map(
+    ([name, value]) => `const int FAR_KIND_${name.toUpperCase()} = ${value};`,
+  )
+  .join("\n");
+
+/**
+ * Light an albedo as the chunk shader lights an open face in sun
+ * ({@link CHUNK_DAYLIGHT}), with `occlusion` where the chunks have their
+ * vertex occlusion and `shadow` (1 lit, 0 shaded) where they have their
+ * shadow cascades: a shaded face loses the sun and keeps
+ * `CHUNK_DAYLIGHT.shadedAmbient` of the sky, plus the bounce. Then wear
+ * the chunks' sky fog and thin into it across the outer `uFarEdge` band.
+ */
+const lightAndFog = (afterLight = "") => `
+  float NdotL = max(dot(normal, uSunDirection) * ${D.sunWrap.scale} + ${D.sunWrap.bias}, 0.0);
+  float brightTexture = smoothstep(${D.brightTexture.from}, ${D.brightTexture.to}, dot(albedo, vec3(0.2126, 0.7152, 0.0722)));
+  vec3 sun = uSunColor * NdotL * shadow * uSunlightIntensity * mix(1.0, ${D.brightTextureSun}, brightTexture);
+  float hemisphere = normal.y * 0.5 + 0.5;
+  vec3 skyAmbient = mix(uAmbientColor * ${D.groundAmbient}, uAmbientColor, hemisphere)
+    * mix(${D.shadedAmbient}, 1.0, shadow);
+  vec3 bounce = uAmbientColor * ${D.bounce} * (1.0 - shadow) * uSunlightIntensity;
+  float ambientFloor = max(uMinLightLevel + uBaseAmbient, 0.0);
+  vec3 globalAmbient = vec3(${D.starlight}) + uAmbientColor * ambientFloor;
+  vec3 weights = abs(normal);
+  weights /= max(weights.x + weights.y + weights.z, 0.0001);
+  float verticalShade = normal.y > 0.0 ? uFaceShades.w : uFaceShades.z;
+  float faceShade = weights.x * uFaceShades.x + weights.z * uFaceShades.y + weights.y * verticalShade;
+  vec3 light = (skyAmbient + sun + bounce + globalAmbient) * vec3(${D.daylightBalance}) * occlusion * faceShade;
+  light = (light * (${D.toneMap.a} * light + ${D.toneMap.b})) / (light * (${D.toneMap.c} * light + ${D.toneMap.d}) + ${D.toneMap.e});
+  light = max(light, vec3(ambientFloor) * faceShade);
+
+  gl_FragColor = vec4(albedo * light, 1.0);
+  ${afterLight}
+  ${createSkyAtmosphereFragment()}
+  gl_FragColor.rgb = mix(
+    gl_FragColor.rgb,
+    fogTint,
+    smoothstep(uFarEdge.x, uFarEdge.y, horizontal) * (1.0 - uCameraSubmersion)
+  );
+  ${createUnderwaterFogFragment(false)}
+`;
+
+const COMMON_DECLARATIONS = `
+${SKY_FOG_UNIFORM_DECLARATIONS}
+uniform vec3 uAmbientColor;
+uniform float uMinLightLevel;
+uniform float uBaseAmbient;
+uniform vec4 uFaceShades;
+uniform float uRingOuter;
+uniform vec2 uRingCenter;
+uniform vec2 uFarEdge;
+uniform sampler2D uFarShadowMap;
+uniform vec4 uFarShadow;
+${FAR_SEAM_UNIFORM_DECLARATIONS}
+varying vec3 vWorldPosition;
+${FAR_SEAM_FUNCTIONS}
+
+// The sun on a point as the far land and canopy toward the sun let it
+// through (far-terrain-shadow): 1 above the shadow line over its texel, 0
+// below it, softened across a couple of blocks since a texel is eight.
+float farTerrainSun(vec3 p) {
+  if (uFarShadow.w <= 0.0) return 1.0;
+  vec2 uv = (p.xz - uFarShadow.xy) / (uFarShadow.z * uFarShadow.w);
+  if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return 1.0;
+  float line = texture2D(uFarShadowMap, uv).r;
+  return smoothstep(line - ${FAR_SHADOW_SOFT}, line + ${FAR_SHADOW_SOFT}, p.y + ${FAR_SHADOW_BIAS});
+}
+`;
+
+/**
+ * Hide under every chunk that draws real terrain, except the pixels the
+ * chunk's outer half yields across the seam band (far-terrain-seam), and
+ * past the reach, measured from the viewer the tiles were picked around.
+ */
+const COVER_DISCARD = `
+  vec2 farTexel = farCoverTexel(vWorldPosition.xz);
+  if (farCoverInside(farTexel) && farCoverHard(farTexel) > 0.5) {
+    if (uFarSeam <= 0.0 || farSeamWeight(farTexel) > farSeamDither(gl_FragCoord.xy)) discard;
+  }
+  float horizontal = length(vWorldPosition.xz - uRingCenter);
+  if (horizontal >= uRingOuter) discard;
+`;
+
+/**
+ * The land: each face's block picked from the class table by what the
+ * face is (a top picks one of its flat covers per cell, a wall shows the
+ * strata down from its column's ground, a crown its leaves), with the
+ * climate tint on the faces that take it. A cell of `vFarStep` blocks wears
+ * its block's 16 texels across the whole cell, as one big block: a cell
+ * subtends about the same angle at every level (far-terrain-lod), so the
+ * texels stay a pixel or two wide out to the reach instead of filtering
+ * down to the face's mean, and the distant land keeps its pixel grain.
+ */
+const LAND_FRAGMENT_SHADER = `
+precision highp sampler2DArray;
+${COMMON_DECLARATIONS}
+uniform highp sampler2DArray uFarLayers;
+uniform highp sampler2D uFarMaterials;
+flat varying vec2 vFarFade;
+flat varying float vFarStep;
+varying float vFarOcclusion;
+flat varying vec4 vFarMaterial;
+flat varying vec2 vFarColumn;
+flat varying vec3 vFarTint;
+${KIND_GLSL}
+${SURFACE_WEATHER_FAR_DECLARATIONS}
+
+float farCoverHash(vec2 cell) {
+  uvec2 q = uvec2(ivec2(floor(cell)));
+  uint h = (q.x * 0x8da6b343u) ^ (q.y * 0xd8163841u);
+  h = (h ^ (h >> 13u)) * 0x5bd1e995u;
+  h ^= h >> 15u;
+  return float(h & 0xffffffu) / 16777216.0;
+}
+
+// The sun on a crown's outer leaves, as the leaves above let it through:
+// the chunks' cascades shade a canopy's lower leaves and its underside
+// wholly. Each block is lit or shaded on its own, dappled, until blocks
+// shrink under a few pixels and take the share lit instead.
+float farCrownSun(vec3 p, vec3 normal, float tip, float blockFootprint) {
+  if (normal.y < -0.5) return 0.0;
+  float depth = max(tip - p.y, 0.0);
+  float lit = mix(${FAR_CROWN_SUN.floor}, 1.0, exp(-depth / ${FAR_CROWN_SUN.depth}));
+  vec3 block = floor(p - normal * 0.5);
+  float dapple = step(farCoverHash(vec2(block.x + block.y * 31.0, block.z - block.y * 17.0)), lit);
+  return mix(dapple, lit, smoothstep(0.25, 0.5, blockFootprint));
+}
+
+vec4 farLayerTexel(float code, vec2 uv, vec2 dx, vec2 dy) {
+  bool tinted = code >= ${FAR_TINTED_LAYER}.0;
+  float layer = tinted ? code - ${FAR_TINTED_LAYER}.0 : code;
+  vec4 texel = textureGrad(uFarLayers, vec3(uv, max(layer, 0.0)), dx, dy);
+  return tinted ? vec4(texel.rgb * vFarTint, texel.a) : texel;
+}
+
+vec3 farLayerColor(float code, vec2 uv, vec2 dx, vec2 dy) {
+  return farLayerTexel(code, uv, dx, dy).rgb;
+}
+
+void main() {
+  // A tile dissolving in draws the pixels under its opacity; one
+  // dissolving out the rest, so a swap never shows both or neither.
+  float fadeDither = farSeamDither(gl_FragCoord.xy);
+  if (vFarFade.y > 0.0 ? fadeDither >= vFarFade.x : fadeDither < 1.0 - vFarFade.x) discard;
+  ${COVER_DISCARD}
+
+  vec3 normal = normalize(cross(dFdx(vWorldPosition), dFdy(vWorldPosition)));
+  if (dot(normal, cameraPosition - vWorldPosition) < 0.0) normal = -normal;
+
+  int cls = int(vFarMaterial.x + 0.5);
+  int kind = int(vFarMaterial.y + 0.5);
+  vec4 m0 = texelFetch(uFarMaterials, ivec2(0, cls), 0);
+  vec4 m1 = texelFetch(uFarMaterials, ivec2(1, cls), 0);
+  vec4 m2 = texelFetch(uFarMaterials, ivec2(2, cls), 0);
+
+  vec3 p = vWorldPosition;
+  // In cells, a wall's rows counted down from its column's ground so the
+  // top cell's side starts at the ground, as a block's does.
+  float step = max(vFarStep, 1.0);
+  vec3 c = vec3(p.x, p.y - vFarColumn.x, p.z) / step;
+  bool isFlat = abs(normal.y) > 0.5;
+  // The chunk mesher's face orientation (greedyFaceUv), unwrapped.
+  vec2 uv = isFlat
+    ? (normal.y > 0.0 ? vec2(-c.x, c.z) : vec2(c.x, -c.z))
+    : (abs(normal.x) > 0.5
+        ? vec2(normal.x > 0.0 ? -c.z : c.z, c.y)
+        : vec2(normal.z > 0.0 ? c.x : -c.x, c.y));
+  vec2 dx = dFdx(uv);
+  vec2 dy = dFdy(uv);
+  float blockFootprint = max(length(dFdx(p)), length(dFdy(p)));
+
+  vec3 albedo;
+  float shadow = 1.0;
+  if (kind == FAR_KIND_TOP) {
+    // Flat covers are whole cells of their own, chosen per cell. Once a
+    // cell shrinks under a couple of pixels the choice would sparkle, so
+    // the covers blend in by share instead.
+    float choice = farCoverHash(c.xz);
+    float code = choice < m1.x ? m0.y : choice < m1.y ? m0.z : choice < m1.z ? m0.w : m0.x;
+    vec3 chosen = farLayerColor(code, uv, dx, dy);
+    float footprint = max(length(dx), length(dy));
+    float blend = smoothstep(0.35, 0.8, footprint);
+    if (blend > 0.0) {
+      vec3 mixed = farLayerColor(m0.x, uv, dx, dy) * (1.0 - m1.z);
+      if (m1.x > 0.0) mixed += farLayerColor(m0.y, uv, dx, dy) * m1.x;
+      if (m1.y > m1.x) mixed += farLayerColor(m0.z, uv, dx, dy) * (m1.y - m1.x);
+      if (m1.z > m1.y) mixed += farLayerColor(m0.w, uv, dx, dy) * (m1.z - m1.y);
+      chosen = mix(chosen, mixed, blend);
+    }
+    albedo = chosen;
+  } else if (kind == FAR_KIND_CROWN) {
+    // A crown's class is its species': leaves on every face, see-through
+    // where the leaves are. Through a gap shows the crown's far side from
+    // within, in the canopy's own shade, and through a gap there whatever
+    // stands behind the tree, as through a leaf block's gaps.
+    vec4 leaves = farLayerTexel(m0.x, uv, dx, dy);
+    // A gap under a few pixels wide winks in and out as the view moves, so
+    // the cut eases off as the texels shrink and the gap shows its shade.
+    float texelFootprint = max(length(dx), length(dy)) * ${FAR_LAYER_SIZE}.0;
+    if (leaves.a < 0.5 * (1.0 - smoothstep(0.3, 0.6, texelFootprint))) discard;
+    if (gl_FrontFacing) {
+      albedo = leaves.rgb;
+      shadow = farCrownSun(p, normal, vFarColumn.y, blockFootprint);
+    } else {
+      albedo = leaves.rgb * ${FAR_CROWN_INSIDE};
+      shadow = 0.0;
+    }
+  } else if (kind == FAR_KIND_TRUNK) {
+    albedo = farLayerColor(m2.y, uv, dx, dy);
+  } else if (kind == FAR_KIND_BOTTOM) {
+    albedo = farLayerColor(m2.z, uv, dx, dy);
+  } else {
+    // A wall: the ground block's side for its top cell, the side block for
+    // the cells sideDepth blocks reach into, and the deep block below.
+    float depth = -c.y;
+    float code = depth < 1.0 ? m2.x : depth < 1.0 + ceil(m1.w / step) ? m2.y : m2.z;
+    albedo = farLayerColor(code, uv, dx, dy);
+  }
+${SURFACE_WEATHER_FAR_ALBEDO_FRAGMENT}
+  float occlusion = vFarOcclusion;
+  shadow = min(shadow, farTerrainSun(p));
+  ${lightAndFog()}
+}
+`;
+
+/**
+ * The chunk water's Fresnel on a top face (`fresnelBase` and `fresnelMax`
+ * in shaders.ts, at `topWaterFace` 1), as the literals both shaders carry;
+ * far-terrain.test.ts fails when either side changes alone.
+ */
+export const CHUNK_WATER_FRESNEL = { base: "0.04", max: "0.56" };
+
+/**
+ * How much of its tint the chunk water's colour takes with distance
+ * (`shallowWater`, `deepWater` and `depthFactor` in shaders.ts, on a top
+ * face where the vertical term is 0): `near` up close, toward `far` as
+ * `1 - exp(-distance * perBlock)` grows, scaled by `reach`, as the literals
+ * both shaders carry; far-terrain.test.ts fails when either side changes
+ * alone.
+ */
+export const CHUNK_WATER_TINT = {
+  near: "0.1",
+  far: "0.28",
+  perBlock: "0.008",
+  reach: "0.72",
+} as const;
+
+/**
+ * What a sea floor's own cover (seagrass, kelp, the gravel and clay patches,
+ * the shade between them) leaves of its bare top's colour: over a polar
+ * bay and a sea lagoon the loaded floor, drawn without its water, averaged
+ * 0.68 of the sand top the far layer paints it with, lit alike.
+ */
+const FAR_SEABED_COVER = "0.68";
+
+/**
+ * The deepest column the chunk water's surface can measure: its mesher packs
+ * the fluid under a surface corner into 15 quarter-block steps
+ * (`SURFACE_DEPTH_MAX_BLOCKS` in vertex_light.rs, `SURFACE_DEPTH_UNITS_PER_
+ * BLOCK` in shaders.ts), on top of the 7/8 a still surface stands in its own
+ * voxel. Past it every column reads the same, so loaded water never takes
+ * more of its deep haze than this depth gives.
+ */
+const CHUNK_WATER_DEPTH_REACH = (15 / 4 + 7 / 8).toFixed(4);
+
+/**
+ * Blocks past the loaded edge over which the far water lets go of the
+ * chunk water's measurable depth (`CHUNK_WATER_DEPTH_REACH`) for the sea's
+ * real one: at the edge it is the water the chunks draw, and out toward
+ * the horizon a deep sea closes into its haze. A shading ramp, not a line,
+ * so nothing marks where it runs.
+ */
+const FAR_WATER_DEPTH_RAMP = 256;
+
+/**
+ * The far water, seen from above by the chunk water's own optics (the
+ * refraction branch of its top face in shaders.ts), so the two agree where
+ * the loaded chunks end: the sea floor dimmed over the path down and back,
+ * the water's colour growing with thickness and toward grazing angles, past
+ * a few blocks the deep in-scatter of the diver's fog colour, the sky
+ * mirrored by the same Fresnel, and the floor showing through what the
+ * surface leaves to the blend. The depth comes from the far tiles' own
+ * floor heights; `uWaterColor` is the colour the chunk water lays over a
+ * floor (its lit texture, toward its tint).
+ */
+const FAR_WATER_FN = `
+float farWaterFresnel(float cosView) {
+  float fresnel = ${CHUNK_WATER_FRESNEL.base}
+    + uWaterFresnelStrength * pow(1.0 - clamp(cosView, 0.0, 1.0), 5.0);
+  return clamp(fresnel, 0.01, ${CHUNK_WATER_FRESNEL.max})
+    * ${WATER_OPTICS.distantFresnelFactor.toFixed(4)};
+}
+vec3 farSkyMirror(vec3 toCamera) {
+  vec3 reflectDir = reflect(-toCamera, vec3(0.0, 1.0, 0.0));
+  float skyH = normalize(reflectDir * uSkyFogDimension + uSkyFogOffset).y;
+  ${createSkyGlowStatements("reflectDir", "mirroredSkyGlow")}
+  return mix(uSkyMiddleColor, uSkyTopColor, pow(max(skyH, 0.0), uSkyFogExponent))
+    + mirroredSkyGlow;
+}
+vec3 farSeabed() {
+  return uSeabedColor * ${FAR_SEABED_COVER};
+}
+float farDeepTransmit(float seaDepth) {
+  return exp(
+    -max(seaDepth - ${WATER_OPTICS.deepSurfaceClearDepth.toFixed(4)}, 0.0)
+    * ${WATER_OPTICS.deepSurfaceExtinction.toFixed(4)}
+  );
+}
+// The lit surface as the chunk water draws it: the lit floor seen through
+// the column (dimmed over the path down and back, under the water's colour
+// as it thickens and toward grazing views), the water's colour taking more
+// of its tint with distance, the deep body's in-scatter (daylight let down
+// through the surface, not lit again), the sky mirror, and all of it over
+// the lit floor by the surface's opacity, which the deep body and grazing
+// views close.
+vec3 farWaterSurface(vec3 light, float seaDepth, float fresnel, vec3 toCamera, float viewDistance) {
+  float floorDepth = min(seaDepth, ${WATER_OPTICS.floorAbsorptionMaxDepth.toFixed(4)});
+  vec3 floorShade = exp(
+    -${WATER_DOWNWELLING_EXTINCTION_GLSL}
+    * floorDepth
+    * ${WATER_OPTICS.floorAbsorptionPathScale.toFixed(4)}
+  ) * ${WATER_OPTICS.wetFloorDarken.toFixed(4)};
+  float thicknessScatter = (1.0 - exp(
+    -floorDepth * ${WATER_OPTICS.shallowScatterDensity.toFixed(4)}
+  )) * ${WATER_OPTICS.shallowScatterMaxMix.toFixed(4)};
+  vec3 floorLit = farSeabed() * light;
+  float tintShare = ${CHUNK_WATER_TINT.near}
+    + (${CHUNK_WATER_TINT.far} - ${CHUNK_WATER_TINT.near})
+    * (1.0 - exp(-viewDistance * ${CHUNK_WATER_TINT.perBlock})) * ${CHUNK_WATER_TINT.reach};
+  vec3 water = mix(uWaterColor * light, uWaterTint, tintShare);
+  vec3 color = mix(
+    floorLit * floorShade,
+    water,
+    clamp(0.12 + fresnel * 0.28 + thicknessScatter, 0.0, 1.0)
+  );
+  // The column the deep haze counts: what the chunk water could measure at
+  // the loaded edge, the sea's own depth by the end of the ramp past it.
+  float edgeDistance = length(vWorldPosition.xz - cameraPosition.xz);
+  float columnDepth = mix(
+    min(seaDepth, ${CHUNK_WATER_DEPTH_REACH}),
+    seaDepth,
+    smoothstep(uFarWaterDepthRamp.x, uFarWaterDepthRamp.y, edgeDistance)
+  );
+  float deepTransmit = farDeepTransmit(columnDepth);
+  vec3 deepScatter = uUnderwaterAmbient * vec3(
+    ${WATER_OPTICS.deepSurfaceScatterScale.red.toFixed(4)},
+    ${WATER_OPTICS.deepSurfaceScatterScale.green.toFixed(4)},
+    ${WATER_OPTICS.deepSurfaceScatterScale.blue.toFixed(4)}
+  ) * exp(
+    -${WATER_DOWNWELLING_EXTINCTION_GLSL}
+    * min(columnDepth, 16.0)
+    * ${WATER_OPTICS.aboveSurfaceScatterDepthScale.toFixed(4)}
+  );
+  color = mix(deepScatter, color, deepTransmit);
+  color = mix(color, farSkyMirror(toCamera), fresnel);
+  float alpha = mix(
+    ${WATER_OPTICS.refractedSurfaceAlphaFloor.toFixed(4)},
+    1.0,
+    fresnel * fresnel * ${WATER_OPTICS.fresnelAlphaStrength.toFixed(4)}
+  );
+  alpha = 1.0 - (1.0 - alpha) * deepTransmit;
+  return mix(floorLit, color, alpha);
+}
+`;
+
+const WATER_FRAGMENT_SHADER = `
+${COMMON_DECLARATIONS}
+uniform vec3 uWaterColor;
+uniform vec3 uWaterTint;
+uniform vec3 uSeabedColor;
+uniform sampler2D uFarDepthMap;
+uniform vec4 uFarDepth;
+uniform vec3 uSkyTopColor;
+uniform vec3 uSkyMiddleColor;
+uniform float uWaterFresnelStrength;
+// (start, end) of the ramp from the chunk water's depth to the sea's.
+uniform vec2 uFarWaterDepthRamp;
+${FAR_WATER_FN}
+void main() {
+  ${COVER_DISCARD}
+  vec3 normal = vec3(0.0, 1.0, 0.0);
+  vec2 depthUv = (vWorldPosition.xz - uFarDepth.xy) / (uFarDepth.z * uFarDepth.w);
+  float seaDepth = texture2D(uFarDepthMap, depthUv).r * ${DEPTH_RANGE}.0;
+  // No sea where the tiles stand at or above it. A lake or shore level
+  // with the sea has its own top an eighth of a block over this plane, and
+  // a few hundred blocks out the depth buffer cannot part them: the two
+  // fought in bands, the sea's side painted as the sand of a zero depth.
+  bool inMap = all(greaterThanEqual(depthUv, vec2(0.0))) && all(lessThanEqual(depthUv, vec2(1.0)));
+  if (inMap && seaDepth < ${FAR_SEA_MIN_DEPTH}) discard;
+  vec3 toCamera = normalize(cameraPosition - vWorldPosition);
+  float fresnel = farWaterFresnel(toCamera.y);
+  vec3 albedo = farSeabed();
+  float occlusion = 1.0;
+  float shadow = farTerrainSun(vWorldPosition);
+  ${lightAndFog(
+    "gl_FragColor.rgb = farWaterSurface(light, seaDepth, fresnel, toCamera, length(cameraPosition - vWorldPosition));",
+  )}
+}
+`;
+
+/** Blocks under the far water plane the seabed behind it lies. */
+const FAR_SEABED_DROP = DEPTH_RANGE;
+
+/**
+ * The floor under the far water, for the chunk water to see through. Where
+ * the loaded chunks end over open water, a view into their water runs out
+ * of their floor before it reaches the bottom: the chunk water composites
+ * what is behind it (its refraction capture), and there the far layer had
+ * nothing, so a band of sky tinted blue ran along the loaded edge, as wide
+ * as the water is deep and the view is low. This plane, past the loaded
+ * chunks and deep enough for any sea the depth map holds, is that floor:
+ * the seabed's colour, lit as the chunks light an open floor in sun. From
+ * above it stays under the far water and the far land, and from under the
+ * water (where the far layer is fog anyway) it draws nothing.
+ */
+const SEABED_FRAGMENT_SHADER = `
+${COMMON_DECLARATIONS}
+uniform vec3 uSeabedColor;
+void main() {
+  ${COVER_DISCARD}
+  if (uCameraSubmersion > 0.5) discard;
+  vec3 normal = vec3(0.0, 1.0, 0.0);
+  vec3 albedo = uSeabedColor * ${FAR_SEABED_COVER};
+  float occlusion = 1.0;
+  float shadow = 1.0;
+  ${lightAndFog()}
+}
+`;
+
+type ResidentTile = {
+  data: FarTileData;
+  land: FarBatchSlot | null;
+  sky: FarBatchSlot | null;
+  isBuilt: boolean;
+  isBuilding: boolean;
+  /** 0 hidden, 1 fully drawn; eases toward 1 while drawn, 0 when not. */
+  opacity: number;
+  isDrawn: boolean;
+  lastDrawnAt: number;
+  bytes: number;
+  /** Builds that failed; past MAX_BUILD_ATTEMPTS the tile is not tried again. */
+  failedBuilds: number;
+  counts: FarMeshCounts | null;
+};
+
+let sharedPool: WorkerPool | null = null;
+
+const workerBuild = (input: FarMeshInput): Promise<FarBuiltTile | null> => {
+  const pool = poolOf();
+  return new Promise((resolve) => {
+    pool.addJob({
+      message: { input },
+      resolve: (data: FarBuiltTile | null) => resolve(data),
+      timeoutMs: 20000,
+    });
+  });
+};
+
+const poolOf = () => {
+  if (!sharedPool) {
+    sharedPool = new WorkerPool(FarTerrainWorker, {
+      maxWorker: 2,
+      name: "far-terrain-worker",
+    });
+  }
+  return sharedPool;
+};
+
+const workerShadow = (
+  shadow: FarShadowInput,
+): Promise<{ lines: Uint16Array; buildMs: number } | null> => {
+  const pool = poolOf();
+  return new Promise((resolve) => {
+    pool.addJob({
+      message: { shadow },
+      buffers: [shadow.heights.buffer as ArrayBuffer],
+      resolve,
+      timeoutMs: 20000,
+    });
+  });
+};
+
+const reliefOf = (tile: FarTileData) => {
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (let at = 0; at < tile.heights.length; at++) {
+    const h = tile.heights[at];
+    if (h < lo) lo = h;
+    if (h > hi) hi = h;
+  }
+  return Number.isFinite(lo) ? hi - lo : 0;
+};
+
+/**
+ * Coarse terrain past the loaded chunks: a quadtree of stepped-column tiles
+ * the server samples from its generator, finer near the viewer and on tall
+ * relief, painted from the textures of the blocks each surface is made of
+ * and lit and fogged as the chunks are, hidden wherever a chunk draws real
+ * terrain, with a flat water plane at sea level. Tiles are meshed off the
+ * main thread and dissolve in and out as the detail changes. The `World`
+ * owns one, feeds it the server's descriptor from the INIT options, drives
+ * `update` once a frame, hands it method replies and sends the requests it
+ * queues.
+ */
+export class FarTerrain extends Group {
+  public options: FarTerrainOptions;
+
+  public descriptor: FarTerrainDescriptor | null = null;
+
+  public stats: FarTerrainStats = {
+    isActive: false,
+    distance: 0,
+    rings: 0,
+    tilesRequested: 0,
+    tilesReceived: 0,
+    tilesRejected: 0,
+    bytesReceived: 0,
+    tilesBuilt: 0,
+    tilesResident: 0,
+    tilesDrawn: 0,
+    tilesWanted: 0,
+    levelCounts: [],
+    meshes: 0,
+    batchPages: 0,
+    lastUpdateMs: 0,
+    peakUpdateMs: 0,
+    totalUpdateMs: 0,
+    updates: 0,
+    maskRebuilds: 0,
+    pendingCovered: 0,
+    chunksHeld: 0,
+    pendingStoodIn: 0,
+    triangles: 0,
+    lastBuildMs: 0,
+    peakBuildMs: 0,
+    buildsInFlight: 0,
+    lastUploadMs: 0,
+    peakUploadMs: 0,
+    lastShadowMs: 0,
+    meshBytes: 0,
+    quads: { tops: 0, risers: 0, skirts: 0, crowns: 0 },
+    facesResolved: 0,
+    facesPending: 0,
+    facesMissing: 0,
+    faceLookMs: 0,
+  };
+
+  private resident = new Map<string, ResidentTile>();
+
+  /**
+   * Every tile's relief once seen, kept past its mesh: a tile split for its
+   * relief is never drawn, so it leaves, and without its relief the plan
+   * would stop splitting and fetch it again.
+   */
+  private reliefs = new Map<string, number>();
+
+  private pending = new Map<string, number>();
+
+  private queuedRequests: MessageProtocol[] = [];
+
+  private lastRequestAt = -Infinity;
+
+  /**
+   * The server's budget for this client mirrored as its token bucket: the
+   * tiles still to ask for, and when it last refilled. Null until the first
+   * request under a descriptor that names a budget.
+   */
+  private budgetTokens: number | null = null;
+
+  private budgetRefilledAt = 0;
+
+  private lastUpdateAt = -Infinity;
+
+  /**
+   * The detail plan, kept while nothing it reads has changed: the viewer
+   * within PLAN_MOVE_BLOCKS of where it was made, no tile arrived, built or
+   * dropped (`planVersion`), and no older than PLAN_MAX_AGE_MS. Planning
+   * walks every tile in reach, which every frame cost more than drawing.
+   */
+  private plan: FarLodPlan | null = null;
+  private planVersion = 0;
+  private plannedVersion = -1;
+  private plannedAt = new Vector2(Infinity, Infinity);
+  private plannedTime = -Infinity;
+
+  private palette: Float32Array;
+
+  /** The materials as GPU data, once every face they need has been read. */
+  private materialTable: FarMaterialTable | null = null;
+
+  /** Faces read so far, by `block:side`. */
+  private faceLooks = new Map<string, FarFaceLook>();
+
+  /** When each still unreadable face was first asked for. */
+  private faceWaitingSince = new Map<string, number>();
+
+  private layersTexture: DataArrayTexture;
+
+  private materialsTexture: DataTexture;
+
+  private landMaterial: ShaderMaterial;
+
+  private waterMaterial: ShaderMaterial;
+
+  private water: Mesh;
+
+  private seabedMaterial: ShaderMaterial;
+
+  private seabed: Mesh;
+
+  private waterSpan = 0;
+
+  private coverage: Uint8Array;
+
+  private coverageTexture: DataTexture;
+
+  private coverageGeneration = -1;
+
+  private coverageCenter: [number, number] | null = null;
+
+  private coverageRadius = -1;
+
+  private coverageBuiltAt = 0;
+
+  /**
+   * Tiles drawn and fully dissolved in, at whatever detail, and those still
+   * dissolving out under their replacement: the ones that stand in for a
+   * chunk column still on its way outside the guard radius
+   * (`pendingGuardRadius`).
+   */
+  private standIns = new Set<string>();
+
+  /** The set the next frame's stand-ins are gathered in, swapped on change. */
+  private nextStandIns = new Set<string>();
+
+  /** The plan `drawnIds` and `keepIds` were taken from (`takePlanIds`). */
+  private idsPlan: FarLodPlan | null = null;
+  private readonly drawnIds = new Set<string>();
+  private readonly keepIds = new Set<string>();
+
+  /** Resident tiles hidden and faded out, gathered each frame. */
+  private readonly idleTiles: [string, ResidentTile][] = [];
+
+  /** Bumped whenever `standIns` changes, so the mask follows it. */
+  private standInGeneration = 0;
+
+  private coverageStandIns = -1;
+
+  /** Loaded chunks the far layer still stands in for (`isHeld`), and those that have settled once. */
+  private heldColumns = new Set<string>();
+  private settledColumns = new Set<string>();
+
+  /** Sea depth per texel (0 dry, 255 at DEPTH_RANGE or deeper), around the viewer. */
+  private depth = new Uint8Array(DEPTH_TEXELS * DEPTH_TEXELS).fill(255);
+
+  /** The level of the tile each depth texel came from (255 none), so a coarser one never overwrites a finer. */
+  private depthLevel = new Uint8Array(DEPTH_TEXELS * DEPTH_TEXELS).fill(255);
+
+  private depthTexture: DataTexture;
+
+  /**
+   * The highest surface per depth-map texel, ground or canopy, from the
+   * finest tile over it (the tallest sample of that tile): what casts the
+   * far layer's sun shadows. `heightLevel` keeps finer over coarser.
+   */
+  private heights = new Float32Array(DEPTH_TEXELS * DEPTH_TEXELS).fill(
+    FAR_SHADOW_NONE,
+  );
+  private heightLevel = new Uint8Array(DEPTH_TEXELS * DEPTH_TEXELS).fill(255);
+  private heightsVersion = 0;
+
+  /** Shadow lines per texel as half floats, from the worker. */
+  private shadowTexture: DataTexture;
+
+  /** `(originX, originZ, blocks per texel, texels)` the shadow lines cover; w 0 while there are none. */
+  private shadowWindow: ShaderUniform<Vector4> = {
+    value: new Vector4(0, 0, DEPTH_BLOCKS_PER_TEXEL, 0),
+  };
+
+  /** The heights and sun the last shadow job ran on, and whether one is out. */
+  private shadowedVersion = -1;
+  private shadowedSun = new Vector3(0, -1, 0);
+  private shadowedAt = -Infinity;
+  private isShadowing = false;
+
+  /** `(originX, originZ, blocks per texel, texels)` of the depth map. */
+  private depthWindow: ShaderUniform<Vector4> = {
+    value: new Vector4(0, 0, DEPTH_BLOCKS_PER_TEXEL, DEPTH_TEXELS),
+  };
+
+  private depthCenter: [number, number] | null = null;
+
+  private seabedColor: ShaderUniform<Color> = { value: new Color() };
+
+  private waterColor: ShaderUniform<Color> = { value: new Color() };
+
+  private skyTop: [number, number, number];
+
+  private skySide: [number, number, number];
+
+  private chunkSize = 16;
+
+  /** Horizontal centre the reach is measured from, shared by every material. */
+  private ringCenter: ShaderUniform<Vector2> = { value: new Vector2() };
+
+  /** `(start, end)` of the band across which the layer thins into haze. */
+  private farEdge: ShaderUniform<Vector2> = {
+    value: new Vector2(Infinity, Infinity),
+  };
+
+  /** `(start, end)` of the far water's depth ramp past the loaded edge. */
+  private waterDepthRamp: ShaderUniform<Vector2> = { value: new Vector2() };
+
+  /** The fade of the mesh about to draw, written per draw. */
+  /** Every tile's land and floating-land meshes, drawn as one. */
+  public readonly batch: FarBatch;
+
+  /** Bumped by configure and clearTiles, so a build in flight that was asked for an older layer is dropped. */
+  private epoch = 0;
+
+  private shared: FarTerrainSharedUniforms;
+
+  constructor(
+    shared: FarTerrainSharedUniforms,
+    options: Partial<FarTerrainOptions> = {},
+  ) {
+    super();
+    this.name = "far-terrain";
+    this.options = { ...DEFAULT_OPTIONS, ...options };
+    this.shared = shared;
+    this.palette = Float32Array.from(this.options.palette);
+    this.skyTop = colorTriple(this.options.skyTopColor);
+    this.skySide = colorTriple(this.options.skySideColor);
+
+    this.coverage = new Uint8Array(COVERAGE_SIZE * COVERAGE_SIZE);
+    this.coverageTexture = new DataTexture(
+      this.coverage,
+      COVERAGE_SIZE,
+      COVERAGE_SIZE,
+      RedFormat,
+      UnsignedByteType,
+    );
+    // Linear so the mask reads as a ramp across the loaded edge for the
+    // seam band; the per-chunk answer samples texel centres.
+    this.coverageTexture.magFilter = LinearFilter;
+    this.coverageTexture.minFilter = LinearFilter;
+    this.coverageTexture.needsUpdate = true;
+    shared.farCoverMask.value = this.coverageTexture;
+    shared.farCover.value.set(0, 0, this.chunkSize, COVERAGE_SIZE);
+    shared.farSeam.value = 0;
+
+    this.depthTexture = new DataTexture(
+      this.depth,
+      DEPTH_TEXELS,
+      DEPTH_TEXELS,
+      RedFormat,
+      UnsignedByteType,
+    );
+    this.depthTexture.magFilter = LinearFilter;
+    this.depthTexture.minFilter = LinearFilter;
+    this.depthTexture.needsUpdate = true;
+
+    this.shadowTexture = new DataTexture(
+      new Uint16Array(DEPTH_TEXELS * DEPTH_TEXELS),
+      DEPTH_TEXELS,
+      DEPTH_TEXELS,
+      RedFormat,
+      HalfFloatType,
+    );
+    this.shadowTexture.magFilter = LinearFilter;
+    this.shadowTexture.minFilter = LinearFilter;
+    this.shadowTexture.needsUpdate = true;
+    this.seabedColor.value.set(this.options.waterColor);
+    this.waterColor.value.set(this.options.waterColor);
+
+    this.layersTexture = new DataArrayTexture(
+      new Uint8Array(FAR_LAYER_SIZE * FAR_LAYER_SIZE * 4).fill(128),
+      FAR_LAYER_SIZE,
+      FAR_LAYER_SIZE,
+      1,
+    );
+    this.materialsTexture = new DataTexture(
+      new Float32Array(FAR_MATERIAL_TEXELS * 4),
+      FAR_MATERIAL_TEXELS,
+      1,
+      RGBAFormat,
+      FloatType,
+    );
+
+    const common = () => ({
+      uFogColor: shared.fogColor,
+      uFogNear: shared.fogNear,
+      uFogFar: shared.fogFar,
+      uFogHeightOrigin: shared.fogHeightOrigin,
+      uFogHeightDensity: shared.fogHeightDensity,
+      uFogVerticalBlend: shared.fogVerticalBlend,
+      uSkyFogTopColor: shared.skyFogTopColor,
+      uSkyFogMiddleColor: shared.skyFogMiddleColor,
+      uSkyFogBottomColor: shared.skyFogBottomColor,
+      uSkyFogOffset: shared.skyFogOffset,
+      uSkyFogVoidOffset: shared.skyFogVoidOffset,
+      uSkyFogExponent: shared.skyFogExponent,
+      uSkyFogExponent2: shared.skyFogExponent2,
+      uSkyFogDimension: shared.skyFogDimension,
+      uSkyFogStrength: shared.skyFogStrength,
+      uChunkReveal: { value: 1 },
+      uCameraSubmersion: shared.cameraSubmersion,
+      uCameraWaterPlaneY: shared.cameraWaterPlaneY,
+      uUnderwaterAmbient: shared.underwaterAmbient,
+      uUnderwaterViewScale: shared.underwaterViewScale,
+      uSunDirection: shared.sunDirection,
+      uSunColor: shared.sunColor,
+      uSunlightIntensity: shared.sunlightIntensity,
+      uDirectSunlight: shared.directSunlight ?? { value: 1 },
+      ...bindSkyGlowUniforms(shared.skyGlow),
+      uAmbientColor: shared.ambientColor,
+      uMinLightLevel: shared.minLightLevel,
+      uBaseAmbient: shared.baseAmbient,
+      uFaceShades: shared.faceShades,
+      uFarCoverMask: shared.farCoverMask,
+      uFarCover: shared.farCover,
+      uFarSeam: shared.farSeam,
+      uRingOuter: { value: 0 },
+      uRingCenter: this.ringCenter,
+      uFarEdge: this.farEdge,
+    });
+
+    // The weather the chunks wear, by reference; a host that shares none
+    // gets the inert defaults, and the land wears none.
+    const weatherDefaults = createSurfaceWeatherUniforms();
+    this.landMaterial = new ShaderMaterial({
+      vertexShader: VERTEX_SHADER,
+      fragmentShader: LAND_FRAGMENT_SHADER,
+      uniforms: {
+        ...common(),
+        uSurfaceWeather:
+          shared.surfaceWeather ?? weatherDefaults.surfaceWeather,
+        uSurfaceWeatherMap:
+          shared.surfaceWeatherMap ?? weatherDefaults.surfaceWeatherMap,
+        uSurfaceWeatherWindow:
+          shared.surfaceWeatherWindow ?? weatherDefaults.surfaceWeatherWindow,
+        uSurfaceWeatherLine:
+          shared.surfaceWeatherLine ?? weatherDefaults.surfaceWeatherLine,
+        uSurfaceCoatColor:
+          shared.surfaceCoatColor ?? weatherDefaults.surfaceCoatColor,
+        uSurfaceWind: shared.surfaceWind ?? weatherDefaults.surfaceWind,
+        uFarLayers: { value: this.layersTexture },
+        uFarShadowMap: { value: this.shadowTexture },
+        uFarShadow: this.shadowWindow,
+        uFarMaterials: { value: this.materialsTexture },
+      },
+      side: DoubleSide,
+    });
+    this.batch = new FarBatch(this.landMaterial);
+    this.add(this.batch.root);
+    this.waterMaterial = new ShaderMaterial({
+      vertexShader: WATER_VERTEX_SHADER,
+      fragmentShader: WATER_FRAGMENT_SHADER,
+      uniforms: {
+        ...common(),
+        uWaterColor: this.waterColor,
+        uWaterTint: shared.waterTint ?? this.waterColor,
+        uSeabedColor: this.seabedColor,
+        uFarDepthMap: { value: this.depthTexture },
+        uFarShadowMap: { value: this.shadowTexture },
+        uFarShadow: this.shadowWindow,
+        uFarDepth: this.depthWindow,
+        uSkyTopColor: shared.skyTopColor ?? shared.skyFogTopColor,
+        uSkyMiddleColor: shared.skyMiddleColor ?? shared.skyFogMiddleColor,
+        uWaterFresnelStrength: shared.waterFresnelStrength ?? { value: 0 },
+        uFarWaterDepthRamp: this.waterDepthRamp,
+      },
+      side: DoubleSide,
+    });
+    this.water = new Mesh(new PlaneGeometry(1, 1), this.waterMaterial);
+    this.water.name = "far-terrain-water";
+    this.water.rotation.x = -Math.PI / 2;
+    this.water.castShadow = false;
+    this.water.receiveShadow = false;
+    this.water.frustumCulled = false;
+    this.water.visible = false;
+    this.add(this.water);
+    this.seabedMaterial = new ShaderMaterial({
+      vertexShader: WATER_VERTEX_SHADER,
+      fragmentShader: SEABED_FRAGMENT_SHADER,
+      uniforms: {
+        ...common(),
+        uRingOuter: this.waterMaterial.uniforms.uRingOuter,
+        uSeabedColor: this.seabedColor,
+        uFarShadowMap: { value: this.shadowTexture },
+        uFarShadow: this.shadowWindow,
+      },
+      side: DoubleSide,
+    });
+    // Rides the water plane, `FAR_SEABED_DROP` below it (the plane's local
+    // z is world up).
+    this.seabed = new Mesh(this.water.geometry, this.seabedMaterial);
+    this.seabed.name = "far-terrain-seabed";
+    this.seabed.position.z = -FAR_SEABED_DROP;
+    this.seabed.castShadow = false;
+    this.seabed.receiveShadow = false;
+    this.seabed.frustumCulled = false;
+    this.water.add(this.seabed);
+  }
+
+  /** The server's description of its far terrain, or null for none. */
+  configure(descriptor: FarTerrainDescriptor | null) {
+    const valid =
+      descriptor &&
+      Number.isFinite(descriptor.baseStep) &&
+      descriptor.baseStep >= 1 &&
+      Number.isFinite(descriptor.tileSamples) &&
+      descriptor.tileSamples >= 2 &&
+      Number.isFinite(descriptor.levels) &&
+      descriptor.levels >= 1
+        ? descriptor
+        : null;
+    if (JSON.stringify(valid) === JSON.stringify(this.descriptor)) return;
+    this.descriptor = valid;
+    this.budgetTokens = null;
+    this.clearTiles();
+    this.materialTable = null;
+  }
+
+  /**
+   * Replaces the colour of every class (linear RGB, flattened) for a server
+   * whose descriptor names no materials; tiles built from here on use it. A
+   * source whose classes are discovered as tiles arrive (block ids, say)
+   * grows its palette before handing each tile in.
+   */
+  setPalette(palette: ArrayLike<number>) {
+    this.palette = Float32Array.from(palette);
+    if (!this.descriptor?.materials?.length) this.materialTable = null;
+  }
+
+  /**
+   * Read every face the descriptor's materials name now, a slice at a time,
+   * for a load phase to await once the block textures are painted: each
+   * atlas read waits on the GPU, a stall that belongs behind a loading
+   * screen, not in the frame a player switches the layer on. Settles once
+   * the materials are ready (a face that never becomes readable is greyed
+   * after `faceLookTimeoutMs`), at once for a world without materials.
+   */
+  async warmLooks() {
+    while (!this.resolveMaterials(performance.now())) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+  }
+
+  /** The reach in blocks; 0 switches the layer off and frees its tiles. */
+  get distance() {
+    return this.options.distance;
+  }
+
+  set distance(distance: number) {
+    const next = Math.max(0, Math.floor(distance));
+    if (next === this.options.distance) return;
+    this.options.distance = next;
+    this.planVersion += 1;
+    if (next === 0) this.clearTiles();
+  }
+
+  /** The far reach when the layer is drawing, else 0 (for the fog range). */
+  get reach() {
+    return this.descriptor && this.options.distance > 0
+      ? this.options.distance
+      : 0;
+  }
+
+  get isActive() {
+    return this.reach > 0;
+  }
+
+  /**
+   * One frame: plan which tiles to draw, ask for the missing ones, ease the
+   * detail changes, drop what is no longer wanted, refresh the chunk-coverage
+   * mask when chunks changed, and hand new tiles to the mesher.
+   *
+   * `isChunkPending` says whether a chunk column inside the render radius
+   * still owes its terrain (not loaded, or loaded with its mesh still being
+   * built at some level; a loaded, meshed chunk with nothing to draw is not
+   * pending): the mask covers those within `pendingGuardRadius` of the
+   * viewer, so a coarse tile never shows through the walls around it.
+   * Further out, a drawn tile over such a column keeps drawing until the
+   * chunk lands instead of opening a hole of sky.
+   */
+  update(
+    position: Vector3,
+    world: {
+      renderRadius: number;
+      chunkSize: number;
+      loadedGeneration: number;
+      forEachMeshedChunk: (callback: (cx: number, cz: number) => void) => void;
+      isChunkPending: (cx: number, cz: number) => boolean;
+    },
+  ) {
+    const started = performance.now();
+    const elapsed = Number.isFinite(this.lastUpdateAt)
+      ? Math.min(250, started - this.lastUpdateAt)
+      : 0;
+    this.lastUpdateAt = started;
+    const descriptor = this.descriptor;
+    this.chunkSize = world.chunkSize;
+    if (!descriptor || this.options.distance <= 0) {
+      this.visible = false;
+      this.stats.isActive = false;
+      this.stats.rings = 0;
+      this.stats.distance = 0;
+      this.shared.farSeam.value = 0;
+      return;
+    }
+    this.visible = true;
+    this.stats.isActive = true;
+    this.stats.distance = this.options.distance;
+    this.ringCenter.value.set(position.x, position.z);
+    this.shared.farSeam.value = farSeamScale(
+      world.chunkSize,
+      this.options.seamBand,
+    );
+    this.landMaterial.uniforms.uRingOuter.value = this.options.distance;
+    this.waterMaterial.uniforms.uRingOuter.value = this.options.distance;
+
+    let plan = this.plan;
+    if (
+      !plan ||
+      this.plannedVersion !== this.planVersion ||
+      started - this.plannedTime > PLAN_MAX_AGE_MS ||
+      Math.hypot(
+        position.x - this.plannedAt.x,
+        position.z - this.plannedAt.y,
+      ) >= PLAN_MOVE_BLOCKS
+    ) {
+      plan = planFarLod(
+        descriptor,
+        position.x,
+        position.z,
+        this.options.distance,
+        this.options.lod,
+        (key) => this.resident.get(farTileId(key))?.isBuilt === true,
+        (key) => this.reliefs.get(farTileId(key)) ?? null,
+      );
+      this.plan = plan;
+      this.plannedVersion = this.planVersion;
+      this.plannedAt.set(position.x, position.z);
+      this.plannedTime = started;
+    }
+    this.stats.tilesWanted = plan.wanted.length;
+    this.requestTiles(plan, started);
+    this.applyDrawn(plan, started, elapsed);
+    this.updateCoverage(position, world);
+    this.updateDepth(position);
+    this.updateShadow(started);
+    this.updateWater(position, descriptor);
+    const loadedEdge = world.renderRadius * world.chunkSize;
+    this.waterDepthRamp.value.set(
+      loadedEdge,
+      loadedEdge + FAR_WATER_DEPTH_RAMP,
+    );
+    this.farEdge.value.set(
+      this.options.distance * (1 - this.options.edgeBand),
+      this.options.distance,
+    );
+    if (this.resolveMaterials(started)) this.dispatchBuilds();
+
+    this.stats.tilesResident = this.resident.size;
+    this.stats.lastUpdateMs = performance.now() - started;
+    this.stats.totalUpdateMs += this.stats.lastUpdateMs;
+    this.stats.updates += 1;
+    this.stats.peakUpdateMs = Math.max(
+      this.stats.peakUpdateMs,
+      this.stats.lastUpdateMs,
+    );
+  }
+
+  /** The batch slots the resident tiles hold, land and floating land. */
+  tileSlots(): FarBatchSlot[] {
+    const slots: FarBatchSlot[] = [];
+    for (const tile of this.resident.values()) {
+      if (tile.land) slots.push(tile.land);
+      if (tile.sky) slots.push(tile.sky);
+    }
+    return slots;
+  }
+
+  /** A method reply to hand over; ignored unless it is a far-terrain tile. */
+  onMethodReply(name: string, payload: unknown) {
+    if (name !== FAR_TERRAIN_METHOD) return;
+    const tile = decodeFarTerrainReply(payload);
+    if (!tile) {
+      this.stats.tilesRejected += 1;
+      return;
+    }
+    const id = farTileId(tile.key);
+    this.pending.delete(id);
+    this.stats.tilesReceived += 1;
+    this.stats.bytesReceived += tile.bytes;
+    if (!this.descriptor) return;
+    const existing = this.resident.get(id);
+    if (existing) this.disposeTile(existing);
+    if (this.depthCenter) this.writeDepth(tile);
+    this.reliefs.set(id, reliefOf(tile));
+    this.planVersion += 1;
+    this.resident.set(id, {
+      data: tile,
+      land: null,
+      sky: null,
+      isBuilt: false,
+      isBuilding: false,
+      opacity: 0,
+      isDrawn: false,
+      lastDrawnAt: performance.now(),
+      bytes: 0,
+      failedBuilds: 0,
+      counts: null,
+    });
+  }
+
+  /** Requests queued since the last call, for the world to send. */
+  takePackets(): MessageProtocol[] {
+    if (this.queuedRequests.length === 0) return [];
+    const packets = this.queuedRequests;
+    this.queuedRequests = [];
+    return packets;
+  }
+
+  /** Reset the peak and the running mean so a measurement window starts clean. */
+  resetPeaks() {
+    this.stats.peakUpdateMs = 0;
+    this.stats.totalUpdateMs = 0;
+    this.stats.updates = 0;
+    this.stats.peakBuildMs = 0;
+    this.stats.peakUploadMs = 0;
+  }
+
+  /** Drop every tile and forget what was asked for. */
+  clearTiles() {
+    for (const tile of this.resident.values()) this.disposeTile(tile);
+    this.resident.clear();
+    this.reliefs.clear();
+    this.planVersion += 1;
+    this.pending.clear();
+    this.queuedRequests = [];
+    this.epoch += 1;
+    this.stats.tilesResident = 0;
+    this.stats.tilesDrawn = 0;
+    this.stats.meshes = 0;
+    this.stats.triangles = 0;
+    this.stats.meshBytes = 0;
+    this.stats.buildsInFlight = 0;
+    this.water.visible = false;
+  }
+
+  dispose() {
+    this.clearTiles();
+    this.batch.dispose();
+    this.landMaterial.dispose();
+    this.waterMaterial.dispose();
+    this.seabedMaterial.dispose();
+    this.water.geometry.dispose();
+    this.coverageTexture.dispose();
+    this.layersTexture.dispose();
+    this.materialsTexture.dispose();
+    this.depthTexture.dispose();
+    this.shadowTexture.dispose();
+  }
+
+  /** Asks for the plan's missing tiles, its fallbacks first. */
+  private requestTiles(plan: FarLodPlan, now: number) {
+    if (plan.fallback.length + plan.wanted.length === 0) return;
+    if (now - this.lastRequestAt < this.options.requestIntervalMs) return;
+    const cap = Math.min(
+      this.options.maxTilesPerRequest,
+      this.budgetAllowance(now),
+    );
+    if (cap < 1) return;
+    const tiles: [number, number, number][] = [];
+    for (const keys of [plan.fallback, plan.wanted]) {
+      for (const key of keys) {
+        if (tiles.length >= cap) break;
+        const id = farTileId(key);
+        if (this.resident.has(id)) continue;
+        const askedAt = this.pending.get(id);
+        if (askedAt !== undefined && now - askedAt < this.options.retryAfterMs)
+          continue;
+        tiles.push([key.level, key.tx, key.tz]);
+        this.pending.set(id, now);
+      }
+    }
+    if (tiles.length === 0) return;
+    if (this.budgetTokens !== null) this.budgetTokens -= tiles.length;
+    this.lastRequestAt = now;
+    this.stats.tilesRequested += tiles.length;
+    this.queuedRequests.push({
+      type: "METHOD",
+      method: {
+        name: FAR_TERRAIN_METHOD,
+        payload: JSON.stringify({ tiles }),
+      },
+    } as MessageProtocol);
+  }
+
+  /**
+   * How many tiles a request may name now under the server's budget,
+   * refilled by wall time as the server refills its own and kept
+   * `budgetHeadroom` short of it; unlimited when the descriptor names none.
+   */
+  private budgetAllowance(now: number) {
+    const budget = this.descriptor?.budget;
+    if (!budget || !(budget.tilesPerSecond > 0) || !(budget.burst > 0))
+      return Infinity;
+    const capacity = Math.max(1, budget.burst - this.options.budgetHeadroom);
+    const tokens =
+      this.budgetTokens === null
+        ? capacity
+        : this.budgetTokens +
+          ((now - this.budgetRefilledAt) / 1000) * budget.tilesPerSecond;
+    this.budgetTokens = Math.min(capacity, tokens);
+    this.budgetRefilledAt = now;
+    return Math.min(budget.maxTilesPerRequest, Math.floor(this.budgetTokens));
+  }
+
+  /**
+   * Ease every resident tile toward drawn or hidden, and drop the ones no
+   * plan wants that have faded out: least recently drawn first once there
+   * are more than `maxResidentTiles`, and any no plan has wanted for a few
+   * seconds. Pending asks no plan wants any more are forgotten too.
+   */
+  private applyDrawn(plan: FarLodPlan, now: number, elapsed: number) {
+    // The ids a plan draws and keeps only change with the plan: taken once
+    // per plan, not once per frame.
+    if (this.idsPlan !== plan) {
+      this.idsPlan = plan;
+      this.takePlanIds(plan);
+      for (const id of this.pending.keys()) {
+        if (!this.keepIds.has(id)) this.pending.delete(id);
+      }
+    }
+    const { drawnIds, keepIds } = this;
+    const step = this.options.fadeMs > 0 ? elapsed / this.options.fadeMs : 1;
+    const levels = this.stats.levelCounts;
+    levels.length = this.descriptor?.levels ?? 0;
+    levels.fill(0);
+    let meshes = 0;
+    let triangles = 0;
+    let bytes = 0;
+    const quads = this.stats.quads;
+    quads.tops = 0;
+    quads.risers = 0;
+    quads.skirts = 0;
+    quads.crowns = 0;
+    const idle = this.idleTiles;
+    idle.length = 0;
+    const standIns = this.nextStandIns;
+    standIns.clear();
+    for (const [id, tile] of this.resident) {
+      const isDrawn = drawnIds.has(id);
+      if (isDrawn) {
+        tile.lastDrawnAt = now;
+        levels[tile.data.key.level] = (levels[tile.data.key.level] ?? 0) + 1;
+        if (tile.counts) {
+          quads.tops += tile.counts.tops;
+          quads.risers += tile.counts.risers;
+          quads.skirts += tile.counts.skirts;
+          quads.crowns += tile.counts.crowns;
+        }
+      }
+      tile.isDrawn = isDrawn;
+      // With nothing of its ground on screen there is nothing to dissolve
+      // over (a teleport's end, a tile kept from an earlier visit): it shows
+      // whole at once instead of rising out of the sky.
+      if (isDrawn && tile.opacity === 0 && !this.isGroundShown(tile.data.key)) {
+        tile.opacity = 1;
+      }
+      tile.opacity = Math.min(
+        1,
+        Math.max(0, tile.opacity + (isDrawn ? step : -step)),
+      );
+      // A stand-in keeps standing in while it dissolves out under what
+      // replaces it: together the two draw every pixel of their ground.
+      if (
+        isDrawn ? tile.opacity >= 1 : tile.opacity > 0 && this.standIns.has(id)
+      ) {
+        standIns.add(id);
+      }
+      for (const slot of [tile.land, tile.sky]) {
+        if (!slot) continue;
+        this.batch.setFade(slot, tile.opacity, tile.isDrawn);
+        if (slot.visible) {
+          meshes += 1;
+          triangles += slot.vertexCount / 3;
+        }
+      }
+      bytes += tile.bytes;
+      if (!isDrawn && tile.opacity === 0 && !keepIds.has(id)) {
+        idle.push([id, tile]);
+      }
+    }
+    // Idle tiles leave after a short stay, so turning back is free; the
+    // oldest leave at once past the cap.
+    idle.sort((a, b) => a[1].lastDrawnAt - b[1].lastDrawnAt);
+    let excess = this.resident.size - this.options.maxResidentTiles;
+    for (const [id, tile] of idle) {
+      if (excess <= 0 && now - tile.lastDrawnAt < this.options.evictAfterMs)
+        continue;
+      this.disposeTile(tile);
+      this.resident.delete(id);
+      this.planVersion += 1;
+      excess -= 1;
+    }
+    let isStandInChanged = standIns.size !== this.standIns.size;
+    if (!isStandInChanged) {
+      for (const id of standIns) {
+        if (this.standIns.has(id)) continue;
+        isStandInChanged = true;
+        break;
+      }
+    }
+    if (isStandInChanged) {
+      this.nextStandIns = this.standIns;
+      this.standIns = standIns;
+      this.standInGeneration += 1;
+    }
+    this.stats.tilesDrawn = drawnIds.size;
+    this.stats.meshes = meshes;
+    this.stats.batchPages = this.batch.pages.length;
+    this.stats.triangles = triangles;
+    this.stats.meshBytes = bytes;
+    let rings = 0;
+    for (const count of levels) if (count > 0) rings += 1;
+    this.stats.rings = rings;
+  }
+
+  /**
+   * The ids `plan` draws, and those it keeps resident: what it draws or
+   * wants, its fallbacks, and every coarser tile over what it draws or
+   * wants (the stand-in it falls back to when the viewer outruns the finer
+   * tiles; without it the layer opens a hole until a refetch lands).
+   */
+  private takePlanIds(plan: FarLodPlan) {
+    const { drawnIds, keepIds } = this;
+    drawnIds.clear();
+    keepIds.clear();
+    for (const key of plan.drawn) drawnIds.add(farTileId(key));
+    for (const key of plan.wanted) keepIds.add(farTileId(key));
+    for (const key of plan.fallback) keepIds.add(farTileId(key));
+    const top = (this.descriptor?.levels ?? 1) - 1;
+    const ancestors = new Set<string>();
+    for (const keys of [plan.drawn, plan.wanted]) {
+      for (const key of keys) {
+        let { level, tx, tz } = key;
+        while (level < top) {
+          level += 1;
+          tx = Math.floor(tx / 2);
+          tz = Math.floor(tz / 2);
+          const id = farTileId({ level, tx, tz });
+          if (ancestors.has(id)) break;
+          ancestors.add(id);
+          keepIds.add(id);
+        }
+      }
+    }
+  }
+
+  /**
+   * Whether the materials are on the GPU, reading the faces the
+   * descriptor's materials name off the atlas, as many a frame as the build
+   * budget allows (at least one). Tiles wait for it: a tile built before
+   * would wear placeholder colours. A face still unreadable after
+   * `faceLookTimeoutMs` is painted grey, and the layer says which.
+   */
+  private resolveMaterials(started: number): boolean {
+    if (this.materialTable) return true;
+    const materials = this.descriptor?.materials;
+    const faceLook = this.options.faceLook;
+    if (!materials?.length || !faceLook) {
+      const table = farPaletteTable(this.palette, this.skyTop, this.skySide);
+      this.installMaterials(table, table.classes - 1);
+      return true;
+    }
+    let pending = 0;
+    let read = 0;
+    const trees = this.descriptor?.trees ?? [];
+    for (const [block, side, stage] of farMaterialFaces(materials, trees)) {
+      const key = farFaceKey(block, side, stage);
+      if (this.faceLooks.has(key)) continue;
+      if (
+        read > 0 &&
+        performance.now() - started > this.options.buildBudgetMs
+      ) {
+        pending += 1;
+        continue;
+      }
+      const readAt = performance.now();
+      const look = faceLook(block, side, stage);
+      read += 1;
+      this.stats.faceLookMs += performance.now() - readAt;
+      if (look) {
+        this.faceLooks.set(key, look);
+        this.faceWaitingSince.delete(key);
+        continue;
+      }
+      const since = this.faceWaitingSince.get(key) ?? started;
+      this.faceWaitingSince.set(key, since);
+      if (started - since < this.options.faceLookTimeoutMs) {
+        pending += 1;
+        continue;
+      }
+      console.warn(
+        `[far-terrain] block ${block}'s ${side} face never became readable in ${this.options.faceLookTimeoutMs} ms; the far layer paints it grey`,
+      );
+      this.faceLooks.set(key, GREY_LOOK);
+      this.stats.facesMissing += 1;
+    }
+    this.stats.facesResolved = this.faceLooks.size;
+    this.stats.facesPending = pending;
+    if (pending > 0) return false;
+    const table = buildFarMaterialTable(
+      materials,
+      (block, side, stage) =>
+        this.faceLooks.get(farFaceKey(block, side, stage)) ?? GREY_LOOK,
+      trees,
+    );
+    const seabed = this.descriptor?.seabedMaterial;
+    if (seabed !== undefined && materials[seabed]) {
+      const look = this.faceLooks.get(`${materials[seabed].top}:top`);
+      if (look) this.seabedColor.value.setRGB(...look.color);
+    }
+    const sky = this.descriptor?.skyMaterial;
+    this.installMaterials(
+      table,
+      sky !== undefined && sky >= 0 && sky < table.classes ? sky : null,
+    );
+    return true;
+  }
+
+  private skyClass = 0;
+
+  private installMaterials(table: FarMaterialTable, skyClass: number | null) {
+    const previous = this.materialTable;
+    const sameClasses =
+      previous !== null &&
+      previous.treeClass === table.treeClass &&
+      this.skyClass === (skyClass ?? 0);
+    this.materialTable = table;
+    this.layersTexture.dispose();
+    const layers = new DataArrayTexture(
+      table.layers,
+      FAR_LAYER_SIZE,
+      FAR_LAYER_SIZE,
+      table.layerCount,
+    );
+    layers.format = RGBAFormat;
+    layers.type = UnsignedByteType;
+    layers.colorSpace = SRGBColorSpace;
+    layers.wrapS = RepeatWrapping;
+    layers.wrapT = RepeatWrapping;
+    layers.magFilter = NearestFilter;
+    layers.minFilter = LinearMipmapLinearFilter;
+    layers.generateMipmaps = true;
+    layers.anisotropy = 8;
+    layers.needsUpdate = true;
+    this.layersTexture = layers;
+    this.landMaterial.uniforms.uFarLayers.value = layers;
+
+    this.materialsTexture.dispose();
+    const rows = new DataTexture(
+      table.table,
+      FAR_MATERIAL_TEXELS,
+      table.classes,
+      RGBAFormat,
+      FloatType,
+    );
+    rows.magFilter = NearestFilter;
+    rows.minFilter = NearestFilter;
+    rows.needsUpdate = true;
+    this.materialsTexture = rows;
+    this.landMaterial.uniforms.uFarMaterials.value = rows;
+
+    this.skyClass = skyClass ?? 0;
+    // Faces paint from the table at draw time; tiles bake only class
+    // indices, so they rebuild only when those move.
+    if (sameClasses) return;
+    for (const tile of this.resident.values()) {
+      tile.isBuilt = false;
+      this.planVersion += 1;
+      this.planVersion += 1;
+      tile.isBuilding = false;
+    }
+  }
+
+  /** Hand unbuilt tiles to the mesher, nearest drawn-or-wanted first. */
+  private dispatchBuilds() {
+    const table = this.materialTable;
+    if (!table) return;
+    const build = this.options.buildMesh ?? workerBuild;
+    const center = this.ringCenter.value;
+    const queue = Array.from(this.resident.values())
+      .filter(
+        (tile) =>
+          !tile.isBuilt &&
+          !tile.isBuilding &&
+          tile.failedBuilds < MAX_BUILD_ATTEMPTS,
+      )
+      .sort(
+        (a, b) => this.tileDistance(a, center) - this.tileDistance(b, center),
+      );
+    for (const tile of queue) {
+      if (this.stats.buildsInFlight >= this.options.maxBuildsInFlight) break;
+      const { data } = tile;
+      const span = (data.size - 1) * data.step;
+      const input: FarMeshInput = {
+        originX: data.key.tx * span,
+        originZ: data.key.tz * span,
+        step: data.step,
+        size: data.size,
+        heights: data.heights,
+        classes: data.colors,
+        tints: data.tints,
+        sky: data.sky,
+        canopy: data.canopy,
+        classCount: table.treeClass,
+        treeClass: table.treeClass,
+        skyClass: this.skyClass,
+        waterSurface: this.descriptor?.waterSurface ?? null,
+      };
+      tile.isBuilding = true;
+      this.stats.buildsInFlight += 1;
+      const epoch = this.epoch;
+      build(input).then((built) => {
+        if (epoch !== this.epoch) return;
+        this.stats.buildsInFlight = Math.max(0, this.stats.buildsInFlight - 1);
+        const id = farTileId(data.key);
+        if (this.resident.get(id) !== tile) return;
+        tile.isBuilding = false;
+        if (!built) {
+          tile.failedBuilds += 1;
+          if (tile.failedBuilds >= MAX_BUILD_ATTEMPTS) {
+            console.error(
+              `[far-terrain] tile ${id} failed to build ${tile.failedBuilds} times; its coarser tile stands in for it`,
+            );
+          } else {
+            console.warn(
+              `[far-terrain] tile ${id} failed to build; trying again`,
+            );
+          }
+          return;
+        }
+        this.installTile(tile, built, input.originX, input.originZ, span);
+      });
+    }
+  }
+
+  private tileDistance(tile: ResidentTile, center: Vector2) {
+    const { key, size, step } = tile.data;
+    const span = (size - 1) * step;
+    const cx = key.tx * span + span / 2;
+    const cz = key.tz * span + span / 2;
+    return Math.hypot(cx - center.x, cz - center.y);
+  }
+
+  private installTile(
+    tile: ResidentTile,
+    built: FarBuiltTile,
+    originX: number,
+    originZ: number,
+    span: number,
+  ) {
+    const started = performance.now();
+    for (const slot of [tile.land, tile.sky]) {
+      if (slot) this.batch.remove(slot);
+    }
+    tile.bytes = 0;
+    const name = farTileId(tile.data.key);
+    tile.land = built.land
+      ? this.slotFor(
+          built.land,
+          originX,
+          originZ,
+          span,
+          tile,
+          `far-terrain-${name}`,
+        )
+      : null;
+    tile.sky = built.sky
+      ? this.slotFor(
+          built.sky,
+          originX,
+          originZ,
+          span,
+          tile,
+          `far-terrain-sky-${name}`,
+        )
+      : null;
+    tile.counts = built.land?.counts ?? null;
+    tile.isBuilt = true;
+    this.planVersion += 1;
+    this.stats.tilesBuilt += 1;
+    this.stats.lastBuildMs = built.buildMs;
+    this.stats.peakBuildMs = Math.max(this.stats.peakBuildMs, built.buildMs);
+    this.stats.lastUploadMs = performance.now() - started;
+    this.stats.peakUploadMs = Math.max(
+      this.stats.peakUploadMs,
+      this.stats.lastUploadMs,
+    );
+  }
+
+  private slotFor(
+    data: FarMeshData,
+    originX: number,
+    originZ: number,
+    span: number,
+    tile: ResidentTile,
+    name: string,
+  ) {
+    tile.bytes +=
+      data.position.byteLength +
+      data.column.byteLength +
+      data.material.byteLength +
+      data.tint.byteLength;
+    return this.batch.add(data, originX, originZ, span, name);
+  }
+
+  private updateCoverage(
+    position: Vector3,
+    world: {
+      renderRadius: number;
+      chunkSize: number;
+      loadedGeneration: number;
+      forEachMeshedChunk: (callback: (cx: number, cz: number) => void) => void;
+      isChunkPending: (cx: number, cz: number) => boolean;
+    },
+  ) {
+    const cx = Math.floor(position.x / world.chunkSize);
+    const cz = Math.floor(position.z / world.chunkSize);
+    const originCx = cx - COVERAGE_SIZE / 2;
+    const originCz = cz - COVERAGE_SIZE / 2;
+    const centerMoved =
+      !this.coverageCenter ||
+      this.coverageCenter[0] !== cx ||
+      this.coverageCenter[1] !== cz;
+    // Pending columns change when a chunk loads (the generation), when
+    // the radius they are counted within does, and, while any are still
+    // counted, as their grace runs out or the tiles fit to stand in for
+    // them change.
+    const now = performance.now();
+    const isRecheckDue =
+      this.stats.pendingCovered + this.heldColumns.size > 0 &&
+      now - this.coverageBuiltAt >= PENDING_RECHECK_MS;
+    const isStandInStale =
+      this.coverageStandIns !== this.standInGeneration &&
+      this.stats.pendingCovered + this.stats.pendingStoodIn > 0;
+    if (
+      !centerMoved &&
+      this.coverageGeneration === world.loadedGeneration &&
+      this.coverageRadius === world.renderRadius &&
+      !isRecheckDue &&
+      !isStandInStale
+    )
+      return;
+    this.coverageBuiltAt = now;
+    this.coverageCenter = [cx, cz];
+    this.coverageGeneration = world.loadedGeneration;
+    this.coverageRadius = world.renderRadius;
+    this.coverageStandIns = this.standInGeneration;
+    const covered: [number, number][] = [];
+    let stoodIn = 0;
+    for (const column of pendingChunksWithin(
+      cx,
+      cz,
+      world.renderRadius,
+      world.isChunkPending,
+    )) {
+      if (
+        !this.isGuarded(column[0], column[1]) &&
+        this.isStoodIn(column[0], column[1], world.chunkSize)
+      )
+        stoodIn += 1;
+      else covered.push(column);
+    }
+    this.stats.pendingCovered = covered.length;
+    this.stats.pendingStoodIn = stoodIn;
+    // A chunk landing where the far layer draws keeps the far layer until
+    // every section of it has meshed: the world hides it meanwhile
+    // (`isHeld`), and both change hands in one frame instead of the column
+    // opening onto the sky section by section. Only a first landing is
+    // held; a chunk that has settled once keeps drawing through a remesh.
+    const held = new Set<string>();
+    const settled = new Set<string>();
+    world.forEachMeshedChunk((x, z) => {
+      const key = `${x},${z}`;
+      const wasSettled = this.settledColumns.has(key);
+      const isPending = !wasSettled && world.isChunkPending(x, z);
+      if (
+        isPending &&
+        !this.isGuarded(x, z) &&
+        this.isStoodIn(x, z, world.chunkSize)
+      ) {
+        held.add(key);
+        return;
+      }
+      if (!isPending) settled.add(key);
+      covered.push([x, z]);
+    });
+    this.heldColumns = held;
+    this.settledColumns = settled;
+    this.stats.chunksHeld = held.size;
+    buildCoverageMask(
+      covered,
+      originCx,
+      originCz,
+      COVERAGE_SIZE,
+      this.coverage,
+    );
+    this.shared.farCover.value.set(
+      originCx,
+      originCz,
+      world.chunkSize,
+      COVERAGE_SIZE,
+    );
+    this.coverageTexture.needsUpdate = true;
+    this.stats.maskRebuilds += 1;
+  }
+
+  /**
+   * Whether the layer draws the whole of a chunk column, as it does over a
+   * column still on its way outside the guard radius. A chunk landing
+   * there replaces terrain already on screen, so a host can land it as
+   * itself rather than reveal it out of the fog, which would flash over
+   * that terrain.
+   */
+  /**
+   * Whether a loaded chunk is still being held back for the far layer:
+   * landed where the far layer draws and not every section meshed yet.
+   * The world hides it while this holds (and its column still owes
+   * meshes), so the two swap in one frame.
+   */
+  isHeld(cx: number, cz: number) {
+    return this.visible && this.heldColumns.has(`${cx},${cz}`);
+  }
+
+  drawsColumn(cx: number, cz: number) {
+    return (
+      this.visible &&
+      !this.isGuarded(cx, cz) &&
+      this.isStoodIn(cx, cz, this.chunkSize)
+    );
+  }
+
+  /** Whether a coarser or finer tile over the same ground is on screen. */
+  private isGroundShown(key: FarTileKey) {
+    const isShown = (level: number, tx: number, tz: number) =>
+      (this.resident.get(farTileId({ level, tx, tz }))?.opacity ?? 0) > 0;
+    const top = (this.descriptor?.levels ?? 1) - 1;
+    let { tx, tz } = key;
+    for (let level = key.level + 1; level <= top; level++) {
+      tx = Math.floor(tx / 2);
+      tz = Math.floor(tz / 2);
+      if (isShown(level, tx, tz)) return true;
+    }
+    let span = 1;
+    for (let level = key.level - 1; level >= 0; level--) {
+      span *= 2;
+      for (let i = 0; i < span; i++) {
+        for (let j = 0; j < span; j++) {
+          if (isShown(level, key.tx * span + i, key.tz * span + j)) return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /** Whether a column lies within `pendingGuardRadius` of the viewer's. */
+  private isGuarded(cx: number, cz: number) {
+    const center = this.coverageCenter;
+    if (!center) return true;
+    const dx = cx - center[0];
+    const dz = cz - center[1];
+    const radius = this.options.pendingGuardRadius;
+    return dx * dx + dz * dz < radius * radius;
+  }
+
+  /**
+   * Whether tiles in `standIns` draw the whole of a chunk column: asked at
+   * both edges of the column and at every finest tile between, since the
+   * drawn tiles cover each square once but need not line up with chunks.
+   */
+  private isStoodIn(cx: number, cz: number, chunkSize: number) {
+    const descriptor = this.descriptor;
+    if (!descriptor || this.standIns.size === 0) return false;
+    const step = Math.min(chunkSize, farTileSpan(descriptor, 0));
+    const offsets: number[] = [];
+    for (let offset = 0.5; offset < chunkSize - 0.5; offset += step) {
+      offsets.push(offset);
+    }
+    offsets.push(chunkSize - 0.5);
+    for (const ox of offsets) {
+      for (const oz of offsets) {
+        const x = cx * chunkSize + ox;
+        const z = cz * chunkSize + oz;
+        let isDrawn = false;
+        for (let level = 0; level < descriptor.levels && !isDrawn; level++) {
+          const span = farTileSpan(descriptor, level);
+          isDrawn = this.standIns.has(
+            farTileId({
+              level,
+              tx: Math.floor(x / span),
+              tz: Math.floor(z / span),
+            }),
+          );
+        }
+        if (!isDrawn) return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Lay the sea-depth map out around the viewer again once it has drifted
+   * far enough from its centre, from every resident tile, coarse first so
+   * the finer ones land on top.
+   */
+  private updateDepth(position: Vector3) {
+    const center = this.depthCenter;
+    if (
+      center &&
+      Math.abs(position.x - center[0]) < DEPTH_RECENTER &&
+      Math.abs(position.z - center[1]) < DEPTH_RECENTER
+    )
+      return;
+    const half = (DEPTH_TEXELS * DEPTH_BLOCKS_PER_TEXEL) / 2;
+    const originX =
+      Math.floor((position.x - half) / DEPTH_BLOCKS_PER_TEXEL) *
+      DEPTH_BLOCKS_PER_TEXEL;
+    const originZ =
+      Math.floor((position.z - half) / DEPTH_BLOCKS_PER_TEXEL) *
+      DEPTH_BLOCKS_PER_TEXEL;
+    this.depthCenter = [position.x, position.z];
+    this.depthWindow.value.set(
+      originX,
+      originZ,
+      DEPTH_BLOCKS_PER_TEXEL,
+      DEPTH_TEXELS,
+    );
+    this.depth.fill(255);
+    this.depthLevel.fill(255);
+    this.heights.fill(FAR_SHADOW_NONE);
+    this.heightLevel.fill(255);
+    this.heightsVersion += 1;
+    for (const tile of this.resident.values()) this.writeDepth(tile.data);
+  }
+
+  /**
+   * Cast the far sun shadows again in a worker once the sun has turned a
+   * little or the heights have changed, one job at a time; the lines go
+   * up with the window they were cast over, so a relayout in between
+   * never puts them in the wrong place.
+   */
+  private updateShadow(now: number) {
+    const cast =
+      this.options.castShadow ?? (this.options.buildMesh ? null : workerShadow);
+    const sun = this.shared.sunDirection.value;
+    if (
+      !cast ||
+      this.isShadowing ||
+      !this.depthCenter ||
+      now - this.shadowedAt < FAR_SHADOW_MIN_INTERVAL_MS ||
+      (this.shadowedVersion === this.heightsVersion &&
+        sun.distanceTo(this.shadowedSun) < FAR_SHADOW_SUN_TURN)
+    )
+      return;
+    this.isShadowing = true;
+    this.shadowedAt = now;
+    this.shadowedVersion = this.heightsVersion;
+    this.shadowedSun.copy(sun);
+    const window = this.depthWindow.value.clone();
+    const epoch = this.epoch;
+    cast({
+      heights: this.heights.slice(),
+      size: DEPTH_TEXELS,
+      texelBlocks: DEPTH_BLOCKS_PER_TEXEL,
+      sun: [sun.x, sun.y, sun.z],
+      maxDistance: FAR_SHADOW_REACH,
+    }).then((result) => {
+      this.isShadowing = false;
+      if (!result || epoch !== this.epoch) return;
+      (this.shadowTexture.image.data as Uint16Array).set(result.lines);
+      this.shadowTexture.needsUpdate = true;
+      this.shadowWindow.value.copy(window);
+      this.stats.lastShadowMs = result.buildMs;
+    });
+  }
+
+  /** A tile's sea depths and heights into the maps, over each sample's own cell. */
+  private writeDepth(tile: FarTileData) {
+    this.writeHeights(tile);
+    const surface = this.descriptor?.waterSurface;
+    if (surface === undefined) return;
+    const { x: originX, y: originZ } = this.depthWindow.value;
+    const span = (tile.size - 1) * tile.step;
+    const tileX = tile.key.tx * span;
+    const tileZ = tile.key.tz * span;
+    const per = DEPTH_BLOCKS_PER_TEXEL;
+    let touched = false;
+    for (let j = 0; j < tile.size - 1; j++) {
+      const z = tileZ + j * tile.step;
+      const tz0 = Math.max(0, Math.floor((z - originZ) / per));
+      const tz1 = Math.min(
+        DEPTH_TEXELS,
+        Math.ceil((z + tile.step - originZ) / per),
+      );
+      if (tz0 >= tz1) continue;
+      for (let i = 0; i < tile.size - 1; i++) {
+        const x = tileX + i * tile.step;
+        const tx0 = Math.max(0, Math.floor((x - originX) / per));
+        const tx1 = Math.min(
+          DEPTH_TEXELS,
+          Math.ceil((x + tile.step - originX) / per),
+        );
+        if (tx0 >= tx1) continue;
+        const height = tile.heights[j * tile.size + i];
+        const value = Math.round(
+          Math.min(1, Math.max(0, (surface - height) / DEPTH_RANGE)) * 255,
+        );
+        for (let tz = tz0; tz < tz1; tz++) {
+          for (let tx = tx0; tx < tx1; tx++) {
+            const at = tz * DEPTH_TEXELS + tx;
+            if (this.depthLevel[at] < tile.key.level) continue;
+            this.depth[at] = value;
+            this.depthLevel[at] = tile.key.level;
+            touched = true;
+          }
+        }
+      }
+    }
+    if (touched) this.depthTexture.needsUpdate = true;
+  }
+
+  /**
+   * A tile's highest surface per texel, its canopy over the ground where
+   * crowns cover most of a sample; a finer tile replaces a coarser one's.
+   */
+  private writeHeights(tile: FarTileData) {
+    const { x: originX, y: originZ } = this.depthWindow.value;
+    const span = (tile.size - 1) * tile.step;
+    const tileX = tile.key.tx * span;
+    const tileZ = tile.key.tz * span;
+    const per = DEPTH_BLOCKS_PER_TEXEL;
+    const level = tile.key.level;
+    let touched = false;
+    for (let j = 0; j < tile.size - 1; j++) {
+      const z = tileZ + j * tile.step;
+      const tz0 = Math.max(0, Math.floor((z - originZ) / per));
+      const tz1 = Math.min(
+        DEPTH_TEXELS,
+        Math.ceil((z + tile.step - originZ) / per),
+      );
+      if (tz0 >= tz1) continue;
+      for (let i = 0; i < tile.size - 1; i++) {
+        const x = tileX + i * tile.step;
+        const tx0 = Math.max(0, Math.floor((x - originX) / per));
+        const tx1 = Math.min(
+          DEPTH_TEXELS,
+          Math.ceil((x + tile.step - originX) / per),
+        );
+        if (tx0 >= tx1) continue;
+        const sample = j * tile.size + i;
+        let height = tile.heights[sample];
+        const canopy = tile.canopy;
+        if (canopy && canopy[sample * 4] > 0 && canopy[sample * 4 + 2] >= 128) {
+          height += canopy[sample * 4];
+        }
+        for (let tz = tz0; tz < tz1; tz++) {
+          for (let tx = tx0; tx < tx1; tx++) {
+            const at = tz * DEPTH_TEXELS + tx;
+            const was = this.heightLevel[at];
+            if (was < level) continue;
+            if (was > level) {
+              this.heights[at] = height;
+              this.heightLevel[at] = level;
+            } else if (height > this.heights[at]) {
+              this.heights[at] = height;
+            }
+            touched = true;
+          }
+        }
+      }
+    }
+    if (touched) this.heightsVersion += 1;
+  }
+
+  private updateWater(position: Vector3, descriptor: FarTerrainDescriptor) {
+    const span =
+      (this.options.distance + farTileSpan(descriptor, descriptor.levels - 1)) *
+      2;
+    if (span !== this.waterSpan) {
+      this.water.geometry.dispose();
+      this.water.geometry = new PlaneGeometry(span, span);
+      this.seabed.geometry = this.water.geometry;
+      this.waterSpan = span;
+    }
+    this.water.position.set(position.x, descriptor.waterSurface, position.z);
+    this.water.visible = true;
+  }
+
+  private disposeTile(tile: ResidentTile) {
+    for (const slot of [tile.land, tile.sky]) {
+      if (slot) this.batch.remove(slot);
+    }
+    tile.land = null;
+    tile.sky = null;
+    tile.isBuilt = false;
+    this.planVersion += 1;
+    tile.isBuilding = false;
+    tile.bytes = 0;
+  }
+}
+
+const GREY_LOOK: FarFaceLook = { color: [0.5, 0.5, 0.5], isTinted: false };
+
+/** How often one tile's build may fail before it is given up on. */
+const MAX_BUILD_ATTEMPTS = 3;
+
+function colorTriple(color: Color | string | number): [number, number, number] {
+  const c = new Color(color);
+  return [c.r, c.g, c.b];
+}

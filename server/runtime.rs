@@ -23,19 +23,25 @@ use actix_files::{Files, NamedFile};
 use actix_web::{
     body::MessageBody,
     dev::{ServiceFactory, ServiceRequest, ServiceResponse},
+    guard,
     web::{self, Query},
     App, Error, HttpMessage, HttpRequest, HttpResponse, HttpServer, Result,
 };
 use actix_ws::AggregatedMessage;
 use futures_util::{future::poll_immediate, StreamExt};
 use hashbrown::HashMap;
-use log::{info, warn};
+use log::{debug, info, log_enabled, warn, Level};
 use serde_json::json;
 use tokio::sync::mpsc;
 
+mod registry_routes;
+pub use registry_routes::*;
+
 use crate::{
-    decode_message, encode_message, ClientMessage, Connect, Disconnect, Health, Info, Message,
-    MessageType, RunPreload, Server, SetStarted, WsSender, PROTOCOL_MISMATCH_REASON,
+    authenticate_session, decode_message, encode_message, BulkFrame, ClientMessage, Connect,
+    Disconnect, Health, Info, LogRateLimiter, Message, MessageType, RunPreload, Server,
+    SessionAuth, SessionAuthenticator, SessionIdentity, SetStarted, WsSender, JOIN_TRACE_DEADLINE,
+    PROTOCOL_MISMATCH_REASON,
 };
 
 /// How long to wait for the server actor to ack a client message before
@@ -257,26 +263,80 @@ where
 pub struct VoxelizeHandle {
     server: Addr<Server>,
     secret: Option<String>,
+    transport_secret: Option<String>,
+    session_authenticator: Option<SessionAuthenticator>,
     serve: String,
     session_policy: WsSessionPolicy,
+    registry: Option<RegistryEndpoint>,
 }
 
 impl VoxelizeHandle {
     /// Create a handle around a running [`Server`] actor with no join secret,
-    /// no static folder, and the default [`WsSessionPolicy`].
+    /// no session authenticator (permissive client ids), no static folder,
+    /// and the default [`WsSessionPolicy`].
     pub fn new(server: Addr<Server>) -> Self {
         Self {
             server,
             secret: None,
+            transport_secret: None,
+            session_authenticator: None,
             serve: String::new(),
             session_policy: WsSessionPolicy::default(),
+            registry: None,
         }
+    }
+
+    /// Serve this block registry on `/registry/blocks.json` and
+    /// `/registry/blocks.<digest>.json` ([`registry_blocks_route`]).
+    /// [`Voxelize::bind_with`] installs the server's own.
+    pub fn with_registry(mut self, registry: RegistryEndpoint) -> Self {
+        self.registry = Some(registry);
+        self
+    }
+
+    /// The block registry this handle serves over HTTP, if any.
+    pub fn registry(&self) -> Option<&RegistryEndpoint> {
+        self.registry.as_ref()
     }
 
     /// Require this secret on `/ws/` connections.
     pub fn with_secret(mut self, secret: Option<String>) -> Self {
         self.secret = secret;
         self
+    }
+
+    /// Require this secret from transport sessions (`?is_transport`) in
+    /// place of the join secret. `None` checks them against the join secret.
+    pub fn with_transport_secret(mut self, secret: Option<String>) -> Self {
+        self.transport_secret = secret;
+        self
+    }
+
+    /// The secret a connection must present: transports answer to their own
+    /// secret when one is configured, everyone else to the join secret.
+    fn expected_secret(&self, is_transport: bool) -> Option<&String> {
+        if is_transport {
+            self.transport_secret.as_ref().or(self.secret.as_ref())
+        } else {
+            self.secret.as_ref()
+        }
+    }
+
+    /// Decide session identity with this hook on `/ws/` upgrades and WebRTC
+    /// offers. `None` keeps the permissive fallback (client-chosen ids).
+    pub fn with_session_authenticator(
+        mut self,
+        authenticator: Option<SessionAuthenticator>,
+    ) -> Self {
+        self.session_authenticator = authenticator;
+        self
+    }
+
+    /// Resolve who a request is, from its query-style parameters. Shared by
+    /// the WebSocket upgrade and the WebRTC signaling routes so both lanes
+    /// answer "which client id may this caller act as" the same way.
+    pub fn authenticate(&self, params: &HashMap<String, String>) -> SessionAuth {
+        authenticate_session(self.session_authenticator.as_ref(), params)
     }
 
     /// Serve a static client folder alongside the API routes.
@@ -313,6 +373,9 @@ impl VoxelizeHandle {
     /// - `GET /ws/` — canonical WebSocket session ([`ws_route`])
     /// - `GET /info` — server info snapshot ([`info_route`])
     /// - `GET /health` — readiness/liveness probe ([`health_route`])
+    /// - `GET /registry/blocks.json` and `GET /registry/blocks.<digest>.json`
+    ///   — the block registry INIT carries ([`registry_blocks_route`]; 404
+    ///   unless the handle has one, see [`VoxelizeHandle::with_registry`])
     /// - static files (when a serve folder is set), installed as the app's
     ///   *default service*: they only handle requests no route matched, so
     ///   they can never shadow engine or adapter routes
@@ -337,7 +400,19 @@ impl VoxelizeHandle {
                 .route("/", web::get().to(serve_index))
                 .route("/ws/", web::get().to(ws_route))
                 .route("/info", web::get().to(info_route))
-                .route("/health", web::get().to(health_route));
+                .route("/health", web::get().to(health_route))
+                .route(
+                    REGISTRY_BLOCKS_PATH,
+                    web::route()
+                        .guard(guard::Any(guard::Get()).or(guard::Head()))
+                        .to(registry_blocks_route),
+                )
+                .route(
+                    REGISTRY_BLOCKS_BY_DIGEST_PATH,
+                    web::route()
+                        .guard(guard::Any(guard::Get()).or(guard::Head()))
+                        .to(registry_blocks_by_digest_route),
+                );
 
             if handle.serve.is_empty() {
                 info!("No static client folder configured (WS/API only)");
@@ -412,38 +487,58 @@ pub async fn ws_route(
     handle: web::Data<VoxelizeHandle>,
     options: Query<HashMap<String, String>>,
 ) -> Result<HttpResponse, Error> {
-    if let Some(secret) = &handle.secret {
+    let upgraded_at = std::time::Instant::now();
+    let is_transport = options.contains_key("is_transport");
+
+    if let Some(secret) = handle.expected_secret(is_transport) {
         let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "wrong secret!");
+        let kind = if is_transport { "transport" } else { "join" };
 
         if let Some(client_secret) = options.get("secret") {
             if client_secret != secret {
-                warn!(
-                    "An attempt to join with a wrong secret was made: {}",
-                    client_secret
-                );
+                // The presented value is never echoed: a wrong secret is
+                // still somebody's secret.
+                warn!("An attempt to {kind} with a wrong secret was made.");
                 return Err(error.into());
             }
         } else {
-            warn!("An attempt to join with no secret key was made.");
+            warn!("An attempt to {kind} with no secret key was made.");
             return Err(error.into());
         }
     }
 
+    // Application middleware may already have authorized this socket (see
+    // `WsConnectionContext`): its client id outranks anything in the query,
+    // and its world restriction and disconnect hook ride the session.
     let connection_context = req
         .extensions()
         .get::<WsConnectionContext>()
         .cloned()
         .unwrap_or_default();
-    let id = connection_context
-        .client_id
-        .clone()
-        .or_else(|| options.get("client_id").cloned())
-        .unwrap_or_default();
 
-    let is_transport = options.contains_key("is_transport");
-
-    if is_transport {
+    // Who is this? The adapter's authenticator decides from the query
+    // (a signed ticket, typically); the client's bare `client_id` is only
+    // honoured when no authenticator is installed. Transports authenticate
+    // by the join secret alone and never carry a player identity.
+    let mut identity = if is_transport {
         info!("A new transport server has connected.");
+        SessionIdentity::anonymous()
+    } else {
+        match handle.authenticate(&options) {
+            SessionAuth::Accept(identity) => identity,
+            SessionAuth::Reject(reason) => {
+                warn!("[WS] Rejected session: {}", reason);
+                if let Some(callback) = &connection_context.on_disconnect {
+                    callback();
+                }
+                return Err(actix_web::error::ErrorUnauthorized(reason));
+            }
+        }
+    };
+    if !is_transport {
+        if let Some(client_id) = connection_context.client_id.clone() {
+            identity.id = Some(client_id);
+        }
     }
 
     info!("[WS] New connection with 16MB continuation limit");
@@ -463,8 +558,8 @@ pub async fn ws_route(
         .aggregate_continuations()
         .max_continuation_size(16 * 1024 * 1024);
 
-    actix_web::rt::spawn(run_ws_session(
-        id,
+    actix_web::rt::spawn(drive_ws_session(
+        identity,
         is_transport,
         session,
         stream,
@@ -472,6 +567,7 @@ pub async fn ws_route(
         handle.session_policy,
         connection_context.allowed_world,
         connection_context.on_disconnect,
+        upgraded_at,
     ));
 
     Ok(response)
@@ -496,7 +592,7 @@ pub async fn ws_route(
 /// [`VoxelizeHandle::with_session_policy`], so this only rejects direct
 /// callers passing an unchecked policy.
 pub async fn run_ws_session(
-    initial_id: String,
+    identity: SessionIdentity,
     is_transport: bool,
     mut session: actix_ws::Session,
     mut stream: impl StreamExt<Item = Result<AggregatedMessage, actix_ws::ProtocolError>> + Unpin,
@@ -504,6 +600,33 @@ pub async fn run_ws_session(
     policy: WsSessionPolicy,
     allowed_world: Option<String>,
     on_disconnect: Option<Arc<dyn Fn() + Send + Sync>>,
+) {
+    drive_ws_session(
+        identity,
+        is_transport,
+        session,
+        stream,
+        server,
+        policy,
+        allowed_world,
+        on_disconnect,
+        std::time::Instant::now(),
+    )
+    .await
+}
+
+/// [`run_ws_session`] for a socket upgraded at `upgraded_at`, the first stamp
+/// of the session's join trace (see [`crate::JoinTrace`]).
+async fn drive_ws_session(
+    identity: SessionIdentity,
+    is_transport: bool,
+    mut session: actix_ws::Session,
+    mut stream: impl StreamExt<Item = Result<AggregatedMessage, actix_ws::ProtocolError>> + Unpin,
+    server: Addr<Server>,
+    policy: WsSessionPolicy,
+    allowed_world: Option<String>,
+    on_disconnect: Option<Arc<dyn Fn() + Send + Sync>>,
+    upgraded_at: std::time::Instant,
 ) {
     if let Err(error) = policy.validate() {
         log::error!("[WS] Refusing session with invalid policy: {}", error);
@@ -518,16 +641,12 @@ pub async fn run_ws_session(
     // world data (chunks, voxel updates), so a client streaming megabytes of
     // chunks still receives JOIN/LEAVE and live state promptly.
     let (control_tx, mut control_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let (bulk_tx, mut bulk_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (bulk_tx, mut bulk_rx) = mpsc::unbounded_channel::<BulkFrame>();
     let tx = WsSender::new(control_tx, bulk_tx);
 
     let (session_id, connection_token) = match server
         .send(Connect {
-            id: if initial_id.is_empty() {
-                None
-            } else {
-                Some(initial_id)
-            },
+            identity,
             is_transport,
             sender: tx.clone(),
             allowed_world,
@@ -544,9 +663,15 @@ pub async fn run_ws_session(
             return;
         }
     };
+    tx.join_trace().session_registered(upgraded_at);
 
     let mut heartbeat = tokio::time::interval(policy.heartbeat_interval);
     let mut last_seen = std::time::Instant::now();
+    // Reports a traced join that never got its first LOAD written; re-armed
+    // by every JOIN read.
+    let join_trace_deadline = tokio::time::sleep(JOIN_TRACE_DEADLINE);
+    tokio::pin!(join_trace_deadline);
+    let mut is_join_trace_armed = false;
 
     loop {
         // `biased` gives the control lane strict priority over the bulk lane:
@@ -567,6 +692,10 @@ pub async fn run_ws_session(
                         break;
                     }
                 }
+            }
+            () = &mut join_trace_deadline, if is_join_trace_armed => {
+                is_join_trace_armed = false;
+                tx.join_trace().expire();
             }
             _ = heartbeat.tick() => {
                 if last_seen.elapsed() > policy.client_timeout {
@@ -598,6 +727,14 @@ pub async fn run_ws_session(
                                 continue;
                             }
                         };
+                        let is_join = message.r#type == MessageType::Join as i32;
+                        if is_join {
+                            tx.join_trace().begin(last_seen);
+                            let deadline =
+                                tokio::time::Instant::from_std(last_seen) + JOIN_TRACE_DEADLINE;
+                            join_trace_deadline.as_mut().reset(deadline);
+                            is_join_trace_armed = true;
+                        }
 
                         // Await the ack to the same in-flight send: a slow ack
                         // must not drop the session, and no further frames are
@@ -629,7 +766,11 @@ pub async fn run_ws_session(
                                 let _ = session.binary(error_response).await;
                                 break;
                             }
-                            AckOutcome::Acked(Ok(None)) => {}
+                            AckOutcome::Acked(Ok(None)) => {
+                                if is_join {
+                                    tx.join_trace().acked();
+                                }
+                            }
                             AckOutcome::Acked(Err(e)) => {
                                 warn!("[WS] Actor mailbox error: {:?}", e);
                                 break;
@@ -657,9 +798,46 @@ pub async fn run_ws_session(
                     None => break,
                 }
             }
-            Some(msg) = bulk_rx.recv() => {
-                match tokio::time::timeout(policy.write_timeout, session.binary(msg)).await {
-                    Ok(Ok(())) => tx.mark_bulk_written(),
+            Some(frame) = bulk_rx.recv() => {
+                let BulkFrame { queued_at, data, completes_join } = frame;
+                let bytes = data.len();
+                let write_started = std::time::Instant::now();
+                // The stamp rode in with the message: this is its own wait.
+                let waited_ms =
+                    write_started.saturating_duration_since(queued_at).as_secs_f32() * 1000.0;
+                match tokio::time::timeout(policy.write_timeout, session.binary(data)).await {
+                    Ok(Ok(())) => {
+                        tx.mark_bulk_written();
+                        if let Some(join) = completes_join {
+                            tx.join_trace().first_load_written(join);
+                        }
+                        let write_ms = write_started.elapsed().as_secs_f32() * 1000.0;
+                        // Chunk data is what rides this lane, and it is what a
+                        // join waits on: say how long it sat behind control and
+                        // inbound traffic before the socket even saw it.
+                        // Both lines fire per bulk message, so both are
+                        // rate-limited (per call site, across sessions).
+                        static BULK_WAIT_LOG: LogRateLimiter = LogRateLimiter::new();
+                        static BULK_WRITE_LOG: LogRateLimiter = LogRateLimiter::new();
+                        if waited_ms > 100.0 {
+                            if let Some(suppressed) = BULK_WAIT_LOG.allow(500) {
+                                info!(
+                                    "[WS] bulk message ({}KB) to {} waited {:.0}ms on the lane \
+                                     before its {:.0}ms socket write (+{} similar line(s) \
+                                     suppressed)",
+                                    bytes / 1024, session_id, waited_ms, write_ms, suppressed
+                                );
+                            }
+                        } else if log_enabled!(Level::Debug) {
+                            if let Some(suppressed) = BULK_WRITE_LOG.allow(250) {
+                                debug!(
+                                    "[WS] bulk message ({}KB) to {}: waited {:.1}ms, wrote in \
+                                     {:.1}ms (+{} similar line(s) suppressed)",
+                                    bytes / 1024, session_id, waited_ms, write_ms, suppressed
+                                );
+                            }
+                        }
+                    }
                     Ok(Err(_)) => break,
                     Err(_) => {
                         warn!("[WS] Bulk write stalled for {}; dropping connection", session_id);
@@ -670,6 +848,7 @@ pub async fn run_ws_session(
         }
     }
 
+    tx.join_trace().session_ended();
     server.do_send(Disconnect {
         id: session_id,
         token: connection_token,
@@ -849,6 +1028,8 @@ impl Voxelize {
         let port = server.port.to_owned();
         let serve = server.serve.to_owned();
         let secret = server.secret.to_owned();
+        let transport_secret = server.transport_secret.to_owned();
+        let session_authenticator = server.session_authenticator.clone();
 
         // Optional bind delay for probes that must observe "unbound" boot
         // (VOXELIZE_DELAY_BIND_MS). Production leaves this unset.
@@ -864,13 +1045,22 @@ impl Voxelize {
             }
         }
 
+        // The block registry INIT carries, serialized once and compressed off
+        // the actor threads now, at boot, so neither the first join nor the
+        // first `/registry/blocks.json` pays for it.
+        let registry = RegistryEndpoint::new(server.shared_init_registry());
+        registry.prepare_in_background(server.registry.clone());
+
         // Start the Server actor first so /info and /health can reach it.
         // Leave `started=false` until RunPreload completes (SetStarted).
         let server_addr = server.start();
 
         let mut handle = VoxelizeHandle::new(server_addr.clone())
             .with_secret(secret)
-            .with_serve(&serve);
+            .with_transport_secret(transport_secret)
+            .with_session_authenticator(session_authenticator)
+            .with_serve(&serve)
+            .with_registry(registry);
         handle.session_policy = session_policy;
         let factory_handle = handle.clone();
 
@@ -899,12 +1089,26 @@ impl Voxelize {
         // Preload concurrently with request serving, so probes see live
         // preloadProgress on /health while chunks generate. Spawned strictly
         // after the accept loop is up: serve-before-preload by construction.
+        //
+        // `VOXELIZE_PRELOAD=0` skips boot preload entirely and marks the
+        // server started at once. A dev stack restarts its core on every
+        // Rust rebuild, and generating every world's spawn area up front cost
+        // 1-5 minutes per restart during which joins queued behind the
+        // generation; chunks generate on demand when a player joins anyway.
+        // Production leaves this unset.
+        let is_preload_skipped = std::env::var("VOXELIZE_PRELOAD")
+            .map(|value| value.trim() == "0" || value.eq_ignore_ascii_case("false"))
+            .unwrap_or(false);
         actix_web::rt::spawn(async move {
-            if let Err(err) = server_addr.send(RunPreload).await {
+            if is_preload_skipped {
+                info!("Boot preload skipped (VOXELIZE_PRELOAD=0); worlds generate chunks on demand");
+            } else if let Err(err) = server_addr.send(RunPreload).await {
                 warn!("RunPreload delivery failed: {:?}", err);
             }
             server_addr.do_send(SetStarted(true));
-            info!("Boot preload finished; server marked started");
+            if !is_preload_skipped {
+                info!("Boot preload finished; server marked started");
+            }
         });
 
         Ok(BoundVoxelize {

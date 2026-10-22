@@ -1,15 +1,22 @@
 use hashbrown::HashMap;
 use log::info;
 use nanoid::nanoid;
-use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
-use specs::{ReadExpect, ReadStorage, System, WriteExpect};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use specs::{Entities, LazyUpdate, ReadExpect, ReadStorage, System, WriteExpect};
 
 use crate::world::profiler::Profiler;
 use crate::{
     BlockUtils, Chunk, ChunkInterests, ChunkOptions, ChunkRenewal, ChunkRequestsComp, ChunkStatus,
-    ChunkUtils, Chunks, Clients, Mesher, MessageType, Pipeline, PositionComp, Registry, Stats,
-    Vec2, Vec3, VoxelAccess, WorldConfig,
+    ChunkUtils, Chunks, Clients, CurrentChunkComp, ETypeComp, EntityFlag, IDComp, JsonComp, Mesher,
+    MessageType, MetadataComp, Pipeline, PositionComp, Registry, Resources, Stats, Vec2, Vec3,
+    VoxelAccess, VoxelComp, WorldConfig,
 };
+use crate::{perf_toggle, run_on_tick_pool, tick_split, PerfToggle};
+
+/// Saved-chunk loads split across the tick pool from this many per tick. One
+/// load reads, parses and inflates a chunk file (milliseconds), so two
+/// already pay for the handoff.
+const SPLIT_MIN_LOADS: usize = 2;
 
 #[derive(Default)]
 pub struct ChunkGeneratingSystem;
@@ -26,6 +33,8 @@ impl<'a> System<'a> for ChunkGeneratingSystem {
         WriteExpect<'a, Mesher>,
         WriteExpect<'a, Profiler>,
         ReadStorage<'a, ChunkRequestsComp>,
+        Entities<'a>,
+        ReadExpect<'a, LazyUpdate>,
     );
 
     fn run(&mut self, data: Self::SystemData) {
@@ -40,6 +49,8 @@ impl<'a> System<'a> for ChunkGeneratingSystem {
             mut mesher,
             mut profiler,
             requests,
+            entities,
+            lazy,
         ) = data;
 
         let chunk_size = config.chunk_size;
@@ -90,6 +101,18 @@ impl<'a> System<'a> for ChunkGeneratingSystem {
 
                 if chunks.is_chunk_ready(&coords) {
                     chunks.update_voxel(&voxel, id);
+                } else if mesher.has_chunk(&coords) {
+                    // The target's Load pass is lighting a clone taken at
+                    // dispatch. As a leftover this write would be baked in
+                    // raw once that pass landed: unlit, unmeshed and never
+                    // sent, the two sides of the border disagreeing about
+                    // it. It waits and replays as an edit once the chunk is
+                    // ready.
+                    pipeline
+                        .deferred
+                        .entry(coords)
+                        .or_default()
+                        .push((voxel, id));
                 } else {
                     pipeline
                         .leftovers
@@ -120,9 +143,17 @@ impl<'a> System<'a> for ChunkGeneratingSystem {
                         mesher.add_chunk(&chunk.coords, false);
                     }
                     pipeline.remove_chunk(&chunk.coords);
+                    pipeline.forget_released(&chunk.coords);
                 } else {
                     chunk.status = ChunkStatus::Generating(next_stage);
-                    pipeline.requeue_chunk(&chunk.coords, false);
+                    // A chunk unloaded while this stage ran keeps the result
+                    // but goes no further unless something wants it again.
+                    let is_wanted = pipeline.is_demanded(&chunk.coords)
+                        || interests.has_interests(&chunk.coords)
+                        || chunks.listeners.contains_key(&chunk.coords);
+                    if !pipeline.parks_released(&chunk.coords, is_wanted) {
+                        pipeline.requeue_chunk(&chunk.coords, false);
+                    }
                 }
 
                 if let Some(listeners) = chunks.listeners.remove(&chunk.coords) {
@@ -234,7 +265,11 @@ impl<'a> System<'a> for ChunkGeneratingSystem {
                             // it forever.
                             Some(ChunkStatus::Meshing) | Some(ChunkStatus::Ready) => continue,
                             Some(ChunkStatus::Generating(n_stage)) if *n_stage >= index => continue,
-                            Some(ChunkStatus::Generating(_)) => {}
+                            // An unload may have dropped the neighbor's queued
+                            // stages; waiting on it is what brings them back.
+                            Some(ChunkStatus::Generating(_)) => {
+                                pipeline.revive_dropped(&n_coords);
+                            }
                             // The margin neighbor exists nowhere and nothing
                             // else will create it: queue it for its voxel data
                             // only. Each context ring needs one stage less
@@ -277,11 +312,32 @@ impl<'a> System<'a> for ChunkGeneratingSystem {
             }
         }
 
-        // parallelize loading
-        let loaded_chunks: Vec<(Vec2<i32>, Option<Chunk>)> = to_load
-            .into_par_iter()
-            .map(|coords| (coords.to_owned(), chunks.try_load(&coords, &registry)))
-            .collect();
+        // Loads split across the tick pool when there are several, and run
+        // inline otherwise. Never on the global pool, where the tick waited
+        // behind worldgen.
+        let restore_stages = pipeline.stages.clone();
+        let load_one = |coords: Vec2<i32>| -> (Vec2<i32>, Option<Chunk>) {
+            let loaded = chunks.try_load(&coords, &registry).map(|mut chunk| {
+                for stage in &restore_stages {
+                    chunk = stage.restore(
+                        chunk,
+                        Resources {
+                            registry: &registry,
+                            config: &config,
+                        },
+                    );
+                }
+                chunk
+            });
+            (coords, loaded)
+        };
+        let loaded_chunks: Vec<(Vec2<i32>, Option<Chunk>)> =
+            if tick_split(to_load.len(), SPLIT_MIN_LOADS) {
+                let loads = to_load.into_par_iter().map(&load_one);
+                run_on_tick_pool(move || loads.collect())
+            } else {
+                to_load.into_iter().map(&load_one).collect()
+            };
 
         for (coords, loaded_chunk) in loaded_chunks.into_iter() {
             if let Some(chunk) = loaded_chunk {
@@ -331,6 +387,24 @@ impl<'a> System<'a> for ChunkGeneratingSystem {
                 }
             }
 
+            if r#type == MessageType::Load {
+                let is_stale = chunks
+                    .raw(&chunk.coords)
+                    .is_some_and(|live| live.write_epoch != chunk.write_epoch);
+                if is_stale && mesher.retry_stale_load(&chunk.coords) {
+                    // Light or blocks reached the live chunk while this pass
+                    // lit its dispatch-time clone: a neighbour's flood over
+                    // the border, a fluid step, a structure's late write.
+                    // Renewing would erase them and leave this side of the
+                    // border darker than the neighbour's, so the chunk goes
+                    // back to the mesher and is lit from its live state.
+                    // Its listeners were served above; it is still Meshing.
+                    mesher.add_chunk(&chunk.coords, true);
+                    continue;
+                }
+                mesher.accept_load(&chunk.coords);
+            }
+
             chunk.status = ChunkStatus::Ready;
             let coords = chunk.coords.to_owned();
             let is_updating = r#type == MessageType::Update;
@@ -343,8 +417,6 @@ impl<'a> System<'a> for ChunkGeneratingSystem {
                 r#type == MessageType::Load && chunks.freshly_created.remove(&coords);
 
             if is_freshly_generated {
-                chunks.newly_generated.push(coords.to_owned());
-
                 // Duplicated onto the live chunk after the renew below —
                 // this copy only matters when no live chunk exists and the
                 // result is inserted whole.
@@ -383,11 +455,25 @@ impl<'a> System<'a> for ChunkGeneratingSystem {
                 if let Some(live) = chunks.map.get_mut(&coords) {
                     live.is_save_dirty = false;
                 }
+                seed_generated_entities(&mut chunks, &coords, &registry, &entities, &lazy);
+            }
+
+            // Stage writes that arrived while the Load pass ran now go
+            // through the updating lane: relit, remeshed and sent like any
+            // edit, instead of being baked in raw and never shown.
+            if !is_updating {
+                if let Some(writes) = pipeline.deferred.remove(&coords) {
+                    chunks.update_voxels(&writes);
+                }
             }
         }
 
         let pending_remesh_coords = mesher.drain_pending_remesh();
         if !pending_remesh_coords.is_empty() {
+            // As in chunk-updating: under client-only meshing a remesh job
+            // changes nothing but the send delay, so the chunk is sent now.
+            let is_sending_directly =
+                config.client_only_meshing && perf_toggle(PerfToggle::SkipNoopRemesh);
             let mut remesh_processes = Vec::new();
             for coords in pending_remesh_coords {
                 if !chunks.is_chunk_ready(&coords) {
@@ -395,6 +481,13 @@ impl<'a> System<'a> for ChunkGeneratingSystem {
                 }
                 if mesher.has_chunk(&coords) {
                     mesher.mark_for_remesh(&coords);
+                    continue;
+                }
+                if is_sending_directly {
+                    if chunks.is_chunk_save_dirty(&coords) {
+                        chunks.add_chunk_to_save(&coords, true);
+                    }
+                    chunks.add_chunk_to_send(&coords, &MessageType::Update, false);
                     continue;
                 }
                 let space = chunks
@@ -461,10 +554,21 @@ impl<'a> System<'a> for ChunkGeneratingSystem {
 
                 if let Some(n_chunk) = chunks.raw(&n_coords) {
                     if matches!(n_chunk.status, ChunkStatus::Generating(_)) {
+                        pipeline.revive_dropped(&n_coords);
                         ready = false;
                         chunks.add_listener(&n_coords, &coords);
                         break;
                     }
+                }
+
+                if chunks.is_chunk_ready(&n_coords) {
+                    // A ready chunk is lit and sent: a write parked for it
+                    // (possible only when it was loaded from disk after the
+                    // park) is an edit, never a raw write.
+                    if let Some(blocks) = pipeline.leftovers.remove(&n_coords) {
+                        chunks.update_voxels(&blocks);
+                    }
+                    continue;
                 }
 
                 if let Some(blocks) = pipeline.leftovers.get(&n_coords) {
@@ -530,5 +634,250 @@ impl<'a> System<'a> for ChunkGeneratingSystem {
                 mesher.process(processes, &MessageType::Load, &registry, &config);
             }
         }
+    }
+}
+
+/// Seed once after the final generation stage and initial mesh. A later
+/// structure may have replaced a seeded voxel, and a saved (even empty)
+/// inventory always wins over the deterministic generation recipe.
+fn seed_generated_entities(
+    chunks: &mut Chunks,
+    coords: &Vec2<i32>,
+    registry: &Registry,
+    entities: &Entities<'_>,
+    lazy: &LazyUpdate,
+) {
+    let seeds = chunks
+        .raw_mut(coords)
+        .map(|chunk| std::mem::take(&mut chunk.block_entity_seeds))
+        .unwrap_or_default();
+    let mut created = false;
+    for (voxel, (block_id, json)) in seeds {
+        let block = registry.get_block_by_id(block_id);
+        if chunks.block_entities.contains_key(&voxel)
+            || chunks.get_voxel(voxel.0, voxel.1, voxel.2) != block_id
+            || !block.is_entity
+        {
+            continue;
+        }
+        if serde_json::from_str::<serde_json::Value>(&json).is_err() {
+            log::error!("Invalid generated entity JSON at {:?}", voxel);
+            continue;
+        }
+        let entity = entities.create();
+        chunks.block_entities.insert(voxel.clone(), entity);
+        lazy.insert(entity, IDComp::new(&nanoid!()));
+        lazy.insert(entity, EntityFlag::default());
+        lazy.insert(
+            entity,
+            ETypeComp::new(&format!("block::{}", block.name.to_lowercase()), true),
+        );
+        lazy.insert(entity, CurrentChunkComp::default());
+        lazy.insert(entity, VoxelComp::new(voxel.0, voxel.1, voxel.2));
+        // Populate metadata immediately as well as through the normal meta
+        // system, so the first save/create packet already contains the loot.
+        let mut metadata = MetadataComp::new();
+        metadata.set("voxel", &VoxelComp::new(voxel.0, voxel.1, voxel.2));
+        metadata.set("json", &JsonComp::new(&json));
+        lazy.insert(entity, metadata);
+        lazy.insert(entity, JsonComp::new(&json));
+        created = true;
+    }
+    if created {
+        // Keep the chest's surrounding generated chunk once its contents
+        // become mutable, even when other pristine chunks regenerate.
+        chunks.add_chunk_to_save(coords, true);
+    }
+}
+
+#[cfg(test)]
+mod generated_entity_tests {
+    use super::*;
+    use crate::{Block, ChunkStage, DataSavingSystem, EntitiesMetaSystem, Space, World};
+    use specs::{RunNow, WorldExt};
+    use std::{
+        path::Path,
+        time::{Duration, Instant},
+    };
+
+    const CHEST: u32 = 8;
+    const LOOT: &str = r#"{"type":"chest","slots":[{"type":"block","id":1,"count":3}]}"#;
+    const EMPTY: &str = r#"{"type":"chest","slots":[]}"#;
+    struct ChestStage;
+    impl ChunkStage for ChestStage {
+        fn name(&self) -> String {
+            "seeded test chest".into()
+        }
+        fn process(&self, mut c: Chunk, _: Resources, _: Option<Space>) -> Chunk {
+            for x in c.min.0..c.max.0 {
+                for z in c.min.2..c.max.2 {
+                    c.set_voxel(x, 0, z, 1);
+                }
+            }
+            if c.contains(3, 1, 3) {
+                c.set_voxel(3, 1, 3, CHEST);
+                c.block_entity_seeds
+                    .insert(Vec3(3, 1, 3), (CHEST, LOOT.into()));
+                // A later feature overwrote this seed; it must not create a
+                // floating entity or resurrect its old block.
+                c.block_entity_seeds
+                    .insert(Vec3(4, 1, 3), (CHEST, LOOT.into()));
+            }
+            c
+        }
+    }
+    fn wait(world: &mut World, label: &str, condition: impl Fn(&World) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            world.tick();
+            if condition(world) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "{label}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    fn open(dir: &Path) -> World {
+        let config = WorldConfig::new()
+            .min_chunk([-1, -1])
+            .max_chunk([1, 1])
+            .max_height(32)
+            .sub_chunks(1)
+            .preload_radius(1)
+            .saving(true)
+            .save_dir(dir.to_str().unwrap())
+            .save_interval(1)
+            .save_pristine_chunks(false)
+            .build();
+        let mut registry = Registry::new();
+        registry.register_block(&Block::new("Ground").id(1).build());
+        registry.register_block(
+            &Block::new("Chest")
+                .id(CHEST)
+                .is_entity(true)
+                .default_entity_json(EMPTY)
+                .build(),
+        );
+        let mut w = World::new("generated-entity-persistence", &config);
+        w.ecs_mut().insert(registry);
+        w.pipeline_mut().add_stage(ChestStage);
+        w.prepare();
+        w.preload();
+        wait(&mut w, "chest chunk ready", |w| {
+            w.chunks().is_chunk_ready(&Vec2(0, 0))
+        });
+        w
+    }
+    fn chest_json(w: &World) -> String {
+        let entity = w.chunks().block_entities[&Vec3(3, 1, 3)];
+        w.ecs()
+            .read_storage::<JsonComp>()
+            .get(entity)
+            .unwrap()
+            .0
+            .clone()
+    }
+    #[test]
+    fn stage_only_update_preserves_entity_identity_and_contents() {
+        let dir = std::env::temp_dir().join(format!("block-state-{}-{:?}",std::process::id(),std::thread::current().id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let mut w = open(&dir);
+        let p = Vec3(3,1,3);
+        let entity = w.chunks().block_entities[&p];
+        let next = crate::BlockUtils::insert_stage(CHEST,1);
+        w.chunks_mut().update_voxel(&p,next);
+        wait(&mut w,"stage update committed",|w| w.chunks().get_raw_voxel(3,1,3)==next);
+        assert_eq!(w.chunks().block_entities[&p],entity);
+        assert_eq!(chest_json(&w),LOOT);
+        w.chunks_mut().update_voxel(&p,1);
+        wait(&mut w,"replacement removed entity",|w| w.chunks().get_voxel(3,1,3)==1);
+        assert!(!w.chunks().block_entities.contains_key(&p));
+        drop(w); std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn generated_chest_keeps_taken_loot_across_regeneration_and_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "generated-chest-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        let mut w = open(&dir);
+        assert_eq!(chest_json(&w), LOOT);
+        assert!(!w.chunks().block_entities.contains_key(&Vec3(4, 1, 3)));
+        assert!(w
+            .chunks()
+            .raw(&Vec2(0, 0))
+            .unwrap()
+            .block_entity_seeds
+            .is_empty());
+        let entity = w.chunks().block_entities[&Vec3(3, 1, 3)];
+        let id = w
+            .ecs()
+            .read_storage::<IDComp>()
+            .get(entity)
+            .unwrap()
+            .0
+            .clone();
+        w.ecs_mut()
+            .write_storage::<JsonComp>()
+            .insert(entity, JsonComp::new(EMPTY))
+            .unwrap();
+        // Replaying a new generation result while the existing inventory is
+        // empty must preserve the empty entity, not refill it.
+        w.chunks_mut()
+            .raw_mut(&Vec2(0, 0))
+            .unwrap()
+            .block_entity_seeds
+            .insert(Vec3(3, 1, 3), (CHEST, LOOT.into()));
+        {
+            let entities = w.ecs().entities();
+            let lazy = w.ecs().read_resource::<LazyUpdate>();
+            seed_generated_entities(
+                &mut w.ecs().write_resource::<Chunks>(),
+                &Vec2(0, 0),
+                &w.ecs().read_resource::<Registry>(),
+                &entities,
+                &lazy,
+            );
+        }
+        w.ecs_mut().maintain();
+        assert_eq!(chest_json(&w), EMPTY);
+        EntitiesMetaSystem.run_now(w.ecs());
+        DataSavingSystem.run_now(w.ecs());
+        let file = dir.join("entities").join(format!("block-chest-{id}.json"));
+        wait(
+            &mut w,
+            "empty chest reaches durable native entity save",
+            |_| {
+                std::fs::read_to_string(&file)
+                    .is_ok_and(|s| s.contains("slots") && !s.contains("count"))
+            },
+        );
+        wait(&mut w, "chest terrain reaches native chunk save", |_| {
+            dir.join("chunks/0|0.json").exists()
+        });
+        drop(w);
+        let mut w = open(&dir);
+        assert_eq!(chest_json(&w), EMPTY);
+        assert_eq!(w.chunks().get_voxel(3, 1, 3), CHEST);
+        w.chunks_mut().update_voxel(&Vec3(3, 1, 3), 0);
+        wait(&mut w, "broken chest is removed", |w| {
+            w.chunks().get_voxel(3, 1, 3) == 0
+                && !w.chunks().block_entities.contains_key(&Vec3(3, 1, 3))
+                && !file.exists()
+        });
+        wait(&mut w, "broken chest terrain is saved", |w| {
+            w.chunks()
+                .try_load(&Vec2(0, 0), &w.registry())
+                .is_some_and(|c| c.get_voxel(3, 1, 3) == 0)
+        });
+        drop(w);
+        let w = open(&dir);
+        assert_eq!(w.chunks().get_voxel(3, 1, 3), 0);
+        assert!(!w.chunks().block_entities.contains_key(&Vec3(3, 1, 3)));
+        drop(w);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

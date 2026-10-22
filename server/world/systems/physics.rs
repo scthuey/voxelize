@@ -3,7 +3,7 @@ use std::ops::Deref;
 use hashbrown::HashMap;
 use log::info;
 use rapier3d::prelude::CollisionEvent;
-use specs::{Entities, ReadExpect, ReadStorage, System, WriteExpect, WriteStorage};
+use specs::{BitSet, Entities, ReadExpect, ReadStorage, System, WriteExpect, WriteStorage};
 
 use crate::{
     world::{
@@ -15,8 +15,8 @@ use crate::{
         voxels::Chunks,
         WorldConfig,
     },
-    ClientFilter, ClientFlag, CollisionsComp, Event, EventBuilder, Events, IDComp, InteractorComp,
-    Vec2, Vec3,
+    run_on_tick_pool, tick_split, ClientFilter, ClientFlag, CollisionsComp, Event, EventBuilder,
+    Events, IDComp, InteractorComp, Vec2, Vec3, TICK_SPLIT_MIN_BODIES,
 };
 
 #[derive(Default)]
@@ -69,45 +69,62 @@ impl<'a> System<'a> for PhysicsSystem {
 
         let mut collision_map = HashMap::new();
 
-        // Tick the voxel physics of all entities (non-clients).
-        // Skip entities in chunks with no interested players.
-        (&curr_chunks, &mut bodies, &mut positions, !&client_flag)
-            .par_join()
-            .for_each(|(curr_chunk, body, position, _)| {
-                if !chunks.is_chunk_ready(&curr_chunk.coords) {
-                    return;
-                }
+        // Tick the voxel physics of all entities (non-clients). Skip entities
+        // whose chunk (or a neighbor) is not ready, and entities in chunks no
+        // player is interested in. Choosing the active bodies is cheap and
+        // runs inline; integrating them splits across the tick pool only
+        // when there are enough to pay for the handoff.
+        let mut active = BitSet::new();
+        let mut active_count = 0usize;
+        for (entity, curr_chunk, body, _, _) in (
+            &entities,
+            &curr_chunks,
+            &mut bodies,
+            &positions,
+            !&client_flag,
+        )
+            .join()
+        {
+            if !chunks.is_chunk_ready(&curr_chunk.coords) {
+                continue;
+            }
 
-                let cx = curr_chunk.coords.0;
-                let cz = curr_chunk.coords.1;
-                let mut neighbors_ready = true;
-                for dx in -1i32..=1 {
-                    for dz in -1i32..=1 {
-                        if dx == 0 && dz == 0 {
-                            continue;
-                        }
-                        let n = Vec2(cx + dx, cz + dz);
-                        if chunks.is_within_world(&n) && !chunks.is_chunk_ready(&n) {
-                            neighbors_ready = false;
-                            break;
-                        }
+            let cx = curr_chunk.coords.0;
+            let cz = curr_chunk.coords.1;
+            let mut neighbors_ready = true;
+            for dx in -1i32..=1 {
+                for dz in -1i32..=1 {
+                    if dx == 0 && dz == 0 {
+                        continue;
                     }
-                    if !neighbors_ready {
+                    let n = Vec2(cx + dx, cz + dz);
+                    if chunks.is_within_world(&n) && !chunks.is_chunk_ready(&n) {
+                        neighbors_ready = false;
                         break;
                     }
                 }
                 if !neighbors_ready {
-                    body.0.forces.set(0.0, 0.0, 0.0);
-                    body.0.impulses.set(0.0, 0.0, 0.0);
-                    return;
+                    break;
                 }
+            }
+            if !neighbors_ready {
+                body.0.forces.set(0.0, 0.0, 0.0);
+                body.0.impulses.set(0.0, 0.0, 0.0);
+                continue;
+            }
 
-                if !interests.has_interests_in_region(&curr_chunk.coords) {
-                    body.0.forces.set(0.0, 0.0, 0.0);
-                    body.0.impulses.set(0.0, 0.0, 0.0);
-                    return;
-                }
+            if !interests.has_interests_in_region(&curr_chunk.coords) {
+                body.0.forces.set(0.0, 0.0, 0.0);
+                body.0.impulses.set(0.0, 0.0, 0.0);
+                continue;
+            }
 
+            active.add(entity.id());
+            active_count += 1;
+        }
+
+        let integrate =
+            |(_, body, position): (u32, &mut RigidBodyComp, &mut PositionComp)| {
                 // First tick against ready terrain: lift the body clear of
                 // any solids it was revived or spawned overlapping (saves
                 // written under older body dimensions bake in centers the
@@ -123,13 +140,32 @@ impl<'a> System<'a> for PhysicsSystem {
                 let body_pos = body.0.get_position();
                 let Vec3(px, py, pz) = body_pos;
                 position.0.set(px, py, pz);
-            });
+            };
 
-        // Move the clients' rigid bodies to their positions
+        if tick_split(active_count, TICK_SPLIT_MIN_BODIES) {
+            let work = (&active, &mut bodies, &mut positions).par_join();
+            run_on_tick_pool(move || work.for_each(&integrate));
+        } else {
+            (&active, &mut bodies, &mut positions)
+                .join()
+                .for_each(&integrate);
+        }
+
+        // Move the clients' rigid bodies to their positions. A body that has
+        // asked to sit out repulsion (an insect perched on a creature) has
+        // its collider disabled for the step, so the contact solver never
+        // pushes it — or what it sits on — apart; clients carry no body
+        // here and keep their collider as it is.
         (&entities, &interactors, &positions)
             .join()
             .for_each(|(ent, interactor, position)| {
                 physics.move_rapier_body(interactor.body_handle(), &position.0);
+                if let Some(body) = bodies.get(ent) {
+                    physics.set_collider_enabled(
+                        interactor.collider_handle(),
+                        !body.0.is_repulsion_exempt,
+                    );
+                }
                 collision_map.insert(interactor.collider_handle().clone(), ent);
             });
 
@@ -192,7 +228,7 @@ impl<'a> System<'a> for PhysicsSystem {
         )
             .join()
         {
-            if !chunks.is_chunk_ready(&curr_chunk.coords) {
+            if !chunks.is_chunk_ready(&curr_chunk.coords) || body.0.is_repulsion_exempt {
                 continue;
             }
 
@@ -229,15 +265,15 @@ impl<'a> System<'a> for PhysicsSystem {
             // Check if the entity is a client, and if so, apply the impulse to the client's body.
             if client_flag.get(entity).is_some() {
                 if let Some(id) = ids.get(entity) {
-                    let event = EventBuilder::new("vox-builtin:impulse")
-                        .payload(vec![
-                            dx * config.client_collision_repulsion,
-                            dy * config.client_collision_repulsion,
-                            dz * config.client_collision_repulsion,
-                        ])
-                        .filter(ClientFilter::Direct(id.0.to_owned()))
-                        .build();
-                    events.dispatch(event);
+                    if let Some(impulse) =
+                        client_repulsion_impulse([dx, dy, dz], config.client_collision_repulsion)
+                    {
+                        let event = EventBuilder::new("vox-builtin:impulse")
+                            .payload(impulse.to_vec())
+                            .filter(ClientFilter::Direct(id.0.to_owned()))
+                            .build();
+                        events.dispatch(event);
+                    }
                     continue;
                 }
             }
@@ -249,5 +285,37 @@ impl<'a> System<'a> for PhysicsSystem {
                 (dz * config.collision_repulsion).min(3.0),
             );
         }
+    }
+}
+
+/// The impulse that pushes an overlapping client along `direction`, or
+/// `None` when it would change nothing. With a repulsion of zero (the
+/// default) overlapping players are never pushed apart, so without this a
+/// zero impulse went to each of them every tick, and each one woke the
+/// receiving body.
+fn client_repulsion_impulse(direction: [f32; 3], strength: f32) -> Option<[f32; 3]> {
+    let impulse = direction.map(|component| component * strength);
+    impulse
+        .iter()
+        .any(|component| component.abs() > f32::EPSILON)
+        .then_some(impulse)
+}
+
+#[cfg(test)]
+mod client_repulsion_tests {
+    use super::client_repulsion_impulse;
+
+    #[test]
+    fn a_zero_repulsion_sends_no_impulse() {
+        assert_eq!(client_repulsion_impulse([0.01, -1.0, 0.0], 0.0), None);
+        assert_eq!(client_repulsion_impulse([0.0, 0.0, 0.0], 0.4), None);
+    }
+
+    #[test]
+    fn a_real_repulsion_pushes_along_the_overlap() {
+        assert_eq!(
+            client_repulsion_impulse([1.0, 0.0, -0.5], 0.4),
+            Some([0.4, 0.0, -0.2])
+        );
     }
 }

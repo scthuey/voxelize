@@ -32,6 +32,7 @@ export class StaticGroup extends Group {
 }
 
 export class Chunk extends RawChunk {
+  public biomeTints: Uint8Array | undefined;
   public meshes = new Map<number, Mesh[]>();
 
   public added = false;
@@ -47,6 +48,12 @@ export class Chunk extends RawChunk {
   public plantsShown: boolean | null = null;
 
   /**
+   * Whether this chunk's tuft meshes ({@link Block.tufts}) are shown, or
+   * `null` when it must be asked again, as {@link plantsShown} is.
+   */
+  public tuftsShown: boolean | null = null;
+
+  /**
    * Bit-per-level mask of which sections the occlusion walk last left
    * visible, or `null` when it must be reapplied (fresh meshes default to
    * visible). Lets the per-frame walk skip rewriting mesh visibility for
@@ -58,21 +65,25 @@ export class Chunk extends RawChunk {
     super(id, coords, options);
   }
 
-  setData(data: ChunkProtocol) {
+  /** See {@link RawChunk.setData}: adopts a new server id for the same coordinates. */
+  override setData(data: ChunkProtocol): boolean {
     const { id, x, z } = data;
-
-    if (this.id !== id) {
-      throw new Error("Chunk id mismatch");
-    }
 
     if (this.coords[0] !== x || this.coords[1] !== z) {
       throw new Error("Chunk coords mismatch");
     }
 
+    const idChanged = this.id !== id;
+    this.id = id;
+
     const { voxels, lights } = data;
+
+    if (data.biomeTints?.length === 12) this.biomeTints = data.biomeTints;
 
     if (lights && lights.byteLength) this.lights.data = lights;
     if (voxels && voxels.byteLength) this.voxels.data = voxels;
+
+    return idChanged;
   }
 
   dispose() {
@@ -80,14 +91,16 @@ export class Chunk extends RawChunk {
       mesh.forEach((subMesh) => {
         if (!subMesh) return;
 
+        // The geometry is this chunk's alone. The material is not: every
+        // chunk mesh wears one of the world's shared block materials
+        // (`chunkRenderer.materials`), so disposing it here tore down the
+        // renderer's compiled program and cached uniforms for every other
+        // chunk still wearing it. The next frame then re-initialised the
+        // material, and where the program had no other user left — the
+        // fluid shader while only water was on screen — recompiled and
+        // relinked it from source: a hitch on every chunk unload, paid
+        // most often exactly where chunks churn fastest, out at sea.
         subMesh.geometry?.dispose();
-
-        // The material is not this chunk's to dispose: every chunk mesh draws
-        // with a material the world shares across chunks and owns in
-        // `chunkRenderer.materials`, disposed with the world. Disposing it here
-        // made three.js release the shared shader program each time a chunk
-        // unloaded, and every chunk still using it recompiled synchronously on
-        // the next frame - a 100-300 ms stall per unload while walking.
 
         if (subMesh.parent) {
           subMesh.parent.remove(subMesh);
@@ -98,5 +111,6 @@ export class Chunk extends RawChunk {
     ChunkSharedPool.getInstance().releaseChunk(this.name);
     this.voxels.data = new Uint32Array(0);
     this.lights.data = new Uint32Array(0);
+    this.biomeTints = undefined;
   }
 }

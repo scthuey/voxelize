@@ -36,11 +36,71 @@ pub(super) fn can_greedy_mesh_block(block: &Block, rotation: &BlockRotation) -> 
     !block.is_fluid
         && !block.rotatable
         && !block.y_rotatable
+        && !block.is_animated
         && block.dynamic_patterns.is_none()
+        && block.connected.is_none()
+        && block.branch.is_none()
+        && !block.branch_shell
         && matches!(rotation, BlockRotation::PY(r) if *r == 0.0)
         && block.is_full_cube()
         && block.faces.iter().all(|face| !face.isolated)
         && !has_diagonal_faces(block)
+}
+
+/// Whether a block is a cutout mass: a see-through cube with a
+/// `standalone_face_depth`, like a canopy of leaves. The client draws it
+/// single-sided, so the two faces back to back between its voxels never
+/// fight over one depth; to keep its surface visible from inside the mass
+/// (through a hedge's front, out of a canopy's edge), the greedy mesher also
+/// lays an inward copy of every face it turns to empty space.
+pub(super) fn is_cutout_mass(block: &Block) -> bool {
+    block.is_see_through
+        && !block.is_fluid
+        && !block.is_plant
+        && block.transparent_standalone
+        && block.standalone_face_depth > 0
+        && block.is_full_cube()
+        && block.faces.len() == CARDINAL_DIRECTIONS.len()
+        && CARDINAL_DIRECTIONS
+            .iter()
+            .all(|dir| block.faces.iter().any(|face| face.dir == *dir))
+        && block.faces.iter().all(|face| !face.independent && !face.isolated)
+}
+
+const CARDINAL_DIRECTIONS: [[i32; 3]; 6] = [
+    [1, 0, 0],
+    [-1, 0, 0],
+    [0, 1, 0],
+    [0, -1, 0],
+    [0, 0, 1],
+    [0, 0, -1],
+];
+
+/// Whether a face between two voxels of one standalone block lies within the
+/// block's `standalone_face_depth` of either side of the mass, along the
+/// face's axis: the run of the block in front of the face (from the
+/// neighbour, along `dir`) or behind it (from this voxel, against `dir`) ends
+/// within that many voxels. Space the access does not hold ends a run.
+pub(super) fn is_standalone_face_within_depth<S: VoxelAccess>(
+    vx: i32,
+    vy: i32,
+    vz: i32,
+    dir: [i32; 3],
+    voxel_id: u32,
+    depth: u32,
+    space: &S,
+) -> bool {
+    if depth == 0 {
+        return true;
+    }
+    let run_ends_within = |sx: i32, sy: i32, sz: i32, step: [i32; 3]| {
+        (1..=depth as i32).any(|i| {
+            let (x, y, z) = (sx + step[0] * i, sy + step[1] * i, sz + step[2] * i);
+            !space.contains(x, y, z) || space.get_voxel(x, y, z) != voxel_id
+        })
+    };
+    run_ends_within(vx + dir[0], vy + dir[1], vz + dir[2], dir)
+        || run_ends_within(vx, vy, vz, [-dir[0], -dir[1], -dir[2]])
 }
 
 pub(super) fn should_render_face<S: VoxelAccess>(
@@ -63,7 +123,10 @@ pub(super) fn should_render_face<S: VoxelAccess>(
     let n_is_void = !space.contains(nvx, nvy, nvz);
 
     if !n_is_void && !registry.has_type(neighbor_id) {
-        return false;
+        // An unknown decoration cannot prove that it covers this face.
+        // Hiding its neighbors turns a registry mismatch into holes through
+        // otherwise valid terrain, rather than just a missing decoration.
+        return true;
     }
 
     let n_block_type = match registry.get_block_by_id(neighbor_id) {
@@ -74,7 +137,7 @@ pub(super) fn should_render_face<S: VoxelAccess>(
     let is_opaque = block.is_opaque;
     let is_see_through = block.is_see_through;
 
-    if is_fluid && space.get_voxel_waterlogged(nvx, nvy, nvz) {
+    if is_fluid && block.is_waterlogging_fluid && space.get_voxel_waterlogged(nvx, nvy, nvz) {
         return false;
     }
 
@@ -83,10 +146,24 @@ pub(super) fn should_render_face<S: VoxelAccess>(
     }
 
     (n_is_void || n_block_type.is_empty)
+        // An opaque fluid still has a lowered, sloped surface. It cannot
+        // cover a whole neighbouring stone face (lava leaves an air strip).
+        || (!is_fluid && n_block_type.is_fluid)
         || (see_through
             && !is_opaque
             && !n_block_type.is_opaque
-            && ((is_see_through && neighbor_id == voxel_id && n_block_type.transparent_standalone)
+            && ((is_see_through
+                && neighbor_id == voxel_id
+                && n_block_type.transparent_standalone
+                && is_standalone_face_within_depth(
+                    vx,
+                    vy,
+                    vz,
+                    dir,
+                    voxel_id,
+                    block.standalone_face_depth,
+                    space,
+                ))
                 || (neighbor_id != voxel_id && (is_see_through || n_block_type.is_see_through))
                 || ({
                     if is_see_through && !is_opaque && n_block_type.is_opaque {
@@ -100,11 +177,289 @@ pub(super) fn should_render_face<S: VoxelAccess>(
                     }
                 })))
         || (!see_through && (!is_opaque || !n_block_type.is_opaque))
+        // An opaque see-through block (lava) shows through whatever does
+        // not hide it, like any opaque block: lava under water, behind glass.
+        || (see_through && is_opaque && !n_block_type.is_opaque)
+        // A fluid's lowered surface stays open under a solid block, unless
+        // still fluid is sealed against it and fills its voxel.
         || (is_fluid
             && n_block_type.is_opaque
             && !n_block_type.is_fluid
             && !has_fluid_above(vx, vy, vz, voxel_id, block.is_waterlogging_fluid, space)
-            && (!n_block_type.is_full_cube() || dir == [0, 1, 0]))
+            && (!n_block_type.is_full_cube()
+                || (dir == [0, 1, 0]
+                    && !is_sealed_under_ceiling(
+                        vx,
+                        vy,
+                        vz,
+                        voxel_id,
+                        block.is_waterlogging_fluid,
+                        space,
+                        registry,
+                    ))))
+}
+
+/// Whether the client draws a block's chunk faces from both sides: every
+/// see-through material except a fluid and a cutout mass, which it draws
+/// single-sided (`chunk-materials.ts`).
+pub(super) fn is_drawn_double_sided(block: &Block) -> bool {
+    block.is_see_through && !block.is_fluid && !is_cutout_mass(block)
+}
+
+/// The rectangle a face covers on its cell's boundary toward `dir`, as
+/// `[u0, v0, u1, v1]` in the two axes across that plane (ascending), after
+/// the voxel's rotation; `None` for a face that is not an axis-aligned
+/// rectangle lying on that boundary.
+pub(super) fn boundary_rect(
+    face: &BlockFace,
+    dir: [i32; 3],
+    rotation: &BlockRotation,
+    rotates: bool,
+    y_rotatable: bool,
+) -> Option<[f32; 4]> {
+    let axis = (0..3).find(|&axis| dir[axis] != 0)?;
+    let boundary = if dir[axis] > 0 { 1.0 } else { 0.0 };
+    let [u, v] = match axis {
+        0 => [1, 2],
+        1 => [0, 2],
+        _ => [0, 1],
+    };
+    let mut points = Vec::with_capacity(face.corners.len());
+    for corner in &face.corners {
+        let mut pos = corner.pos;
+        if rotates {
+            rotation.rotate_node(&mut pos, y_rotatable, true);
+        }
+        if (pos[axis] - boundary).abs() >= 0.001 {
+            return None;
+        }
+        points.push([pos[u], pos[v]]);
+    }
+    let rect = points.iter().fold(
+        [f32::MAX, f32::MAX, f32::MIN, f32::MIN],
+        |[u0, v0, u1, v1], [pu, pv]| [u0.min(*pu), v0.min(*pv), u1.max(*pu), v1.max(*pv)],
+    );
+    let on_rim =
+        |value: f32, lo: f32, hi: f32| (value - lo).abs() < 0.001 || (value - hi).abs() < 0.001;
+    let is_rectangle = points.len() == 4
+        && rect[2] - rect[0] > 0.001
+        && rect[3] - rect[1] > 0.001
+        && points
+            .iter()
+            .all(|[pu, pv]| on_rim(*pu, rect[0], rect[2]) && on_rim(*pv, rect[1], rect[3]));
+    is_rectangle.then_some(rect)
+}
+
+/// What is left of `rect` once `cover` is cut out of it.
+fn rect_minus(rect: [f32; 4], cover: [f32; 4]) -> Vec<[f32; 4]> {
+    const EPS: f32 = 0.001;
+    let [u0, v0, u1, v1] = rect;
+    let [c0, d0, c1, d1] = cover;
+    if c0 >= u1 - EPS || c1 <= u0 + EPS || d0 >= v1 - EPS || d1 <= v0 + EPS {
+        return vec![rect];
+    }
+    let mut left = Vec::new();
+    if c0 > u0 + EPS {
+        left.push([u0, v0, c0, v1]);
+    }
+    if c1 < u1 - EPS {
+        left.push([c1, v0, u1, v1]);
+    }
+    let (inner0, inner1) = (u0.max(c0), u1.min(c1));
+    if d0 > v0 + EPS {
+        left.push([inner0, v0, inner1, d0]);
+    }
+    if d1 < v1 - EPS {
+        left.push([inner0, d1, inner1, v1]);
+    }
+    left
+}
+
+/// What is left of a see-through face drawn from both sides, lying on its
+/// cell's boundary toward `dir` over `rect`, once the faces its neighbour
+/// draws back across that boundary are cut out of it; `None` where they
+/// cover none of it, or where it does not give way to them.
+///
+/// Drawn as well, the covered part fights the neighbour's face over one
+/// depth: chunk positions are quantized far coarser than the see-through
+/// inset, so the pair lands on one plane, and both show from this side
+/// because this face's back is drawn. The neighbour's face is the surface
+/// either side sees there, so this one gives way: a sheet laid on a trunk,
+/// a mat on a slab, a door swung flat against a hedge. An opaque neighbour
+/// already hides a flush face; this is the same rule for a neighbour that
+/// covers it only with its faces, and only as far as they reach.
+///
+/// Where the neighbour's face is see-through too, exactly one of the two
+/// gives way, so the plane is never left bare: a single-sided cutout mass
+/// keeps its face, then an animated block (its faces swing with it, and one
+/// missing would show the whole way), then the lower block id, then, between
+/// two voxels of one block, the face toward the positive axis.
+pub(super) fn uncovered_by_neighbor_faces<S: VoxelAccess>(
+    voxel: [i32; 3],
+    voxel_id: u32,
+    block: &Block,
+    dir: [i32; 3],
+    rect: [f32; 4],
+    space: &S,
+    registry: &Registry,
+) -> Option<Vec<[f32; 4]>> {
+    if !is_drawn_double_sided(block) {
+        return None;
+    }
+    let at = [voxel[0] + dir[0], voxel[1] + dir[1], voxel[2] + dir[2]];
+    if !space.contains(at[0], at[1], at[2]) {
+        return None;
+    }
+    let neighbor_id = space.get_voxel(at[0], at[1], at[2]);
+    let neighbor = registry.get_block_by_id(neighbor_id)?;
+    if neighbor.is_empty || neighbor.is_fluid || neighbor.is_opaque {
+        return None;
+    }
+    if is_drawn_double_sided(neighbor) {
+        let gives_way = match (block.is_animated, neighbor.is_animated) {
+            (true, false) => false,
+            (false, true) => true,
+            _ if neighbor_id == voxel_id => dir[0] + dir[1] + dir[2] < 0,
+            _ => voxel_id > neighbor_id,
+        };
+        if !gives_way {
+            return None;
+        }
+    }
+
+    let back = [-dir[0], -dir[1], -dir[2]];
+    let rotation = space.get_voxel_rotation(at[0], at[1], at[2]);
+    let owned: Vec<(BlockFace, bool)>;
+    let faces: Vec<(&BlockFace, bool)> = if neighbor.branch.is_some() || neighbor.branch_shell {
+        owned = branch_faces(at, space, registry);
+        owned.iter().map(|(face, world)| (face, *world)).collect()
+    } else if neighbor.dynamic_patterns.is_some() {
+        owned = get_dynamic_faces(neighbor, at, space, &rotation);
+        owned.iter().map(|(face, world)| (face, *world)).collect()
+    } else {
+        neighbor.faces.iter().map(|face| (face, false)).collect()
+    };
+    let mut open = vec![rect];
+    let mut is_covered = false;
+    for (face, world_space) in faces {
+        let rotates = (neighbor.rotatable || neighbor.y_rotatable) && !world_space;
+        let mut face_dir = face.dir.map(|v| v as f32);
+        if rotates {
+            rotation.rotate_direction(&mut face_dir, neighbor.y_rotatable);
+        }
+        if face_dir.map(|v| v.round() as i32) != back {
+            continue;
+        }
+        let Some(cover) = boundary_rect(face, back, &rotation, rotates, neighbor.y_rotatable)
+        else {
+            continue;
+        };
+        let mut left = Vec::with_capacity(open.len());
+        for part in open {
+            let rest = rect_minus(part, cover);
+            is_covered |= rest.as_slice() != [part];
+            left.extend(rest);
+        }
+        open = left;
+        if open.is_empty() {
+            break;
+        }
+    }
+    is_covered.then_some(open)
+}
+
+/// The part of `face` over `part` of the rectangle `rect` it covers on its
+/// cell's boundary toward `dir`, laid in the cell's own frame (already
+/// rotated, so drawn as world-space) with its texture coordinates carried
+/// across, so it draws exactly what that part of the whole face drew.
+pub(super) fn face_piece(
+    face: &BlockFace,
+    dir: [i32; 3],
+    rotation: &BlockRotation,
+    rotates: bool,
+    y_rotatable: bool,
+    rect: [f32; 4],
+    part: [f32; 4],
+) -> BlockFace {
+    let axis = (0..3).find(|&axis| dir[axis] != 0).unwrap_or(0);
+    let [u, v] = match axis {
+        0 => [1, 2],
+        1 => [0, 2],
+        _ => [0, 1],
+    };
+    let points: Vec<[f32; 3]> = face
+        .corners
+        .iter()
+        .map(|corner| {
+            let mut pos = corner.pos;
+            if rotates {
+                rotation.rotate_node(&mut pos, y_rotatable, true);
+            }
+            pos
+        })
+        .collect();
+    let is_low = |value: f32, lo: f32| (value - lo).abs() < 0.001;
+    // The texture coordinate at each corner of `rect`, low or high on u
+    // then on v; a rectangle's coordinates are affine across it.
+    let mut rim = [[[0.0f32; 2]; 2]; 2];
+    for (corner, pos) in face.corners.iter().zip(&points) {
+        let i = usize::from(!is_low(pos[u], rect[0]));
+        let j = usize::from(!is_low(pos[v], rect[1]));
+        rim[i][j] = corner.uv;
+    }
+    let lerp =
+        |a: [f32; 2], b: [f32; 2], t: f32| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+    let mut piece = face.clone();
+    piece.dir = dir;
+    for (corner, pos) in piece.corners.iter_mut().zip(points) {
+        let at_u = if is_low(pos[u], rect[0]) {
+            part[0]
+        } else {
+            part[2]
+        };
+        let at_v = if is_low(pos[v], rect[1]) {
+            part[1]
+        } else {
+            part[3]
+        };
+        let fu = (at_u - rect[0]) / (rect[2] - rect[0]);
+        let fv = (at_v - rect[1]) / (rect[3] - rect[1]);
+        let mut placed = pos;
+        placed[u] = at_u;
+        placed[v] = at_v;
+        corner.pos = placed;
+        corner.uv = lerp(
+            lerp(rim[0][0], rim[1][0], fu),
+            lerp(rim[0][1], rim[1][1], fu),
+            fv,
+        );
+    }
+    piece
+}
+
+/// Whether a face lies on its cell's boundary in the direction it points,
+/// after the voxel's rotation — the only position where an opaque neighbour
+/// on that side genuinely covers it. Corners are compared with the same
+/// tolerance the mesher uses to snap a rotated coordinate, so a leaf one
+/// sixteenth in from the jamb counts as inset and a pane in mid-cell too.
+pub(super) fn is_face_flush_with_boundary(
+    face: &BlockFace,
+    dir: [i32; 3],
+    rotation: &BlockRotation,
+    rotates: bool,
+    y_rotatable: bool,
+) -> bool {
+    let Some(axis) = (0..3).find(|&axis| dir[axis] != 0) else {
+        return false;
+    };
+    let boundary = if dir[axis] > 0 { 1.0 } else { 0.0 };
+    face.corners.iter().all(|corner| {
+        let mut pos = corner.pos;
+        if rotates {
+            rotation.rotate_node(&mut pos, y_rotatable, true);
+        }
+        (pos[axis] - boundary).abs() < 0.001
+    })
 }
 
 pub(super) fn rotate_offset_y(offset: &mut [f32; 3], rotation: &BlockRotation) {
@@ -291,20 +646,6 @@ pub(super) fn process_face<S: VoxelAccess>(
 ) {
     let [min_x, min_y, min_z] = *min;
 
-    // Fluids report their own column instead of a stack group: what the
-    // shader needs from a water fragment is how much water stands above it,
-    // and that run is defined by which voxels hold the fluid, not by a
-    // registry grouping.
-    let stack_bits = if is_fluid {
-        let (index, count) = fluid_column_position(vx, vy, vz, voxel_id, registry, space);
-        with_stack(0, index, count)
-    } else if block.stack_group == 0 {
-        0
-    } else {
-        let (index, count) = stack_position(vx, vy, vz, block.stack_group, registry, space);
-        with_stack(0, index, count)
-    };
-
     let is_opaque = block.is_opaque;
     let is_see_through = block.is_see_through;
     let rotatable = block.rotatable;
@@ -312,7 +653,7 @@ pub(super) fn process_face<S: VoxelAccess>(
 
     let mut dir = [face.dir[0] as f32, face.dir[1] as f32, face.dir[2] as f32];
     if (rotatable || y_rotatable) && !world_space {
-        rotation.rotate_node(&mut dir, y_rotatable, false);
+        rotation.rotate_direction(&mut dir, y_rotatable);
     }
 
     let dir = [
@@ -337,7 +678,7 @@ pub(super) fn process_face<S: VoxelAccess>(
         None => return,
     };
 
-    if is_fluid && space.get_voxel_waterlogged(nvx, nvy, nvz) {
+    if is_fluid && block.is_waterlogging_fluid && space.get_voxel_waterlogged(nvx, nvy, nvz) {
         return;
     }
 
@@ -347,13 +688,41 @@ pub(super) fn process_face<S: VoxelAccess>(
 
     let n_is_empty = n_is_void || n_block_type.is_empty;
 
+    // A see-through block's face pointing at an opaque neighbour is hidden
+    // only when it lies on the cell boundary between them. A door leaf
+    // standing a sixteenth in from its jamb, a pane in the middle of its
+    // cell, a fence post: their faces point at the wall without being
+    // against it. Culling those drew an open door as nothing but its edges.
+    let is_inset_from_opaque_neighbor = see_through
+        && !is_opaque
+        && !n_is_empty
+        && n_block_type.is_opaque
+        && !is_face_flush_with_boundary(
+            face,
+            dir,
+            rotation,
+            (rotatable || y_rotatable) && !world_space,
+            y_rotatable,
+        );
+
     let should_mesh = n_is_empty
+        || (!is_fluid && n_block_type.is_fluid)
+        || is_inset_from_opaque_neighbor
         || (see_through
             && !is_opaque
             && !n_block_type.is_opaque
             && ((is_see_through
                 && neighbor_id == voxel_id
-                && n_block_type.transparent_standalone)
+                && n_block_type.transparent_standalone
+                && is_standalone_face_within_depth(
+                    vx,
+                    vy,
+                    vz,
+                    dir,
+                    voxel_id,
+                    block.standalone_face_depth,
+                    space,
+                ))
                 || (neighbor_id != voxel_id && (is_see_through || n_block_type.is_see_through))
                 || ({
                     if is_see_through && !is_opaque && n_block_type.is_opaque {
@@ -367,14 +736,70 @@ pub(super) fn process_face<S: VoxelAccess>(
                     }
                 })))
         || (!see_through && (!is_opaque || !n_block_type.is_opaque))
+        || (see_through && is_opaque && !n_block_type.is_opaque)
+        // A fluid's lowered surface stays open under a solid block, unless
+        // still fluid is sealed against it and fills its voxel.
         || (is_fluid
             && n_block_type.is_opaque
             && !n_block_type.is_fluid
             && !has_fluid_above(vx, vy, vz, voxel_id, block.is_waterlogging_fluid, space)
-            && (!n_block_type.is_full_cube() || dir == [0, 1, 0]));
+            && (!n_block_type.is_full_cube()
+                || (dir == [0, 1, 0]
+                    && !is_sealed_under_ceiling(
+                        vx,
+                        vy,
+                        vz,
+                        voxel_id,
+                        block.is_waterlogging_fluid,
+                        space,
+                        registry,
+                    ))));
 
     if !should_mesh {
         return;
+    }
+
+    if is_see_through && !n_is_empty {
+        let rotates = (rotatable || y_rotatable) && !world_space;
+        if let Some(rect) = boundary_rect(face, dir, rotation, rotates, y_rotatable) {
+            if let Some(open) = uncovered_by_neighbor_faces(
+                [vx, vy, vz],
+                voxel_id,
+                block,
+                dir,
+                rect,
+                space,
+                registry,
+            ) {
+                // Each uncovered piece is drawn as a face of its own, laid
+                // in the cell's frame already; none of it is covered again.
+                for part in open {
+                    let piece = face_piece(face, dir, rotation, rotates, y_rotatable, rect, part);
+                    process_face(
+                        vx,
+                        vy,
+                        vz,
+                        voxel_id,
+                        rotation,
+                        &piece,
+                        block,
+                        uv_map,
+                        registry,
+                        space,
+                        neighbors,
+                        see_through,
+                        is_fluid,
+                        positions,
+                        indices,
+                        uvs,
+                        lights,
+                        min,
+                        true,
+                    );
+                }
+                return;
+            }
+        }
     }
 
     // A face is water-exposed when water sits on either side of it: the
@@ -384,6 +809,58 @@ pub(super) fn process_face<S: VoxelAccess>(
     let is_water_exposed = n_block_type.is_fluid
         || space.get_voxel_waterlogged(vx, vy, vz)
         || space.get_voxel_waterlogged(nvx, nvy, nvz);
+
+    // A vertical fluid face is one of two different things, and only the
+    // mesher can tell which. Against air it is the water's own surface — the
+    // front of a spreading flow, a waterfall, the side of a leak — and must
+    // draw as water. Against a see-through solid covering the whole shared
+    // face it is the water pressed on a tank window (Barrier, glass), which
+    // the shader fades and drops head-on so the window stays a window.
+    // Without the distinction every spread edge got the window treatment and
+    // its walls vanished, leaving the surface floating in unconnected sheets;
+    // and a partial block (a slab beside the flow) is not a window either —
+    // see `is_fluid_window`.
+    let is_fluid_pane =
+        is_fluid && dir[1] == 0 && !n_is_empty && is_fluid_window(n_block_type, dir);
+
+    // Column walks only for a face that will be emitted: they are the
+    // costliest thing here, and a culled face — every face of a submerged
+    // water voxel — never reads them.
+    //
+    // Fluids report their own column instead of a stack group: what the
+    // shader needs from a water fragment is how much water stands above it,
+    // and that run is defined by which voxels hold the fluid, not by a
+    // registry grouping.
+    let fluid_column = if is_fluid {
+        Some(fluid_column_position(vx, vy, vz, voxel_id, registry, space))
+    } else {
+        None
+    };
+    let fluid_stack_bits = fluid_column
+        .map(|(index, count)| with_stack(0, index, count))
+        .unwrap_or(0);
+    let fluid_surface_above = is_fluid
+        && is_fluid_filled(
+            vx,
+            vy,
+            vz,
+            voxel_id,
+            block.is_waterlogging_fluid,
+            space,
+            registry,
+        );
+    let block_stack = if !is_fluid && block.stack_group != 0 {
+        Some(stack_position(
+            vx,
+            vy,
+            vz,
+            block.stack_group,
+            registry,
+            space,
+        ))
+    } else {
+        None
+    };
 
     let UV {
         start_u,
@@ -419,8 +896,11 @@ pub(super) fn process_face<S: VoxelAccess>(
     } else {
         (0.0, 0.0)
     };
+    let plant_jitter_y = block_stack
+        .map(|(index, _)| vy - index as i32)
+        .unwrap_or(vy);
     let (diag_x_offset, diag_z_offset) = if is_diagonal && block.is_plant {
-        plant_position_jitter(vx, vy, vz)
+        plant_position_jitter(vx, plant_jitter_y, vz)
     } else {
         (0.0, 0.0)
     };
@@ -440,6 +920,20 @@ pub(super) fn process_face<S: VoxelAccess>(
         if (rotatable || y_rotatable) && !world_space {
             rotation.rotate_node(&mut pos, y_rotatable, true);
         }
+
+        // A full-height face has vertices at local y=0 and y=1. `fract(y)`
+        // maps both to zero in the shader, so packing only the voxel index
+        // pins the entire lower half of a two-block plant. Advance the packed
+        // position at the upper boundary; the shader adds the remaining
+        // fractional height for partial-height faces.
+        let stack_bits = if is_fluid {
+            fluid_stack_bits
+        } else if let Some((index, count)) = block_stack {
+            let vertex_step = pos[1].floor().clamp(0.0, 1.0) as u32;
+            with_stack(0, index + vertex_step, count)
+        } else {
+            0
+        };
 
         let pos_x = pos[0] + vx as f32;
         let pos_y = pos[1] + vy as f32;
@@ -662,22 +1156,64 @@ pub(super) fn process_face<S: VoxelAccess>(
         light = LightUtils::insert_blue_light(light, blue_light);
         light = LightUtils::insert_sunlight(light, sunlight);
         let fluid_bit = if is_fluid { FLUID_BIT } else { 0 };
-        let fluid_surface_above = is_fluid
-            && has_fluid_above(vx, vy, vz, voxel_id, block.is_waterlogging_fluid, space);
-        let wave_bit = if is_fluid && dy == 1 && !fluid_surface_above {
-            WAVE_BIT
+        let waves = is_fluid && dy == 1 && !fluid_surface_above;
+        let wave_bit = if waves { WAVE_BIT } else { 0 };
+        // A waving vertex sits on the fluid's surface, so its column count
+        // is its index plus one and the count field carries the surface
+        // flow at this corner instead; the index field carries the fluid
+        // standing below the corner rather than below this voxel alone.
+        // Both are read at the corner-grid point, so every face meeting
+        // there packs the same values and the shader interpolates continuous
+        // fields across the sheet — a depth per voxel drew a step in the bed
+        // as a hard rectangle on the surface above it.
+        let stack_bits = match fluid_column {
+            Some(_) if waves => {
+                let cx = vx + pos[0].round() as i32;
+                let cz = vz + pos[2].round() as i32;
+                let flow = surface_flow_at_corner(
+                    cx,
+                    vy,
+                    cz,
+                    voxel_id,
+                    block.is_waterlogging_fluid,
+                    space,
+                    registry,
+                );
+                let depth = surface_depth_at_corner(cx, vy, cz, voxel_id, registry, space);
+                with_surface_flow(0, surface_depth_code(depth), flow_code(flow))
+            }
+            _ => stack_bits,
+        };
+        let water_exposed_bit = if is_water_exposed {
+            WATER_EXPOSED_BIT
         } else {
             0
         };
-        let water_exposed_bit = if is_water_exposed { WATER_EXPOSED_BIT } else { 0 };
-        lights.push(
-            light as i32
-                | ao_or_emissive_bits(ao, face.emissive)
-                | fluid_bit
-                | wave_bit
-                | water_exposed_bit
-                | stack_bits,
-        );
+        let pane_bit = if is_fluid_pane { FLUID_PANE_BIT } else { 0 };
+        let packed = light as i32
+            | ao_or_emissive_bits(ao, face.emissive)
+            | fluid_bit
+            | pane_bit
+            | wave_bit
+            | water_exposed_bit
+            | stack_bits;
+        let pigment = if is_fluid {
+            None
+        } else {
+            face_pigment(space.get_voxel_stage(vx, vy, vz), face.pigment_mask)
+        };
+        lights.push(if let Some(pigment) = pigment {
+            with_pigment(packed, pigment)
+        } else if face.stage_tint_mask != 0 && !is_fluid {
+            with_stage_tint(
+                packed,
+                space.get_voxel_stage(vx, vy, vz) & face.stage_tint_mask,
+            )
+        } else if face.regional_tint && !is_fluid {
+            with_stage_tint(packed, 0)
+        } else {
+            packed
+        });
 
         four_red_lights[corner_idx] = red_light;
         four_green_lights[corner_idx] = green_light;

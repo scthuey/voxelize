@@ -75,6 +75,14 @@ type ChromiumHeapInfo = {
   jsHeapSizeLimit: number;
 };
 
+/**
+ * `performance.memory`, which is narrower and wider than its name: it is the
+ * page realm's heap plus its external memory (ArrayBuffers, canvases) against
+ * the page's own heap limit. It sees no worker at all, while every worker's
+ * heap shares the renderer's pointer-compression cage with the page's (the
+ * renderer dies when their sum reaches it, far below the limit reported
+ * here), and the external memory it counts lives outside that cage.
+ */
 export const readChromiumHeap: HeapReader = () => {
   if (typeof performance === "undefined") return null;
 

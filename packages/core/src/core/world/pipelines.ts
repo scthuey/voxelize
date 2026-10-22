@@ -6,19 +6,158 @@ import { ChunkUtils } from "../../utils";
 import { Chunk } from "./chunk";
 
 export type ChunkStage =
-  | { stage: "requested"; requestedAt: number }
-  | { stage: "processing"; source: "update" | "load"; data: ChunkProtocol }
-  | { stage: "loaded"; chunk: Chunk };
+  | {
+      stage: "requested";
+      /** When the LOAD packet was queued for the next flush. */
+      requestedAt: number;
+      /** When that packet was handed to the socket, once it has been. */
+      sentAt: number | null;
+    }
+  | {
+      stage: "processing";
+      source: "update" | "load";
+      data: ChunkProtocol;
+      requestedAt: number | null;
+      sentAt: number | null;
+      /** When the first payload's raw bytes reached the client, if known. */
+      arrivedAt: number | null;
+      /** When the first decoded payload for this chunk reached the main thread. */
+      receivedAt: number;
+    }
+  | {
+      stage: "loaded";
+      chunk: Chunk;
+      requestedAt: number | null;
+      sentAt: number | null;
+      arrivedAt: number | null;
+      receivedAt: number | null;
+      loadedAt: number;
+    };
 
 type StageType = ChunkStage["stage"];
 
+/**
+ * Where a chunk's time went on its way to being renderable, in
+ * `performance.now()` milliseconds. Request to sent is this client's own
+ * outbound queue (a flush the main thread had to get to); sent to arrive is
+ * the server's pipeline plus the wire; arrive to receive is the client's
+ * packet queue and worker decode; receive to loaded is its processing queue.
+ * A field is null for a stage the chunk never went through here (a chunk
+ * pushed by the server unasked has no request time; a payload whose
+ * transport did not stamp it has no arrival time).
+ */
+export interface ChunkLoadTiming {
+  requestedAt: number | null;
+  sentAt: number | null;
+  arrivedAt: number | null;
+  receivedAt: number | null;
+  loadedAt: number | null;
+}
+
+export interface ChunkRoundTrip {
+  sentAt: number;
+  wireMs: number;
+  loadMs: number;
+}
+
+/**
+ * A chunk's outstanding request, from the first time it was asked for until
+ * data for it arrives or it leaves the world. It outlives the `requested`
+ * stage: a retry ({@link ChunkPipeline.expireRequest}) and a rejoin
+ * ({@link ChunkPipeline.resyncForRejoin}) both drop that stage so the chunk
+ * is asked for again, and the stage's own clock restarts with every attempt,
+ * so without this a chunk missing for ten minutes looked just asked for.
+ * Times are `performance.now()` milliseconds.
+ */
+export interface ChunkRequestHistory {
+  /** When the chunk was first asked for. */
+  firstRequestedAt: number;
+  /** LOAD requests queued for it so far, the first one included. */
+  attempts: number;
+  /** When the latest of them reached the socket; null if none ever has. */
+  lastSentAt: number | null;
+}
+
+export type OverdueChunkRequest = ChunkRequestHistory & { name: string };
+
+type ChunkRequestRecord = ChunkRequestHistory & {
+  /** When an overdue report last named this chunk. */
+  reportedAt: number | null;
+};
+
+const formatSeconds = (ms: number) =>
+  ms < 10_000 ? (ms / 1000).toFixed(1) : String(Math.round(ms / 1000));
+
+/**
+ * "asked 13x over 64s, last sent 1.2s ago": how long a chunk has been
+ * missing and whether its requests left this client at all. A request never
+ * sent is this client's outbound queue; one sent and never answered is the
+ * server's, or the inbound path's.
+ */
+export function describeChunkRequestHistory(
+  history: ChunkRequestHistory,
+  now: number,
+): string {
+  const asked = `asked ${history.attempts}x over ${formatSeconds(
+    now - history.firstRequestedAt,
+  )}s`;
+  return history.lastSentAt === null
+    ? `${asked}, never sent`
+    : `${asked}, last sent ${formatSeconds(now - history.lastSentAt)}s ago`;
+}
+
+/// Enough round trips to cover a teleport's worth of chunks without
+/// remembering a whole session.
+const RECENT_ROUND_TRIP_CAPACITY = 64;
+
+type PendingChunkData = { source: "update" | "load"; data: ChunkProtocol };
+
+/**
+ * A later payload for a chunk layered over an earlier one not yet applied:
+ * the server sends a chunk's meshes and its voxels as separate messages.
+ */
+const mergeChunkData = (
+  earlier: ChunkProtocol,
+  later: ChunkProtocol,
+): ChunkProtocol => ({
+  ...earlier,
+  ...later,
+  meshes:
+    later.meshes && later.meshes.length > 0 ? later.meshes : earlier.meshes,
+  voxels: later.voxels ?? earlier.voxels,
+  lights: later.lights ?? earlier.lights,
+});
+
 export class ChunkPipeline {
   private states = new Map<string, ChunkStage>();
+  private recentRoundTrips: ChunkRoundTrip[] = [];
   private indices: Record<StageType, Set<string>> = {
     requested: new Set(),
     processing: new Set(),
     loaded: new Set(),
   };
+
+  /**
+   * Bumps whenever a chunk enters or leaves the loaded stage. A caller that
+   * memoizes a loaded-chunk lookup (the world's by-coords getter) compares
+   * against it instead of re-resolving the name on every voxel read.
+   */
+  public loadedGeneration = 0;
+
+  /**
+   * Data that arrived for a chunk that is already loaded (a rejoin refresh,
+   * a server re-mesh, the answer to a re-issued request), waiting to be
+   * applied to that same chunk. The chunk stays loaded meanwhile, so
+   * lookups, culling, the terrain fade and unloading keep reaching it.
+   * Sending it back to `processing` dropped the only reference to it: the
+   * world built a second chunk for the same coordinates and the first one's
+   * meshes stayed in the scene for good, drawn over the new ones, with any
+   * section caught mid-fade frozen in its fog colour.
+   */
+  private reloads = new Map<string, PendingChunkData>();
+
+  /** Outstanding requests; see {@link ChunkRequestHistory}. */
+  private requests = new Map<string, ChunkRequestRecord>();
 
   private setStage(name: string, stage: ChunkStage): void {
     const old = this.states.get(name);
@@ -27,6 +166,12 @@ export class ChunkPipeline {
     }
     this.states.set(name, stage);
     this.indices[stage.stage].add(name);
+    if (old?.stage === "loaded" || stage.stage === "loaded") {
+      this.loadedGeneration++;
+    }
+    if (stage.stage !== "requested") {
+      this.requests.delete(name);
+    }
   }
 
   private removeStage(name: string): void {
@@ -34,6 +179,9 @@ export class ChunkPipeline {
     if (old) {
       this.indices[old.stage].delete(name);
       this.states.delete(name);
+      if (old.stage === "loaded") {
+        this.loadedGeneration++;
+      }
     }
   }
 
@@ -51,10 +199,91 @@ export class ChunkPipeline {
 
   markRequested(coords: Coords2): void {
     const name = ChunkUtils.getChunkName(coords);
+    const requestedAt = performance.now();
     this.setStage(name, {
       stage: "requested",
-      requestedAt: performance.now(),
+      requestedAt,
+      sentAt: null,
     });
+    const record = this.requests.get(name);
+    if (record) {
+      record.attempts += 1;
+    } else {
+      this.requests.set(name, {
+        firstRequestedAt: requestedAt,
+        attempts: 1,
+        lastSentAt: null,
+        reportedAt: null,
+      });
+    }
+  }
+
+  /**
+   * Drop a request presumed lost so the chunk is asked for again. Unlike
+   * {@link remove}, the chunk's {@link ChunkRequestHistory} stays: the chunk
+   * is still missing.
+   */
+  expireRequest(name: string): void {
+    if (this.states.get(name)?.stage === "requested") {
+      this.removeStage(name);
+    }
+  }
+
+  /** How many send stamps were offered, and how many landed on a waiting request. */
+  public sentStampAttempts = 0;
+  public sentStampHits = 0;
+
+  /** The queued LOAD for this chunk reached the socket at `sentAt`. */
+  markSent(coords: Coords2, sentAt: number): void {
+    this.sentStampAttempts += 1;
+    const name = ChunkUtils.getChunkName(coords);
+    const record = this.requests.get(name);
+    if (record) {
+      record.lastSentAt = sentAt;
+    }
+    const state = this.states.get(name);
+    if (state?.stage === "requested" && state.sentAt === null) {
+      state.sentAt = sentAt;
+      this.sentStampHits += 1;
+    }
+  }
+
+  /** How long this chunk has been asked for, if it still is. */
+  getRequestHistory(name: string): ChunkRequestHistory | undefined {
+    const record = this.requests.get(name);
+    if (!record) return undefined;
+    const { firstRequestedAt, attempts, lastSentAt } = record;
+    return { firstRequestedAt, attempts, lastSentAt };
+  }
+
+  /**
+   * Requests outstanding for at least `overdueMs`. Each one is returned
+   * again only once another `overdueMs` has passed, so a caller asking every
+   * frame names a stuck chunk once per interval for as long as it stays
+   * stuck.
+   */
+  takeOverdueRequests(now: number, overdueMs: number): OverdueChunkRequest[] {
+    const overdue: OverdueChunkRequest[] = [];
+    for (const [name, record] of this.requests) {
+      if (now - record.firstRequestedAt < overdueMs) continue;
+      if (record.reportedAt !== null && now - record.reportedAt < overdueMs) {
+        continue;
+      }
+      record.reportedAt = now;
+      const { firstRequestedAt, attempts, lastSentAt } = record;
+      overdue.push({ name, firstRequestedAt, attempts, lastSentAt });
+    }
+    return overdue;
+  }
+
+  /**
+   * Forget the requests of chunks the caller no longer wants, including ones
+   * between attempts that hold no stage to be removed by.
+   */
+  forgetRequestsWhere(isForgotten: (name: string) => boolean): void {
+    for (const name of [...this.requests.keys()]) {
+      if (isForgotten(name)) this.requests.delete(name);
+    }
   }
 
   /**
@@ -72,30 +301,116 @@ export class ChunkPipeline {
     coords: Coords2,
     source: "update" | "load",
     data: ChunkProtocol,
+    arrivedAt: number | null = null,
   ): void {
     const name = ChunkUtils.getChunkName(coords);
     const existing = this.states.get(name);
 
+    if (existing?.stage === "loaded") {
+      const pending = this.reloads.get(name);
+      this.reloads.set(name, {
+        source,
+        data: pending ? mergeChunkData(pending.data, data) : data,
+      });
+      return;
+    }
+
     if (existing?.stage === "processing") {
-      const merged: ChunkProtocol = {
-        ...existing.data,
-        ...data,
-        meshes:
-          data.meshes && data.meshes.length > 0
-            ? data.meshes
-            : existing.data.meshes,
-        voxels: data.voxels ?? existing.data.voxels,
-        lights: data.lights ?? existing.data.lights,
-      };
-      this.setStage(name, { stage: "processing", source, data: merged });
+      this.setStage(name, {
+        stage: "processing",
+        source,
+        data: mergeChunkData(existing.data, data),
+        requestedAt: existing.requestedAt,
+        sentAt: existing.sentAt,
+        arrivedAt: existing.arrivedAt,
+        receivedAt: existing.receivedAt,
+      });
     } else {
-      this.setStage(name, { stage: "processing", source, data });
+      this.setStage(name, {
+        stage: "processing",
+        source,
+        data,
+        requestedAt:
+          existing?.stage === "requested" ? existing.requestedAt : null,
+        sentAt: existing?.stage === "requested" ? existing.sentAt : null,
+        arrivedAt,
+        receivedAt: performance.now(),
+      });
     }
   }
 
   markLoaded(coords: Coords2, chunk: Chunk): void {
     const name = ChunkUtils.getChunkName(coords);
-    this.setStage(name, { stage: "loaded", chunk });
+    this.reloads.delete(name);
+    const existing = this.states.get(name);
+    const carried =
+      existing?.stage === "requested" || existing?.stage === "processing"
+        ? existing
+        : null;
+    const loadedAt = performance.now();
+    const arrivedAt =
+      existing?.stage === "processing" ? existing.arrivedAt : null;
+    const sentAt = carried?.sentAt ?? null;
+    if (sentAt !== null && arrivedAt !== null) {
+      this.recentRoundTrips.push({
+        sentAt,
+        wireMs: arrivedAt - sentAt,
+        loadMs: loadedAt - arrivedAt,
+      });
+      if (this.recentRoundTrips.length > RECENT_ROUND_TRIP_CAPACITY) {
+        this.recentRoundTrips.shift();
+      }
+    }
+    this.setStage(name, {
+      stage: "loaded",
+      chunk,
+      requestedAt: carried?.requestedAt ?? null,
+      sentAt,
+      arrivedAt,
+      receivedAt: existing?.stage === "processing" ? existing.receivedAt : null,
+      loadedAt,
+    });
+  }
+
+  /**
+   * The last few chunk round trips this client completed: wire is socket send
+   * to raw arrival (server + transport + the main thread getting to the
+   * socket event), load is arrival to data applied. Lets a slow join window be
+   * compared against the same path during play, when the main thread is idle.
+   */
+  readRecentRoundTrips(): readonly ChunkRoundTrip[] {
+    return this.recentRoundTrips;
+  }
+
+  getTiming(name: string): ChunkLoadTiming | undefined {
+    const state = this.states.get(name);
+    if (!state) return undefined;
+    switch (state.stage) {
+      case "requested":
+        return {
+          requestedAt: state.requestedAt,
+          sentAt: state.sentAt,
+          arrivedAt: null,
+          receivedAt: null,
+          loadedAt: null,
+        };
+      case "processing":
+        return {
+          requestedAt: state.requestedAt,
+          sentAt: state.sentAt,
+          arrivedAt: state.arrivedAt,
+          receivedAt: state.receivedAt,
+          loadedAt: null,
+        };
+      case "loaded":
+        return {
+          requestedAt: state.requestedAt,
+          sentAt: state.sentAt,
+          arrivedAt: state.arrivedAt,
+          receivedAt: state.receivedAt,
+          loadedAt: state.loadedAt,
+        };
+    }
   }
 
   getLoadedChunk(name: string): Chunk | undefined {
@@ -112,15 +427,28 @@ export class ChunkPipeline {
       : undefined;
   }
 
+  /** Data waiting for chunks that stay loaded; see {@link reloads}. */
+  getReloads(): ReadonlyMap<string, PendingChunkData> {
+    return this.reloads;
+  }
+
+  /** Whether data for this chunk is still waiting to be applied. */
+  isAwaitingData(name: string): boolean {
+    return this.indices.processing.has(name) || this.reloads.has(name);
+  }
+
   remove(name: string): Chunk | undefined {
     const chunk = this.getLoadedChunk(name);
     this.removeStage(name);
+    this.reloads.delete(name);
+    this.requests.delete(name);
     return chunk;
   }
 
   resyncForRejoin(): string[] {
     // Requested chunks have no local data and the new server process holds
     // no interest for them: drop them so they are reissued as fresh requests.
+    // Their request histories stay; the chunks are still missing.
     for (const name of [...this.indices.requested]) {
       this.removeStage(name);
     }
@@ -150,7 +478,7 @@ export class ChunkPipeline {
   }
 
   get processingCount(): number {
-    return this.indices.processing.size;
+    return this.indices.processing.size + this.reloads.size;
   }
 
   get totalCount(): number {
@@ -159,6 +487,10 @@ export class ChunkPipeline {
 }
 
 interface MeshState {
+  /** The section's column and level, read off its key once. */
+  cx: number;
+  cz: number;
+  level: number;
   generation: number;
   inFlightGenerations: Set<number>;
   displayedGeneration: number;
@@ -171,6 +503,60 @@ interface MeshState {
   inFlightStartedAt: Map<number, number>;
 }
 
+/** One number per chunk column, for maps keyed by column. */
+const columnKey = (cx: number, cz: number) =>
+  (cx + 0x8000) * 0x10000 + (cz + 0x8000);
+
+const CHAR_MINUS = 45;
+const CHAR_ZERO = 48;
+const CHAR_COMMA = 44;
+const CHAR_COLON = 58;
+
+/**
+ * The squared chunk distance from a `cx,cz:level` mesh key's column to a
+ * center, read off the key's characters. The remesh order sorts every dirty
+ * key by it, a thousand and more right after the render radius grows, and
+ * parsing a key into strings, an array and an object on every comparison
+ * made that sort the frame's largest allocation.
+ */
+function keyColumnDistanceSq(key: string, centerX: number, centerZ: number) {
+  let i = 0;
+  let sign = 1;
+  if (key.charCodeAt(i) === CHAR_MINUS) {
+    sign = -1;
+    i++;
+  }
+  let cx = 0;
+  for (; i < key.length; i++) {
+    const code = key.charCodeAt(i);
+    if (code === CHAR_COMMA) break;
+    cx = cx * 10 + (code - CHAR_ZERO);
+  }
+  cx *= sign;
+  i++;
+  sign = 1;
+  if (key.charCodeAt(i) === CHAR_MINUS) {
+    sign = -1;
+    i++;
+  }
+  let cz = 0;
+  for (; i < key.length; i++) {
+    const code = key.charCodeAt(i);
+    if (code === CHAR_COLON) break;
+    cz = cz * 10 + (code - CHAR_ZERO);
+  }
+  cz *= sign;
+  const dx = cx - centerX;
+  const dz = cz - centerZ;
+  return dx * dx + dz * dz;
+}
+
+/**
+ * Rebuilds of sections already on screen that may be started in a row ahead
+ * of a nearer-than-them section with nothing drawn yet.
+ */
+const REBUILD_QUOTA = 2;
+
 export class MeshPipeline {
   private states = new Map<string, MeshState>();
   private dirty = new Set<string>();
@@ -179,7 +565,11 @@ export class MeshPipeline {
   private getOrCreate(key: string): MeshState {
     let state = this.states.get(key);
     if (!state) {
+      const { cx, cz, level } = MeshPipeline.parseKey(key);
       state = {
+        cx,
+        cz,
+        level,
         generation: 0,
         inFlightGenerations: new Set(),
         displayedGeneration: 0,
@@ -255,6 +645,16 @@ export class MeshPipeline {
     }
 
     state.displayedGeneration = jobGeneration;
+    // The newest generation is on screen, so the key has nothing left to
+    // mesh. It can still be dirty: the watchdog re-queues a job it expired
+    // (one held past its ceiling waiting on a neighbour) and that job may
+    // land before the key is dispatched again. Only a dispatch takes a key
+    // out of the dirty set, and none would start for a key that is current,
+    // so it would hold the dirty count up for the rest of the session.
+    if (jobGeneration === state.generation) {
+      this.dirty.delete(key);
+      this.urgentDirty.delete(key);
+    }
     return true;
   }
 
@@ -303,6 +703,11 @@ export class MeshPipeline {
     return expired;
   }
 
+  /** Whether some mesh of this section, current or not, has been applied. */
+  hasDisplayed(key: string): boolean {
+    return (this.states.get(key)?.displayedGeneration ?? 0) > 0;
+  }
+
   needsRemesh(key: string): boolean {
     const state = this.states.get(key);
     if (!state) return false;
@@ -334,15 +739,101 @@ export class MeshPipeline {
     );
     if (center) {
       const [centerX, centerZ] = center;
-      const distanceSq = (key: string) => {
-        const { cx, cz } = MeshPipeline.parseKey(key);
-        const dx = cx - centerX;
-        const dz = cz - centerZ;
-        return dx * dx + dz * dz;
-      };
-      regularKeys.sort((a, b) => distanceSq(a) - distanceSq(b));
+      const distances = this.dirtyKeyDistances;
+      for (const key of regularKeys) {
+        distances.set(key, keyColumnDistanceSq(key, centerX, centerZ));
+      }
+      regularKeys.sort(
+        (a, b) => (distances.get(a) as number) - (distances.get(b) as number),
+      );
+      distances.clear();
     }
     return [...urgentKeys, ...regularKeys];
+  }
+
+  /** Each dirty key's distance for one {@link getDirtyKeys} sort. */
+  private dirtyKeyDistances = new Map<string, number>();
+
+  /** Urgent keys a dispatch can start now, in the order they went dirty. */
+  urgentDirtyKeys(): string[] {
+    return [...this.urgentDirty].filter((key) => this.shouldStartJob(key));
+  }
+
+  /**
+   * The keys to dispatch next: the urgent lane whole, then at most `limit`
+   * regular keys, nearest first but sections with nothing on screen ahead
+   * of rebuilds of ones already drawn (`REBUILD_QUOTA`). Found in one pass
+   * instead of a sort: a
+   * flight keeps thousands of sections dirty, and sorting them all for
+   * every dispatch cost more than the dispatches did. A regular key
+   * `isReady` turns down is left out (and stays dirty) for this pass.
+   */
+  nearestDirtyKeys(
+    center: Coords2,
+    limit: number,
+    isReady?: (cx: number, cz: number) => boolean,
+  ): string[] {
+    const urgentKeys = this.urgentDirtyKeys();
+    const [centerX, centerZ] = center;
+    // Two lanes, each the nearest `limit`: sections with nothing on screen
+    // yet, and sections being rebuilt (a neighbour landed, the light moved).
+    const fresh: string[] = [];
+    const freshDistances: number[] = [];
+    const rebuilt: string[] = [];
+    const rebuiltDistances: number[] = [];
+    const readyColumns = new Map<number, boolean>();
+    for (const key of this.dirty) {
+      if (this.urgentDirty.has(key)) continue;
+      const isFresh = !this.hasDisplayed(key);
+      const keys = isFresh ? fresh : rebuilt;
+      const distances = isFresh ? freshDistances : rebuiltDistances;
+      const distance = keyColumnDistanceSq(key, centerX, centerZ);
+      if (keys.length >= limit && distance >= distances[limit - 1]) continue;
+      if (!this.shouldStartJob(key)) continue;
+      if (isReady) {
+        // Asked once per column: its sections share the answer.
+        const { cx, cz } = this.states.get(key) ?? MeshPipeline.parseKey(key);
+        const column = columnKey(cx, cz);
+        let isColumnReady = readyColumns.get(column);
+        if (isColumnReady === undefined) {
+          isColumnReady = isReady(cx, cz);
+          readyColumns.set(column, isColumnReady);
+        }
+        if (!isColumnReady) continue;
+      }
+      // Insertion keeps the kept keys sorted; equal distances keep the
+      // dirty set's insertion order, as the full sort does.
+      let at = keys.length;
+      while (at > 0 && distances[at - 1] > distance) at -= 1;
+      keys.splice(at, 0, key);
+      distances.splice(at, 0, distance);
+      if (keys.length > limit) {
+        keys.pop();
+        distances.pop();
+      }
+    }
+    // Fresh sections first: terrain nobody can see yet beats a better
+    // version of terrain already drawn. A rebuild goes first only when it
+    // is nearer, and at most REBUILD_QUOTA in a row, so a stream of them
+    // near the camera cannot starve the frontier.
+    const ordered: string[] = [];
+    let quota = REBUILD_QUOTA;
+    let f = 0;
+    let r = 0;
+    while (ordered.length < limit && (f < fresh.length || r < rebuilt.length)) {
+      const takeRebuild =
+        r < rebuilt.length &&
+        (f >= fresh.length ||
+          (quota > 0 && rebuiltDistances[r] < freshDistances[f]));
+      if (takeRebuild) {
+        ordered.push(rebuilt[r++]);
+        quota -= 1;
+      } else {
+        ordered.push(fresh[f++]);
+        quota = REBUILD_QUOTA;
+      }
+    }
+    return [...urgentKeys, ...ordered];
   }
 
   hasDirtyChunks(): boolean {
@@ -369,6 +860,11 @@ export class MeshPipeline {
   hasInFlightJob(key: string): boolean {
     const state = this.states.get(key);
     return (state?.inFlightGenerations.size ?? 0) > 0;
+  }
+
+  /** Whether a mesh job for this section is waiting to be dispatched. */
+  isDirty(key: string): boolean {
+    return this.dirty.has(key);
   }
 
   inFlightJobCount(): number {

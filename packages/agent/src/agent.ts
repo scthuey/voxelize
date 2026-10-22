@@ -1,14 +1,17 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 import puppeteer, { Browser, Page } from "puppeteer";
 
+import { signInThrough } from "./auth-url";
 import type {
   AgentEventMap,
   AgentEventName,
   BlockInfo,
   CameraShot,
   CameraShotStatus,
+  CaptureCaveat,
   ChatMsgIn,
   ChunkCoord,
   ChunkSnapshot,
@@ -16,6 +19,7 @@ import type {
   CommandDispatch,
   CommandResult,
   ConnectionSnapshot,
+  DrawThrottleStatus,
   EntitySnapshot,
   FaceInput,
   FollowOptions,
@@ -23,6 +27,7 @@ import type {
   FollowTarget,
   FrameRateMeasurement,
   FrameRateMeasurementOptions,
+  MemoryTrend,
   MeshTransferBenchmarkRequest,
   MeshTransferBenchmarkResult,
   MeshTransferStatus,
@@ -36,33 +41,65 @@ import type {
   VideoRecordingStarted,
   VideoRecordingStatus,
   ViewOptions,
+  VoxelCensus,
+  VoxelCensusBox,
   WalkDirection,
   WalkOptions,
   WalkToOptions,
+  BlockAnimationsSnapshot,
   RenderStats,
+  TextureCensus,
+  TextureFillResult,
   WorldMemoryCounters,
   YawPitch,
 } from "./bridge";
 import {
+  DEFAULT_MOUNT_SELECTOR,
+  agentBrowserFlag,
   agentPidFile,
   clearAgentPidFile,
   reapStaleAgentBrowser,
   recordAgentBrowser,
   spawnBrowserWatchdog,
 } from "./browser-lifecycle";
+import { describeLaunchError, lowPriorityBrowser } from "./browser-priority";
+import { agentCacheDir } from "./cache-dir";
 import {
   CaptureViewport,
   RequestedCaptureViewport,
   expectedBackingSize,
   resolveCaptureViewport,
 } from "./capture-viewport";
+import {
+  ClientUpdateMode,
+  ClientUpdateState,
+  clientUpdateGuardSource,
+  resolveClientUpdateMode,
+  resolveHmrUrlPatterns,
+} from "./client-updates";
+import { composeClientUrl } from "./client-url";
+import { assertUncappedWindow } from "./frame-rate-guard";
 import { AgentHealth, AgentWorldHealth, evaluateAgentHealth } from "./health";
+import {
+  DEFAULT_NAVIGATION_RETRY_MS,
+  PageUnavailableError,
+  openPage,
+  resolveNavigationRetryMs,
+  type PageUnavailable,
+} from "./page-availability";
 import {
   createAgentPerfTraceId,
   isAgentPerfLogging,
   logAgentPerf,
   writeClientPerfLine,
 } from "./perf";
+import type { PoseSample } from "./pose-memory";
+import {
+  CpuProfile,
+  ProfileSummary,
+  SamplingHeapProfile,
+  summarizeProfile,
+} from "./profile-summary";
 
 export type AgentLaunchOptions = {
   url: string;
@@ -75,9 +112,17 @@ export type AgentLaunchOptions = {
   /**
    * Visited before joining the world so the response can set session
    * cookies (e.g. a dev-login endpoint), letting the agent run as an
-   * authenticated user with admin-only commands available.
+   * authenticated user with admin-only commands available. An answer other
+   * than 2xx (or 304) rejects the launch with an AuthUrlError, browser
+   * closed, instead of joining without the account.
    */
   authUrl?: string;
+  /**
+   * How long a client page that answers like a server mid-restart (5xx, a
+   * refused connection) is retried before the launch gives up; a 404 gives
+   * up at once (page-availability.ts). Defaults to AGENT_NAVIGATION_RETRY_MS.
+   */
+  navigationRetryMs?: number;
 };
 
 export type ScreenshotOptions = {
@@ -87,6 +132,11 @@ export type ScreenshotOptions = {
    * WebGL canvas instead of the full page.
    */
   isPure?: boolean;
+  /**
+   * When true, composite the first-person arm/held item. `/sc` and pure
+   * captures leave it off; pass this (or `?hand=true`) for a viewmodel shot.
+   */
+  isIncludingArm?: boolean;
   /**
    * Optional capture-only viewport width in CSS pixels. When any of width,
    * height, or deviceScaleFactor is set, the page is temporarily resized for
@@ -117,6 +167,25 @@ export type VideoRecordingStartReport = VideoRecordingStarted & {
   viewport: CaptureViewport;
 };
 
+/**
+ * The V8 heap of every isolate in the page's renderer: the page itself and
+ * each worker, summed and per worker pool (workers named `pool-N`).
+ */
+export type IsolateHeaps = {
+  /** The page plus every worker found, read or not. */
+  count: number;
+  unreadWorkers: number;
+  heapUsedBytes: number;
+  heapTotalBytes: number;
+  pageHeapTotalBytes: number;
+  pools: Record<
+    string,
+    { workers: number; heapUsedBytes: number; heapTotalBytes: number }
+  >;
+};
+
+type HeapUsage = { usedSize: number; totalSize: number };
+
 export type VideoRecordingFile = VideoRecordingResult & {
   path: string;
   viewport: CaptureViewport;
@@ -134,6 +203,15 @@ const DEFAULT_PAGE_CALL_TIMEOUT_MS = 10_000;
 // Rendering plus PNG encode under software WebGL is the slowest page call
 // that is still healthy, so captures get their own ceiling.
 const CAPTURE_PAGE_CALL_TIMEOUT_MS = 30_000;
+// How long a launch (or reset) waits for the client to finish initializing
+// and install `window.__agent__`. The bridge lands only after asset load and
+// world init, which on a saturated box (several sessions, a core rebuild)
+// takes minutes, not seconds — and a daemon that dies here can report
+// nothing at all. `AGENT_READY_TIMEOUT_MS` raises it for that machine.
+const DEFAULT_READY_TIMEOUT_MS = 60_000;
+// Puppeteer's stock CDP protocol timeout; kept as the floor so nothing gets
+// stricter than upstream when the ready wait is left at its default.
+const DEFAULT_PROTOCOL_TIMEOUT_MS = 180_000;
 // Read a finished take out of the page in slices: the whole clip in one
 // evaluate result is a payload with no upper bound, and base64 inflates it by
 // a third on the way across.
@@ -172,6 +250,108 @@ function positiveEnvNumber(name: string, fallback: number): number {
   return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
+// The bridge wait grows with machine load. Under a saturated box (several
+// agent sessions, a cargo build, the dev client recompiling) the client's
+// join legitimately takes minutes, and a fixed 60s made every start under
+// load a false "died while starting". An explicit AGENT_READY_TIMEOUT_MS is
+// taken literally; the default scales by load-per-core, capped so a runaway
+// load average cannot turn the wait into an hour.
+export const READY_TIMEOUT_MAX_LOAD_FACTOR = 6;
+
+export function loadFactor(
+  loadAverage = os.loadavg()[0],
+  cpuCount = os.cpus().length,
+): number {
+  if (!Number.isFinite(loadAverage) || cpuCount <= 0) return 1;
+  return Math.min(
+    READY_TIMEOUT_MAX_LOAD_FACTOR,
+    Math.max(1, loadAverage / cpuCount),
+  );
+}
+
+export function resolveReadyTimeoutMs(
+  env: NodeJS.ProcessEnv = process.env,
+  factor = loadFactor(),
+): { timeoutMs: number; isScaled: boolean; factor: number } {
+  const explicit = Number(env.AGENT_READY_TIMEOUT_MS);
+  if (Number.isFinite(explicit) && explicit > 0) {
+    return { timeoutMs: explicit, isScaled: false, factor: 1 };
+  }
+  return {
+    timeoutMs: Math.round(DEFAULT_READY_TIMEOUT_MS * factor),
+    isScaled: factor > 1,
+    factor,
+  };
+}
+
+// A page error's stack can embed the mesh worker's base64-inlined wasm (a
+// multi-megabyte `data:application/wasm;base64,...` frame per line); one
+// trap wrote megabytes, and a session that trapped repeatedly grew its log
+// past 2 GB. Enough of a line to act on is kept; the rest is counted.
+export const MAX_LOG_LINE_CHARS = 4_000;
+
+export function truncateLogText(
+  text: string,
+  maxChars = MAX_LOG_LINE_CHARS,
+): string {
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, maxChars)} …[truncated ${text.length - maxChars} chars]`;
+}
+
+/**
+ * Extra Chromium switches from `AGENT_CHROME_ARGS`, whitespace-separated.
+ * The measurement escape hatch: `--disable-gpu-vsync --disable-frame-rate-limit`
+ * uncaps the frame rate so `fps` reports the frame the GPU actually takes
+ * instead of the display's refresh. Only well-formed switches pass, so a
+ * typo here can never keep the browser from launching. V8's own flags go in
+ * `AGENT_JS_FLAGS` (`--trace-gc-nvp --trace-gc-verbose`): `--js-flags` is one
+ * switch with a space-separated value, which the split cannot carry.
+ */
+function extraChromeArgs(): string[] {
+  const raw = process.env.AGENT_CHROME_ARGS ?? "";
+  const args = raw
+    .split(/\s+/)
+    .filter((arg) => /^--[a-z0-9][a-z0-9-]*(=[^\s]*)?$/i.test(arg));
+  const dropped = raw.split(/\s+/).filter((a) => a !== "" && !args.includes(a));
+  if (dropped.length > 0) {
+    console.warn(
+      `[voxelize-agent] ignoring malformed AGENT_CHROME_ARGS entries: ${dropped.join(" ")}`,
+    );
+  }
+  const jsFlags = process.env.AGENT_JS_FLAGS?.trim();
+  if (jsFlags) {
+    args.push(`--js-flags=${jsFlags}`);
+  }
+  if (args.length > 0) {
+    console.log(`[voxelize-agent] extra chrome args: ${args.join(" ")}`);
+  }
+  return args;
+}
+
+/**
+ * Where a port's browser profile lives, or null for a throwaway temp
+ * profile. `AGENT_PROFILE_DIR` names the parent directory (default
+ * `profiles` under {@link agentCacheDir}); `AGENT_EPHEMERAL_PROFILE=1` opts
+ * back into a fresh profile per launch (cold-cache measurements, e.g.
+ * join-timing from scratch).
+ */
+export function agentProfileDir(
+  port: number,
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  if (
+    env.AGENT_EPHEMERAL_PROFILE === "1" ||
+    env.AGENT_EPHEMERAL_PROFILE === "true"
+  ) {
+    return null;
+  }
+  const base =
+    env.AGENT_PROFILE_DIR && env.AGENT_PROFILE_DIR.trim() !== ""
+      ? env.AGENT_PROFILE_DIR
+      : path.join(agentCacheDir(env), "profiles");
+  return path.join(base, `port-${port}`);
+}
+
 /** `video/mp4;codecs=avc1.42E01E` -> `mp4`. */
 function containerExtension(mimeType: string): string {
   const subtype = mimeType.split(";")[0]?.split("/")[1];
@@ -181,10 +361,37 @@ function containerExtension(mimeType: string): string {
   return subtype;
 }
 
+/**
+ * A give-up on navigation timeouts alone: nothing answered with a status
+ * and nothing refused the load, so the browser is still loading the page.
+ */
+function isStillLoading(report: PageUnavailable): boolean {
+  return (
+    report.isTransient &&
+    report.status === null &&
+    /timeout/i.test(report.error ?? "")
+  );
+}
+
 export class Agent {
   private browser: Browser;
   private page: Page;
   private targetUrl = "";
+  /** The launch's page-load retry budget, kept for later navigations. */
+  private navigationRetryMs = DEFAULT_NAVIGATION_RETRY_MS;
+  /** Read once: a session holds or follows hot updates for its whole life. */
+  readonly clientUpdateMode: ClientUpdateMode = resolveClientUpdateMode();
+  /**
+   * Extra page console prefixes worth keeping in the session log
+   * (AGENT_PAGE_LOG_PREFIXES, comma-separated), on top of the agent's own
+   * and error/warning output.
+   */
+  private readonly pageLogPrefixes: string[] = (
+    process.env.AGENT_PAGE_LOG_PREFIXES ?? ""
+  )
+    .split(",")
+    .map((prefix) => prefix.trim())
+    .filter((prefix) => prefix.length > 0);
   private readonly pidFile: string;
   private eventListeners: Map<AgentEventName, Set<(data: unknown) => void>> =
     new Map();
@@ -216,53 +423,178 @@ export class Agent {
   );
   public readyPromise: Promise<void>;
 
+  /** The world the page is on now; see `worldName`. */
+  private currentWorld: string;
+
   private constructor(
     browser: Browser,
     page: Page,
     readyPromise: Promise<void>,
     pidFile: string,
-    public readonly worldName: string,
+    worldName: string,
+    /** In-game display name (`agentName` query param the client joined with). */
+    public readonly name: string,
   ) {
     this.browser = browser;
     this.page = page;
     this.readyPromise = readyPromise;
     this.pidFile = pidFile;
+    this.currentWorld = worldName;
+  }
+
+  /**
+   * The world the page is on now: the one it launched in until the page
+   * reports another (`observeWorld`, fed by the daemon's connection watch),
+   * so a session moved to another world says so everywhere it is listed.
+   */
+  get worldName(): string {
+    return this.currentWorld;
+  }
+
+  /**
+   * The page says which world it is on. A change also moves the URL a page
+   * reset reopens to the page's own, so a reset after a world switch
+   * reloads the world the agent is in, not the one it launched in. Returns
+   * whether the world changed.
+   */
+  observeWorld(world: string | null | undefined): boolean {
+    if (!world || world === this.currentWorld) return false;
+    const from = this.currentWorld;
+    this.currentWorld = world;
+    const url = this.page.url();
+    if (/^https?:/.test(url)) this.targetUrl = url;
+    console.log(
+      `[voxelize-agent] world ${from} -> ${world}; a page reset now reopens ${this.targetUrl}`,
+    );
+    return true;
+  }
+
+  /** The address the page is showing. */
+  pageUrl(): string {
+    return this.page.url();
   }
 
   static async launch(options: AgentLaunchOptions): Promise<Agent> {
+    const readyTimeout = resolveReadyTimeoutMs();
     const {
       url,
       world,
       name = "agent",
       isHeadless = true,
-      waitReadyTimeoutMs = 60_000,
+      waitReadyTimeoutMs = readyTimeout.timeoutMs,
       port = DEFAULT_DAEMON_PORT,
       authUrl,
+      navigationRetryMs = resolveNavigationRetryMs(process.env),
     } = options;
+    if (options.waitReadyTimeoutMs === undefined && readyTimeout.isScaled) {
+      console.log(
+        `[voxelize-agent] bridge wait ${Math.round(waitReadyTimeoutMs / 1000)}s: default scaled x${readyTimeout.factor.toFixed(1)} for load ${os.loadavg()[0].toFixed(0)} on ${os.cpus().length} cores`,
+      );
+    }
 
     const pidFile = agentPidFile(port);
-    reapStaleAgentBrowser(pidFile);
+    reapStaleAgentBrowser(pidFile, port);
 
-    const browser = await puppeteer.launch({
+    const launchOptions = {
       headless: isHeadless,
       // Fatal renderer aborts (V8 OOM, mojo errors, sandbox CHECKs) only
       // surface on Chromium's stderr; dumpio pipes it into the daemon log so
       // a dead tab always leaves its reason behind.
       dumpio: true,
+      // A CDP call against a page whose main thread is starved for minutes
+      // (the same saturated-box case AGENT_READY_TIMEOUT_MS exists for)
+      // otherwise fails on puppeteer's own 180s protocol ceiling before the
+      // bridge wait gets to run its course.
+      protocolTimeout: Math.max(
+        DEFAULT_PROTOCOL_TIMEOUT_MS,
+        waitReadyTimeoutMs + DEFAULT_PAGE_CALL_TIMEOUT_MS,
+      ),
       args: [
+        // The agent's own mark: the watchdog and every reaper know this
+        // browser by it, whichever Chrome runs (browser-lifecycle.ts).
+        agentBrowserFlag(port),
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
         "--enable-webgl",
         "--ignore-gpu-blocklist",
+        // ERROR and FATAL only. Chromium's INFO level mirrors every console
+        // message to stderr, duplicating what attachPageLogging already
+        // records through CDP, plus per-packet socket chatter; one session
+        // log reached 3.2 GB that way.
         "--enable-logging=stderr",
+        "--log-level=2",
+        // A headless session has no listener: its game audio only kept the
+        // host's audio mixer busy (about one core with a few sessions up).
+        // In-page WebAudio still runs; AGENT_AUDIO=1 plays it out.
+        ...(process.env.AGENT_AUDIO === "1" ? [] : ["--mute-audio"]),
+        ...extraChromeArgs(),
       ],
       defaultViewport: {
         width: positiveEnvNumber("AGENT_VIEWPORT_WIDTH", 1280),
         height: positiveEnvNumber("AGENT_VIEWPORT_HEIGHT", 720),
         deviceScaleFactor: positiveEnvNumber("AGENT_VIEWPORT_SCALE", 1),
       },
-    });
+    };
+
+    // The browser runs below the server and the player's browser. Like the
+    // profile below, it is a nicety: a wrapped launch that fails falls back
+    // to a plain one rather than costing the session.
+    const priority = lowPriorityBrowser(puppeteer.executablePath());
+    console.log(
+      `[voxelize-agent] browser priority: ${priority?.tier ?? "default"}`,
+    );
+    const launch = async (
+      options: typeof launchOptions & { userDataDir?: string },
+    ) => {
+      if (!priority) return puppeteer.launch(options);
+      try {
+        return await puppeteer.launch({
+          ...options,
+          executablePath: priority.executablePath,
+        });
+      } catch (error) {
+        console.error(
+          `[voxelize-agent] low-priority browser launch failed (${describeLaunchError(
+            error,
+          )}); launching at default priority`,
+        );
+        return puppeteer.launch(options);
+      }
+    };
+
+    // The profile persists per port so the client's IndexedDB creature
+    // texture store (and its HTTP cache) survive from one session to the
+    // next: a fresh temp profile made every join re-bake the whole roster.
+    // A profile that will not open is wiped and retried once — a warm cache
+    // is a nicety, a session that cannot start is a defect.
+    const profileDir = agentProfileDir(port);
+    let browser: Browser;
+    if (profileDir === null) {
+      browser = await launch(launchOptions);
+    } else {
+      fs.mkdirSync(profileDir, { recursive: true });
+      try {
+        browser = await launch({
+          ...launchOptions,
+          userDataDir: profileDir,
+        });
+      } catch (error) {
+        console.error(
+          `[voxelize-agent] chromium refused the persistent profile at ${profileDir} (${
+            error instanceof Error
+              ? error.message.split("\n")[0]
+              : String(error)
+          }); wiping it and retrying with a fresh one`,
+        );
+        fs.rmSync(profileDir, { recursive: true, force: true });
+        fs.mkdirSync(profileDir, { recursive: true });
+        browser = await launch({
+          ...launchOptions,
+          userDataDir: profileDir,
+        });
+      }
+    }
     recordAgentBrowser(pidFile, browser.process()?.pid);
     // Guards the SIGKILL/crash path: signal handlers and exit hooks below
     // cover clean shutdowns, but only this outlives the daemon process itself.
@@ -282,10 +614,18 @@ export class Agent {
       localStorage.setItem("VOXELIZE-playerId", `agent-${agentPort}`);
     }, port);
 
-    const agent = new Agent(browser, page, Promise.resolve(), pidFile, world);
+    const agent = new Agent(
+      browser,
+      page,
+      Promise.resolve(),
+      pidFile,
+      world,
+      name,
+    );
     agent.watchdogPidValue = watchdogPid;
     browser.on("disconnected", () => agent.handleBrowserDisconnected());
     agent.attachPageLogging(page);
+    await agent.installClientUpdateGuard(page);
     await agent.installChatCapture();
 
     // Registered on every navigation (dev-server reloads included), so the
@@ -299,29 +639,77 @@ export class Agent {
     });
 
     if (authUrl) {
-      await page.goto(authUrl, { waitUntil: "domcontentloaded" });
-      console.log(`[voxelize-agent] visited auth url: ${authUrl}`);
+      let status: number;
+      try {
+        status = await signInThrough(page, authUrl);
+      } catch (error) {
+        // Nothing else would close this browser: the daemon registers its
+        // exit hooks only once launch returns.
+        await agent.close();
+        throw error;
+      }
+      console.log(
+        `[voxelize-agent] visited auth url: ${authUrl} (answered ${status})`,
+      );
     }
 
-    const target = new URL(`${url.replace(/\/$/, "")}/${world}`);
-    target.searchParams.set("agent", "true");
-    target.searchParams.set("agentName", name);
-    if (process.env.AGENT_CAPTURE_MODE === "true") {
-      target.searchParams.set("capture", "true");
-    }
     // Visual tests of held items opt into rendering the first-person arm,
     // which agent screenshots otherwise omit (see client agent mode).
-    if (process.env.AGENT_ARM_VISIBLE === "true") {
-      target.searchParams.set("agentArm", "true");
-    }
-    agent.targetUrl = target.toString();
+    const targetUrl = composeClientUrl(url, world, {
+      agentName: name,
+      isCapture: process.env.AGENT_CAPTURE_MODE === "true",
+      isArmVisible: process.env.AGENT_ARM_VISIBLE === "true",
+    });
+    agent.targetUrl = targetUrl;
+    agent.navigationRetryMs = navigationRetryMs;
 
-    await page.goto(target.toString(), { waitUntil: "domcontentloaded" });
+    await agent.openClientPage(targetUrl, navigationRetryMs);
 
     const ready = Agent.waitForBridge(page, waitReadyTimeoutMs);
 
     agent.trackReadyPromise(ready);
     return agent;
+  }
+
+  /**
+   * Open the client page under page-availability's rule. One that cannot
+   * load closes this browser before the error reaches the daemon: nothing
+   * else would (the daemon registers its exit hooks only once launch
+   * returns), and a session that can never mount must not hold one.
+   */
+  private async openClientPage(url: string, retryMs: number): Promise<void> {
+    try {
+      await this.loadPage(url, retryMs);
+    } catch (error) {
+      if (error instanceof PageUnavailableError) {
+        const pid = this.browserPid();
+        await this.close();
+        console.log(
+          `[voxelize-agent] closed browser pid=${pid ?? "?"}: its page cannot load, so the session ends instead of waiting for a bridge`,
+        );
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Navigate this tab to `url` under page-availability's rule: a load that
+   * may pass on its own (a navigation timeout while a dev server compiles
+   * the route, a 5xx, a refused connection) is tried again within
+   * `retryMs`; one that cannot throws PageUnavailableError.
+   */
+  private async loadPage(url: string, retryMs: number): Promise<void> {
+    await openPage(
+      async () => {
+        const response = await this.page.goto(url, {
+          waitUntil: "domcontentloaded",
+        });
+        return response === null
+          ? null
+          : { status: response.status(), statusText: response.statusText() };
+      },
+      { url, retryMs },
+    );
   }
 
   private trackReadyPromise(ready: Promise<void>): void {
@@ -441,7 +829,9 @@ export class Agent {
       throw new PageStallError(
         label,
         PAGE_STALL_RETRY_AFTER_MS,
-        `page call "${label}" started ${Date.now() - stalledSince}ms ago, timed out, and still has not settled; ` +
+        `page call "${label}" started ${
+          Date.now() - stalledSince
+        }ms ago, timed out, and still has not settled; ` +
           `refusing to stack another onto a blocked page. Retry in ~${PAGE_STALL_RETRY_AFTER_MS}ms, ` +
           `or POST /reset to reload the page.`,
       );
@@ -487,7 +877,9 @@ export class Agent {
    * the daemon process or its port. If the renderer itself died (detached
    * main frame), a brand-new page is opened at the same URL instead.
    */
-  async reset(waitReadyTimeoutMs = 60_000): Promise<void> {
+  async reset(
+    waitReadyTimeoutMs = resolveReadyTimeoutMs().timeoutMs,
+  ): Promise<void> {
     try {
       await this.page.reload({ waitUntil: "domcontentloaded" });
     } catch (error) {
@@ -498,6 +890,7 @@ export class Agent {
       const stale = this.page;
       const page = await this.browser.newPage();
       this.attachPageLogging(page);
+      await this.installClientUpdateGuard(page);
       this.page = page;
       await this.installChatCapture();
       await page.evaluateOnNewDocument(() => {
@@ -517,6 +910,141 @@ export class Agent {
     const ready = Agent.waitForBridge(this.page, waitReadyTimeoutMs);
     this.trackReadyPromise(ready);
     await ready;
+  }
+
+  /**
+   * Hold dev-server hot updates back from this page (client-updates.ts).
+   * A nicety like the priority wrapper: if it cannot be installed the page
+   * follows the dev server as it always did, and the log says so.
+   */
+  private async installClientUpdateGuard(page: Page): Promise<void> {
+    if (this.clientUpdateMode === "live") {
+      console.log(
+        "[voxelize-agent] client updates: live (dev-server hot updates apply to this page)",
+      );
+      return;
+    }
+    const patterns = resolveHmrUrlPatterns();
+    try {
+      await page.evaluateOnNewDocument(clientUpdateGuardSource(patterns));
+      console.log(
+        `[voxelize-agent] client updates: hold (hot updates on ${patterns.join(", ")} are held; the page keeps the code it loaded until a reload)`,
+      );
+    } catch (error) {
+      console.error(
+        `[voxelize-agent] could not install the client-update guard (${
+          error instanceof Error ? error.message : String(error)
+        }); this page will follow dev-server hot updates`,
+      );
+    }
+  }
+
+  /** The loaded document and the hot updates held back from it; no bridge needed. */
+  async pageDocument(): Promise<{
+    documentId: number;
+    url: string;
+    title: string;
+    clientUpdates: ClientUpdateState | null;
+    /** The client rendered its mount element or installed the bridge. */
+    isMounted: boolean;
+  }> {
+    const mountSelector =
+      process.env.AGENT_MOUNT_SELECTOR || DEFAULT_MOUNT_SELECTOR;
+    return this.withPageTimeout("pageDocument", this.defaultPageTimeoutMs, () =>
+      this.page.evaluate(
+        (selector) => ({
+          documentId: performance.timeOrigin,
+          url: window.location.href,
+          title: document.title,
+          clientUpdates: window.__agentClientUpdates__ ?? null,
+          isMounted:
+            Boolean(window.__agent__) ||
+            document.querySelector(selector) !== null,
+        }),
+        mountSelector,
+      ),
+    );
+  }
+
+  /**
+   * Position, facing, and the join they were read from (document, bridge,
+   * world), in one call.
+   */
+  async poseSample(): Promise<PoseSample> {
+    return this.withPageTimeout("poseSample", this.defaultPageTimeoutMs, () =>
+      this.page.evaluate(() => {
+        const bridge = window.__agentRequired__();
+        const facing = bridge.facing();
+        const connection = bridge.connection();
+        return {
+          position: bridge.position(),
+          facing: { yaw: facing.yaw, pitch: facing.pitch },
+          documentId: performance.timeOrigin,
+          joinSerial: connection.joinSerial ?? null,
+          joinGeneration: connection.joinGeneration ?? null,
+          // A host whose connection does not name its world still names it
+          // in the snapshot (the costlier read, so only then).
+          world: connection.world ?? bridge.snapshot().world ?? null,
+        };
+      }),
+    );
+  }
+
+  /**
+   * Open another page in this tab (a world switch by navigation) and wait
+   * for its bridge. The load is retried the way the launch's is (the same
+   * budget); a page the client answers with an error status, or that cannot
+   * load at all, throws PageUnavailableError without waiting out the bridge
+   * timeout. Unlike the launch's, a page that cannot load leaves the browser
+   * up: the session is still standing in some world.
+   */
+  async navigateTo(
+    url: string,
+    waitReadyTimeoutMs = resolveReadyTimeoutMs().timeoutMs,
+  ): Promise<void> {
+    try {
+      await this.loadPage(url, this.navigationRetryMs);
+    } catch (error) {
+      // Out of retries on navigation timeouts alone (a dev server still
+      // compiling the route): the last load is still going, so its bridge
+      // is waited for like any other instead of failing a page that lands.
+      if (
+        !(error instanceof PageUnavailableError) ||
+        !isStillLoading(error.report)
+      ) {
+        throw error;
+      }
+      console.log(
+        `[voxelize-agent] ${error.message}; the last load is still going, so its bridge is waited for anyway`,
+      );
+    }
+    this.targetUrl = url;
+    const ready = Agent.waitForBridge(this.page, waitReadyTimeoutMs);
+    this.trackReadyPromise(ready);
+    await ready;
+  }
+
+  /**
+   * Ask the page's host to switch worlds in place (`AgentBridge.switchWorld`),
+   * awaiting its answer. False when the bridge has no in-page switch, or the
+   * host declined or could not (a host may log why to the page console).
+   */
+  async switchWorldInPage(world: string): Promise<boolean> {
+    return this.withPageTimeout("switchWorld", this.defaultPageTimeoutMs, () =>
+      this.page.evaluate(async (name) => {
+        const bridge = window.__agent__;
+        if (!bridge || typeof bridge.switchWorld !== "function") return false;
+        return Boolean(await bridge.switchWorld(name));
+      }, world),
+    );
+  }
+
+  /** Reload without waiting for the bridge, for pages that may never install one. */
+  async reloadDocument(): Promise<void> {
+    await this.page.reload({ waitUntil: "domcontentloaded" });
+    this.trackReadyPromise(
+      Agent.waitForBridge(this.page, resolveReadyTimeoutMs().timeoutMs),
+    );
   }
 
   private attachPageLogging(page: Page): void {
@@ -541,19 +1069,20 @@ export class Agent {
             text = descriptions.join(" ");
           }
         }
-        console.error(`[agent-page] ${type}:`, text);
+        console.error(`[agent-page] ${type}:`, truncateLogText(text));
         return;
       }
       if (
         text.startsWith("[agent") ||
         text.startsWith("[NETWORK]") ||
-        text.includes("GAMETEST")
+        text.includes("GAMETEST") ||
+        this.pageLogPrefixes.some((prefix) => text.startsWith(prefix))
       ) {
-        console.log(`[agent-page]`, text);
+        console.log(`[agent-page]`, truncateLogText(text));
       }
     });
     page.on("pageerror", (err) => {
-      console.error("[agent-page-error]", err.message);
+      console.error("[agent-page-error]", truncateLogText(err.message));
     });
   }
 
@@ -706,6 +1235,18 @@ export class Agent {
     );
   }
 
+  async setFogDistance(blocks: number | null): Promise<number | null> {
+    return this.withPageTimeout(
+      "setFogDistance",
+      this.defaultPageTimeoutMs,
+      () =>
+        this.page.evaluate(
+          (b) => window.__agentRequired__().setFogDistance(b),
+          blocks,
+        ),
+    );
+  }
+
   async call(method: string, payload: unknown): Promise<unknown> {
     return this.withPageTimeout("call", this.defaultPageTimeoutMs, () =>
       this.page.evaluate(
@@ -724,6 +1265,56 @@ export class Agent {
   > {
     return this.withPageTimeout("breakVoxel", this.defaultPageTimeoutMs, () =>
       this.page.evaluate((p) => window.__agentRequired__().breakVoxel(p), pos),
+    );
+  }
+
+  async placeVoxel(
+    pos: Vec3,
+    block: string | number,
+  ): Promise<{ beforeId: number; afterId: number; blockId: number }> {
+    return this.withPageTimeout("placeVoxel", this.defaultPageTimeoutMs, () =>
+      this.page.evaluate(
+        (p, b) => window.__agentRequired__().placeVoxel(p, b),
+        pos,
+        block,
+      ),
+    );
+  }
+
+  async selectHotbar(slot: number): Promise<void> {
+    if (!Number.isInteger(slot) || slot < 0 || slot > 8) {
+      throw new Error("selectHotbar slot must be an integer from 0 to 8");
+    }
+    await this.withPageTimeout("selectHotbar", this.defaultPageTimeoutMs, () =>
+      this.page.evaluate(
+        (index) => window.__agentRequired__().selectHotbar(index),
+        slot,
+      ),
+    );
+  }
+
+  async interact(
+    button: "left" | "right" = "right",
+    holdMs = 0,
+    isShift = false,
+  ): Promise<{
+    button: "left" | "right";
+    target: Vec3 | null;
+    block: string | null;
+  }> {
+    if (!Number.isFinite(holdMs) || holdMs < 0 || holdMs > 15_000) {
+      throw new Error("interact holdMs must be between 0 and 15000");
+    }
+    return this.withPageTimeout(
+      "interact",
+      Math.max(this.defaultPageTimeoutMs, holdMs + PAGE_CALL_GRACE_MS),
+      () =>
+        this.page.evaluate(
+          (b, ms, shift) => window.__agentRequired__().interact(b, ms, shift),
+          button,
+          holdMs,
+          isShift,
+        ),
     );
   }
 
@@ -827,6 +1418,11 @@ export class Agent {
     heapUsedBytes: number;
     heapTotalBytes: number;
     counters: WorldMemoryCounters;
+    /** The debug bar's sampler: heap floor and leak trend. Null where the
+     * client has no debug UI or the browser exposes no heap counters. */
+    trend: MemoryTrend | null;
+    /** Every isolate's V8 heap: the page's and each worker's. */
+    isolates: IsolateHeaps;
   }> {
     const metrics = await this.withPageTimeout(
       "pageMetrics",
@@ -839,11 +1435,89 @@ export class Agent {
       () =>
         this.page.evaluate(() => window.__agentRequired__().memoryCounters()),
     );
+    // Older bridges predate the method; a missing trend is reported as null,
+    // never as a failed read of the counters that are there.
+    const trend = await this.withPageTimeout(
+      "memoryTrend",
+      this.defaultPageTimeoutMs,
+      () =>
+        this.page.evaluate(() => {
+          const bridge = window.__agentRequired__();
+          return typeof bridge.memoryTrend === "function"
+            ? bridge.memoryTrend()
+            : null;
+        }),
+    );
     return {
       heapUsedBytes: metrics.JSHeapUsedSize ?? 0,
       heapTotalBytes: metrics.JSHeapTotalSize ?? 0,
       counters,
+      trend,
+      isolates: await this.withPageTimeout(
+        "isolateHeaps",
+        this.defaultPageTimeoutMs,
+        () => this.isolateHeaps(),
+      ),
     };
+  }
+
+  /**
+   * The V8 heap of the page and of every worker it runs, read over each
+   * one's own DevTools session. Every isolate in a renderer allocates from
+   * one shared pointer-compression cage, so the renderer dies when their sum
+   * reaches it, while the page alone reads small and `performance.memory`
+   * sees no worker at all. A worker that cannot be read is counted as
+   * unread, never as an empty heap.
+   */
+  async isolateHeaps(): Promise<IsolateHeaps> {
+    const client = await this.page.createCDPSession();
+    try {
+      const page = (await client.send("Runtime.getHeapUsage")) as HeapUsage;
+      const pools: IsolateHeaps["pools"] = {};
+      let workerTotalBytes = 0;
+      let workerUsedBytes = 0;
+      let unreadWorkers = 0;
+      const workers = this.page.workers();
+      await Promise.all(
+        workers.map(async (worker) => {
+          try {
+            const [usage, named] = await Promise.all([
+              worker.client.send("Runtime.getHeapUsage") as Promise<HeapUsage>,
+              worker.client.send("Runtime.evaluate", {
+                expression: "self.name",
+                returnByValue: true,
+              }) as Promise<{ result: { value?: unknown } }>,
+            ]);
+            const name =
+              typeof named.result.value === "string" && named.result.value
+                ? named.result.value.replace(/-\d+$/, "")
+                : "(unnamed)";
+            const pool = (pools[name] ??= {
+              workers: 0,
+              heapUsedBytes: 0,
+              heapTotalBytes: 0,
+            });
+            pool.workers += 1;
+            pool.heapUsedBytes += usage.usedSize;
+            pool.heapTotalBytes += usage.totalSize;
+            workerUsedBytes += usage.usedSize;
+            workerTotalBytes += usage.totalSize;
+          } catch {
+            unreadWorkers += 1;
+          }
+        }),
+      );
+      return {
+        count: 1 + workers.length,
+        unreadWorkers,
+        heapUsedBytes: page.usedSize + workerUsedBytes,
+        heapTotalBytes: page.totalSize + workerTotalBytes,
+        pageHeapTotalBytes: page.totalSize,
+        pools,
+      };
+    } finally {
+      await client.detach().catch(() => {});
+    }
   }
 
   /**
@@ -853,6 +1527,75 @@ export class Agent {
    */
   async renderStats(): Promise<RenderStats> {
     return this.page.evaluate(() => window.__agentRequired__().renderStats());
+  }
+
+  /**
+   * Cap (or lift) how often the page draws. Resolves after the next drawn
+   * frame, so a capture that follows a lift never sees a stale frame. A
+   * client without the bridge method reports `isSupported: false` and is
+   * left alone.
+   */
+  async setDrawThrottle(
+    intervalMs: number | null,
+  ): Promise<DrawThrottleStatus> {
+    return this.withPageTimeout(
+      "setDrawThrottle",
+      this.defaultPageTimeoutMs,
+      () =>
+        this.page.evaluate((ms) => {
+          const bridge = window.__agentRequired__();
+          if (typeof bridge.setDrawThrottle !== "function") {
+            return { intervalMs: null, isSupported: false };
+          }
+          return bridge.setDrawThrottle(ms);
+        }, intervalMs),
+    );
+  }
+
+  /**
+   * Every animated voxel the world tracks and the pose it shows right now.
+   * The check behind "did the door swing or cut": a voxel that changed
+   * state reports `isMoving` until its swing has run its course.
+   */
+  async blockAnimations(): Promise<BlockAnimationsSnapshot> {
+    return this.withPageTimeout(
+      "blockAnimations",
+      this.defaultPageTimeoutMs,
+      () =>
+        this.page.evaluate(() => window.__agentRequired__().blockAnimations()),
+    );
+  }
+
+  /**
+   * Every block surface's dress, with the ones not in their own art listed
+   * worst first. A census with no `unknown` entries after a load is the
+   * "no magenta checker anywhere" assertion.
+   */
+  async textureCensus(): Promise<TextureCensus> {
+    return this.withPageTimeout(
+      "textureCensus",
+      this.defaultPageTimeoutMs,
+      () =>
+        this.page.evaluate(() => window.__agentRequired__().textureCensus()),
+    );
+  }
+
+  /**
+   * Dress every surface still on the checker in its default or the world's
+   * fallback colour; see the bridge's `fillUnpaintedSurfaces`.
+   */
+  async fillUnpaintedSurfaces(options?: {
+    color?: string;
+  }): Promise<TextureFillResult> {
+    return this.withPageTimeout(
+      "fillUnpaintedSurfaces",
+      this.defaultPageTimeoutMs,
+      () =>
+        this.page.evaluate(
+          (opts) => window.__agentRequired__().fillUnpaintedSurfaces(opts),
+          options ?? {},
+        ),
+    );
   }
 
   async position(): Promise<Vec3> {
@@ -867,6 +1610,18 @@ export class Agent {
     );
   }
 
+  /** What makes a frame captured now mislead (`AgentBridge.captureCaveats`). */
+  async captureCaveats(): Promise<CaptureCaveat[]> {
+    return this.withPageTimeout(
+      "captureCaveats",
+      this.defaultPageTimeoutMs,
+      () =>
+        this.page.evaluate(
+          () => window.__agentRequired__().captureCaveats?.() ?? [],
+        ),
+    );
+  }
+
   async raycast(): Promise<RaycastHit | null> {
     return this.withPageTimeout("raycast", this.defaultPageTimeoutMs, () =>
       this.page.evaluate(() => window.__agentRequired__().raycast()),
@@ -876,6 +1631,36 @@ export class Agent {
   async blockAt(pos: Vec3): Promise<BlockInfo | null> {
     return this.withPageTimeout("blockAt", this.defaultPageTimeoutMs, () =>
       this.page.evaluate((p) => window.__agentRequired__().blockAt(p), pos),
+    );
+  }
+
+  async loseCalls(method: string, count: number): Promise<number> {
+    return this.withPageTimeout("loseCalls", this.defaultPageTimeoutMs, () =>
+      this.page.evaluate(
+        (m, c) => {
+          const bridge = window.__agentRequired__();
+          if (!bridge.loseCalls) {
+            throw new Error("this page's agent bridge has no loseCalls");
+          }
+          return bridge.loseCalls(m, c);
+        },
+        method,
+        count,
+      ),
+    );
+  }
+
+  async voxelCensus(boxes: VoxelCensusBox[]): Promise<VoxelCensus[]> {
+    return this.withPageTimeout("voxelCensus", this.defaultPageTimeoutMs, () =>
+      this.page.evaluate((b) => {
+        const bridge = window.__agentRequired__();
+        if (!bridge.voxelCensus) {
+          throw new Error(
+            "this page's agent bridge has no voxelCensus, so a fill cannot be read back; send it unverified",
+          );
+        }
+        return bridge.voxelCensus(b);
+      }, boxes),
     );
   }
 
@@ -1041,17 +1826,24 @@ export class Agent {
     // that to an HTTP 400 before the page is touched at all.
     const captureViewport = resolveCaptureViewport(opts, currentViewport);
     if (!captureViewport) {
-      return this.captureBuffer(opts.isPure === true);
+      return this.captureBuffer(
+        opts.isPure === true,
+        opts.isIncludingArm === true,
+      );
     }
 
     // Resize only for the duration of this capture. Joining/loading at 4K
     // under software WebGL makes every frame so expensive that heavy worlds
-    // (e.g. large town hubs) starve the network/chunk pipeline and the agent
-    // stalls or disconnects. Loading at the lightweight default viewport and
+    // (dense builds, large render radii) starve the network/chunk pipeline
+    // and the agent stalls or disconnects. Loading at the lightweight default
+    // viewport and
     // paying for high resolution only inside this window avoids that.
     await this.setViewportAndAwaitPaint(captureViewport);
     try {
-      return await this.captureBuffer(opts.isPure === true);
+      return await this.captureBuffer(
+        opts.isPure === true,
+        opts.isIncludingArm === true,
+      );
     } finally {
       // Restore even when the capture throws, and wait for the restoration
       // paint too, so the session never keeps running at capture resolution.
@@ -1124,7 +1916,9 @@ export class Agent {
   ): Promise<VideoRecordingStartReport> {
     if (this.activeRecording !== null) {
       throw new Error(
-        `a recording has been running for ${Date.now() - this.activeRecording.startedAt}ms; stop it before starting another`,
+        `a recording has been running for ${
+          Date.now() - this.activeRecording.startedAt
+        }ms; stop it before starting another`,
       );
     }
     const currentViewport = this.currentViewport();
@@ -1279,7 +2073,10 @@ export class Agent {
     };
   }
 
-  private async captureBuffer(isPure: boolean): Promise<Buffer> {
+  private async captureBuffer(
+    isPure: boolean,
+    isIncludingArm = false,
+  ): Promise<Buffer> {
     if (isPure) {
       const dataUrl = await this.withPageTimeout(
         "captureFrame",
@@ -1289,6 +2086,7 @@ export class Agent {
             (o) => window.__agentRequired__().captureFrame(o),
             {
               isPure: true,
+              isIncludingArm,
             },
           ),
       );
@@ -1361,6 +2159,140 @@ export class Agent {
     );
   }
 
+  /**
+   * A V8 heap snapshot of the page, streamed straight to `filePath` (a few
+   * hundred megabytes for a loaded world; never buffered in the daemon).
+   * A full collection runs first so the file holds the live set, not the
+   * garbage a collection would have taken. The page's main thread is held
+   * for the duration -- ten to twenty seconds on a busy world -- so this is
+   * a deliberate act, never something a poll does.
+   *
+   * The analysis lives outside the daemon (`pnpm heap census|diff|retainers`
+   * in the host repo): a census of object counts per class, a diff of two
+   * censuses to see what accumulates between them, and the retaining path
+   * from the GC root to any instance of a class.
+   */
+  async heapSnapshot(filePath: string): Promise<{
+    path: string;
+    bytes: number;
+    durationMs: number;
+    heapUsedBytes: number;
+    heapTotalBytes: number;
+  }> {
+    const startedAt = performance.now();
+    const client = await this.page.createCDPSession();
+    const fd = fs.openSync(filePath, "w");
+    let bytes = 0;
+    const onChunk = (event: { chunk: string }) => {
+      bytes += fs.writeSync(fd, event.chunk);
+    };
+    try {
+      await client.send("HeapProfiler.enable");
+      await client.send("HeapProfiler.collectGarbage");
+      const usage = await client.send("Runtime.getHeapUsage");
+      client.on("HeapProfiler.addHeapSnapshotChunk", onChunk);
+      // The protocol ceiling, not the page-call one: the page is expected
+      // to be unresponsive while V8 walks its heap.
+      await client.send("HeapProfiler.takeHeapSnapshot", {
+        reportProgress: false,
+        captureNumericValue: false,
+      });
+      return {
+        path: filePath,
+        bytes,
+        durationMs: Math.round(performance.now() - startedAt),
+        heapUsedBytes: usage.usedSize,
+        heapTotalBytes: usage.totalSize,
+      };
+    } finally {
+      client.off("HeapProfiler.addHeapSnapshotChunk", onChunk);
+      fs.closeSync(fd);
+      await client.detach().catch(() => {});
+    }
+  }
+
+  /**
+   * Sample the page's main thread for a window and attribute it per function
+   * and per rendered frame: V8's CPU profiler at a 200us interval, plus an
+   * optional sampling heap profiler that keeps the objects the collector
+   * already reclaimed, so allocation churn is measured and not just what
+   * happened to be alive at the end. The page keeps running; the profiler
+   * costs a few percent while it samples.
+   *
+   * This is what turns "it feels slower under water" into a number with a
+   * function name on it. `watch` is a case-insensitive pattern over the
+   * `functionName file:line` labels, so a perf gate can ask for exactly the
+   * functions it is about.
+   */
+  async profile(opts: {
+    durationMs?: number;
+    isSamplingAllocations?: boolean;
+    watch?: string | null;
+    top?: number;
+  }): Promise<ProfileSummary> {
+    const durationMs = opts.durationMs ?? 10_000;
+    const watch =
+      opts.watch && opts.watch.trim() !== ""
+        ? new RegExp(opts.watch, "i")
+        : null;
+    const client = await this.page.createCDPSession();
+    const counterKey = "__voxelizeAgentProfileFrames";
+    try {
+      await client.send("Profiler.enable");
+      await client.send("Profiler.setSamplingInterval", { interval: 200 });
+      if (opts.isSamplingAllocations) {
+        await client.send("HeapProfiler.enable");
+        await client.send("HeapProfiler.startSampling", {
+          samplingInterval: 4096,
+          includeObjectsCollectedByMajorGC: true,
+          includeObjectsCollectedByMinorGC: true,
+        });
+      }
+      // Frames are counted by the page itself: per-frame cost only means
+      // something against the frames the page actually ran.
+      await this.page.evaluate((key) => {
+        const w = window as unknown as Record<string, unknown>;
+        const state = { frames: 0, handle: 0 };
+        const tick = (): void => {
+          state.frames += 1;
+          state.handle = requestAnimationFrame(tick);
+        };
+        state.handle = requestAnimationFrame(tick);
+        w[key] = state;
+      }, counterKey);
+      await client.send("Profiler.start");
+      const startedAt = performance.now();
+      await new Promise((resolve) => setTimeout(resolve, durationMs));
+      const { profile } = await client.send("Profiler.stop");
+      const wallMs = performance.now() - startedAt;
+      const frames = await this.page.evaluate((key) => {
+        const w = window as unknown as Record<string, unknown>;
+        const state = w[key] as { frames: number; handle: number } | undefined;
+        if (!state) return 0;
+        cancelAnimationFrame(state.handle);
+        delete w[key];
+        return state.frames;
+      }, counterKey);
+      let heap: SamplingHeapProfile | null = null;
+      if (opts.isSamplingAllocations) {
+        heap = (await client.send("HeapProfiler.stopSampling"))
+          .profile as SamplingHeapProfile;
+      }
+      return summarizeProfile(profile as CpuProfile, heap, {
+        durationMs: Math.round(wallMs),
+        frames,
+        top: opts.top,
+        watch,
+      });
+    } finally {
+      await client.send("Profiler.disable").catch(() => {});
+      if (opts.isSamplingAllocations) {
+        await client.send("HeapProfiler.disable").catch(() => {});
+      }
+      await client.detach().catch(() => {});
+    }
+  }
+
   async measureFrameRate(
     opts: FrameRateMeasurementOptions & RequestedCaptureViewport = {},
   ): Promise<FrameRateReport> {
@@ -1389,10 +2321,25 @@ export class Agent {
     const durationMs = opts.durationMs ?? 10_000;
     const warmupMs = opts.warmupMs ?? 1_000;
 
-    return this.withPageTimeout(
+    const measurement = await this.withPageTimeout(
       "measureFrameRate",
       durationMs + warmupMs + PAGE_CALL_GRACE_MS,
       () => this.evaluateFrameRateMeasurement(durationMs, warmupMs),
+    );
+    assertUncappedWindow(measurement.drawThrottle, measurement.frameCount);
+    return measurement;
+  }
+
+  /** The page's own report of its draw cap, not the daemon's bookkeeping. */
+  async drawThrottleStatus(): Promise<DrawThrottleStatus> {
+    return this.withPageTimeout("drawThrottle", this.defaultPageTimeoutMs, () =>
+      this.page.evaluate(() => {
+        const bridge = window.__agent__;
+        if (typeof bridge?.drawThrottle !== "function") {
+          return { intervalMs: null, isSupported: false };
+        }
+        return bridge.drawThrottle();
+      }),
     );
   }
 
@@ -1408,6 +2355,36 @@ export class Agent {
           let measurementStartedAt = 0;
           let lastFrameAt = 0;
 
+          // Every frame of the window, warmup included, asks the page for
+          // its cap: one capped frame anywhere refuses the measurement.
+          const bridge = window.__agent__;
+          const readCap = () =>
+            typeof bridge?.drawThrottle === "function"
+              ? bridge.drawThrottle()
+              : null;
+          const firstCap = readCap();
+          const draws: FrameRateMeasurement["drawThrottle"] = {
+            isReported: firstCap !== null && firstCap.isSupported,
+            intervalAtStartMs: firstCap?.intervalMs ?? null,
+            intervalAtEndMs: null,
+            cappedFrames: 0,
+            maxIntervalMs: null,
+            drawnFrames: null,
+          };
+          let drawnAtStart: number | null = null;
+          const observeCap = () => {
+            const cap = readCap();
+            if (cap?.intervalMs != null) {
+              draws.cappedFrames += 1;
+              draws.maxIntervalMs = Math.max(
+                draws.maxIntervalMs ?? 0,
+                cap.intervalMs,
+              );
+            }
+            return cap;
+          };
+          observeCap();
+
           const percentile = (sorted: number[], value: number): number => {
             if (sorted.length === 0) return 0;
             const index = Math.min(
@@ -1418,6 +2395,7 @@ export class Agent {
           };
 
           const tick = (now: number): void => {
+            const cap = observeCap();
             if (warmupStartedAt === 0) {
               warmupStartedAt = now;
               requestAnimationFrame(tick);
@@ -1432,6 +2410,7 @@ export class Agent {
             if (measurementStartedAt === 0) {
               measurementStartedAt = now;
               lastFrameAt = now;
+              drawnAtStart = cap?.drawnFrames ?? null;
               requestAnimationFrame(tick);
               return;
             }
@@ -1442,6 +2421,11 @@ export class Agent {
             if (now - measurementStartedAt < measuredDurationMs) {
               requestAnimationFrame(tick);
               return;
+            }
+
+            draws.intervalAtEndMs = cap?.intervalMs ?? null;
+            if (drawnAtStart !== null && cap?.drawnFrames != null) {
+              draws.drawnFrames = cap.drawnFrames - drawnAtStart;
             }
 
             const elapsedMs = lastFrameAt - measurementStartedAt;
@@ -1472,6 +2456,7 @@ export class Agent {
               p95FrameMs,
               p99FrameMs,
               maxFrameMs,
+              drawThrottle: draws,
             });
           };
 
@@ -1520,49 +2505,50 @@ export class Agent {
       },
     );
 
+    // Subscribes to every bridge the page installs, not just its first: a
+    // host that switches worlds in place installs a new bridge in the same
+    // document. The last one is held weakly, so a bridge the host took down
+    // is never kept alive (with its whole world) by this watcher.
     await this.page.evaluateOnNewDocument(() => {
-      const waitForAgent = () =>
-        new Promise<void>((resolve) => {
-          const check = () => {
-            if (window.__agent__) {
-              resolve();
-              return;
-            }
-            setTimeout(check, 50);
-          };
-          check();
-        });
-
-      waitForAgent().then(() => {
-        const w = window as unknown as {
-          __agent__: {
-            on: (ev: string, cb: (d: unknown) => void) => void;
-          };
-          __agentPushChat__?: (m: unknown) => void;
-          __agentPushEvent__?: (name: string, payload: unknown) => void;
-        };
-
+      type EventBridge = {
+        on: (ev: string, cb: (d: unknown) => void) => void;
+      };
+      const w = window as unknown as {
+        __agent__?: EventBridge;
+        __agentPushChat__?: (m: unknown) => void;
+        __agentPushEvent__?: (name: string, payload: unknown) => void;
+      };
+      const forwardedEvents = [
+        "chunk-loaded",
+        "chunk-unloaded",
+        "entity-spawned",
+        "entity-despawned",
+        "test-result",
+        "test-start",
+        "tick",
+      ];
+      const subscribe = (bridge: EventBridge) => {
         const pushChat = w.__agentPushChat__;
         if (pushChat) {
-          w.__agent__.on("chat", (msg) => pushChat(msg));
+          bridge.on("chat", (msg) => pushChat(msg));
         }
-
-        const forwardedEvents = [
-          "chunk-loaded",
-          "chunk-unloaded",
-          "entity-spawned",
-          "entity-despawned",
-          "test-result",
-          "test-start",
-          "tick",
-        ];
         const pushEvent = w.__agentPushEvent__;
         if (pushEvent) {
           for (const name of forwardedEvents) {
-            w.__agent__.on(name, (data) => pushEvent(name, data));
+            bridge.on(name, (data) => pushEvent(name, data));
           }
         }
-      });
+      };
+      let subscribed: WeakRef<EventBridge> | null = null;
+      const check = () => {
+        const bridge = w.__agent__;
+        if (bridge && bridge !== subscribed?.deref()) {
+          subscribed = new WeakRef(bridge);
+          subscribe(bridge);
+        }
+        setTimeout(check, bridge ? 250 : 50);
+      };
+      check();
     });
   }
 

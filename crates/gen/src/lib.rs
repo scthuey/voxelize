@@ -24,6 +24,8 @@ pub mod field;
 pub mod flora;
 pub mod geology;
 pub mod hydro;
+#[cfg(feature = "unstable-landscape")]
+pub mod landscape;
 pub mod lane;
 pub mod mosaic;
 pub mod noise;
@@ -71,11 +73,12 @@ pub use spec::{
 };
 pub use stages::install;
 pub use stream::{
-    cell_id, fnv1a_64, hash_unit, mix64, stream_seed, HashStream, SaltPath, Subsystem,
+    cell_id, fnv1a_64, hash_unit, mix64, stream_seed, stream_seed_bytes, stream_seed_lane,
+    HashStream, SaltPath, Subsystem, FIRST_LAYER_LANE,
 };
 pub use structures::{
-    AdaptationSpec, Dir4, PieceBuilder, PieceDef, PlacementConstraint, PlacementPolicy, Pool,
-    PopulatePhase, RejectionReason, RejectionStats, Socket, StructureMember, StructurePlan,
-    StructureSetSpec, StructureSource, TerrainView,
+    AdaptationSpec, Dir4, PieceBuilder, PieceCellState, PieceDef, PlacementConstraint,
+    PlacementPolicy, Pool, PopulatePhase, RejectionReason, RejectionStats, Socket, StructureMember,
+    StructurePlan, StructureSetSpec, StructureSource, TerrainView,
 };
 pub use surface::{SurfaceCond, SurfaceRule, SurfaceSpec, SurfaceTable};

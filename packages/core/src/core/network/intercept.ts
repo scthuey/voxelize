@@ -36,4 +36,21 @@ export interface NetIntercept {
    * sent to the server after every `network.flush()` call.
    */
   packets?: MessageProtocol[];
+
+  /**
+   * Called by `network.flush()` with the packets from `packets` that were
+   * actually handed to an open socket, right after they were. A packet
+   * queued in `packets` may wait for the next flush and for the main thread
+   * to be free; this is where a sender learns when it truly left.
+   */
+  onPacketsSent?: (packets: MessageProtocol[]) => void;
+
+  /**
+   * True while this intercept is waiting on what arrives next and nothing
+   * it draws could be stalled by handling it at once (a world waiting on
+   * its spawn window). The network then decodes each packet on its own
+   * thread the moment it arrives instead of in a decode worker on its next
+   * sync tick. Polled per packet, so it must be cheap.
+   */
+  wantsMessagesOnArrival?: () => boolean;
 }

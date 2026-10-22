@@ -1,10 +1,14 @@
 pub mod mesher;
 
 pub use mesher::{
-    compute_section_connectivity, connectivity_pair_bit, mesh_chunk, mesh_chunk_with_registry,
-    mesh_chunk_with_registry_chunks, mesh_space_greedy, Block, ChunkData, GeometryProtocol,
-    MeshConfig, MeshInput, MeshInputNoRegistry, MeshOutput, Registry, CONNECTIVITY_FACES,
-    CONNECTIVITY_FULL, CONNECTIVITY_SEALED,
+    branch_cell, branch_layout_at, compute_section_connectivity, connectivity_pair_bit, mesh_chunk,
+    mesh_chunk_with_registry, mesh_chunk_with_registry_chunks, mesh_space_greedy, Block,
+    BranchBeyond, BranchBlocks, BranchCell, BranchKind, BranchLayout, BranchPart, BranchPartKind,
+    BranchQuad, BranchSeat, BranchShape, BranchSide, BranchSocket, BranchTexture, ChunkData,
+    ConnectedFrame, GeometryProtocol, MeshConfig, MeshInput, MeshInputNoRegistry, MeshOutput,
+    Registry, StageFaces, Tufts, TUFTS_FACE_NAME, WideBranchBits, WideBranchSection, WideCell, CONNECTIVITY_FACES,
+    CONNECTIVITY_FULL,
+    CONNECTIVITY_SEALED, VOXEL_NEIGHBORS,
 };
 
 pub use voxelize_core::{

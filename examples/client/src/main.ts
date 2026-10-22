@@ -12,6 +12,7 @@ import * as THREE from "three";
 
 import "@voxelize/core/styles.css"; //? For official use, you should do `@voxelize/core/styles.css` instead.
 
+import { critters } from "./critters";
 import LolImage from "./assets/lol.png";
 import {
   BOT_HEAD_COLOR,
@@ -34,6 +35,11 @@ const world = new VOXELIZE.World({
   textureUnitDimension: 8,
   // Sized for the local-lights benchmark scenes (10k registered emitters).
   localLights: { maxRegisteredLights: 12288 },
+  // `?transparency=sorted` draws the sorted pipeline instead, for A/B.
+  orderIndependentTransparency:
+    new URLSearchParams(window.location.search).get("transparency") === "sorted"
+      ? null
+      : VOXELIZE.defaultOrderIndependentTransparencyOptions,
 });
 // actual world setup code handled later after network and world are initialized
 
@@ -546,6 +552,7 @@ const shadowCasters: THREE.Object3D[] = [];
 const collectShadowCasters = () => {
   shadowCasters.length = 0;
   peers.collectShadowCasters(shadowCasters);
+  shadowCasters.push(...roster.listShadowCasterPools());
   entities.map.forEach((entity) => {
     const caster = (entity as { shadowCaster?: THREE.Object3D }).shadowCaster;
     if (caster) shadowCasters.push(caster);
@@ -791,9 +798,10 @@ const frameStats = () => {
         const mesh = object as THREE.Mesh;
         if (!mesh.isMesh) return;
         const material = mesh.material as THREE.Material;
-        if (toLegacy && legacyOf.has(material)) {
+        const legacy = legacyOf.get(material);
+        if (toLegacy && legacy) {
           mesh.userData.__parityOriginal = material;
-          mesh.material = legacyOf.get(material)!;
+          mesh.material = legacy;
         } else if (!toLegacy && mesh.userData.__parityOriginal) {
           mesh.material = mesh.userData.__parityOriginal;
           delete mesh.userData.__parityOriginal;
@@ -868,7 +876,8 @@ const frameStats = () => {
       const canvas = document.createElement("canvas");
       canvas.width = size;
       canvas.height = size;
-      const ctx = canvas.getContext("2d")!;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("parity harness: no 2d context for the PNG");
       const image = ctx.createImageData(size, size);
       // GL readback is bottom-up; PNGs are top-down.
       for (let row = 0; row < size; row++) {
@@ -1037,6 +1046,8 @@ const frameStats = () => {
   clearPigs: () => method.call("clear-pigs", {}),
   spawnFauna: (x: number, y: number, z: number, count = 1) =>
     method.call("spawn-fauna", { position: [x, y, z], count }),
+  spawnCritters: (x: number, y: number, z: number, count = 12) =>
+    method.call("spawn-critter", { position: [x, y, z], count }),
   toggleAtlasViewer: (x: number, y: number, z: number, size = 6) =>
     toggleAtlasViewer(x, y, z, size),
   setPerspective: (state: "first" | "second" | "third") => {
@@ -1750,6 +1761,12 @@ entities.setClass("drop", Drop);
 entities.setClass("pig", Pig);
 entities.setClass("sheep", Sheep);
 
+// Instanced entity families: the roster owns their pools (one draw call per
+// variant), and each family registers its entity class for its type.
+const roster = new VOXELIZE.InstancedEntityRoster();
+world.add(roster);
+critters.install({ entities, roster, world, lightAt: lightShined.lightAt });
+
 world.add(entities);
 
 events.on("test", (payload) => {
@@ -1912,6 +1929,7 @@ const update = () => {
   );
 
   entities.update();
+  roster.update(1 / 60, renderer);
 
   peers.update();
   debug.update();
@@ -1921,6 +1939,8 @@ let isFocused = true;
 
 const composer = new EffectComposer(renderer);
 composer.addPass(new RenderPass(world, camera));
+// The blended layers accumulate against the scene's own depth.
+composer.createDepthTexture();
 
 const overlayEffect = new VOXELIZE.BlockOverlayEffect(world, camera);
 overlayEffect.addOverlay("water", new THREE.Color("#5F9DF7"), 0.001);
@@ -1934,8 +1954,10 @@ const animate = () => {
   // plus the local-light atlas) exactly the way a production host does.
   if (world.isInitialized && SHADOWS_ENABLED) {
     world.updateShaderLighting(camera, controls.object.position);
+    roster.updateShadowUniforms(world.chunkRenderer.shaderLightingUniforms);
     world.renderShadowMaps(renderer, collectShadowCasters());
   }
+  if (world.isInitialized) world.prepareTransparency(renderer, camera);
   composer.render();
   renderer.clearDepth();
   renderer.render(armScene, armCamera);

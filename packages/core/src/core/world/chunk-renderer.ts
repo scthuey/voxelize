@@ -1,5 +1,6 @@
 import {
   Color,
+  DataTexture,
   FramebufferTexture,
   LinearFilter,
   Matrix4,
@@ -12,6 +13,12 @@ import {
 } from "three";
 
 import { CustomChunkShaderMaterial } from "./chunk-materials";
+import {
+  createSurfaceWeatherUniforms,
+  type SurfaceWeatherUniforms,
+} from "./surface-weather";
+import { makeWaterNormalTexture } from "./water-normal-texture";
+import { WATER_OPTICS } from "./water-optics";
 
 export function makeSceneColorTexture(width = 1, height = 1, isSRGB = false) {
   const texture = new FramebufferTexture(width, height);
@@ -34,7 +41,19 @@ export function makeSceneColorTexture(width = 1, height = 1, isSRGB = false) {
 }
 
 export interface ShaderLightingUniforms {
+  /**
+   * The shading light: held above a minimum elevation, tilted off the sun's
+   * plane, and blended toward the moon through twilight, so terrain shading
+   * and shadows stay readable at every hour. Not where the sun is drawn.
+   */
   sunDirection: { value: Vector3 };
+  /**
+   * The celestial disc above the horizon as the sky box actually draws it
+   * (`getVisibleDiscDirection`): the sun by day, the moon by night, never
+   * clamped or tilted. Specular reflections read this, so the sun on the
+   * water sits under the sun in the sky.
+   */
+  celestialDirection: { value: Vector3 };
   sunColor: { value: Color };
   ambientColor: { value: Color };
   shadowMap0: { value: Texture | null };
@@ -54,11 +73,42 @@ export interface ShaderLightingUniforms {
   shadowSideFaceBiasScale: { value: number };
   shadowStrength: { value: number };
   sunlightIntensity: { value: number };
+  /**
+   * The share of the sun (the moon by night) that reaches the world as a
+   * direct beam, 0..1: 1 under a clear sky, falling as cloud veils the
+   * disc. What only a beam draws (glints on water, caustics, the disc seen
+   * through the surface from below) scales by it; diffuse daylight
+   * (`sunlightIntensity`) does not. The engine leaves it at 1; a host with
+   * weather lowers it.
+   */
+  directSunlight: { value: number };
   waterTint: { value: Color };
   waterAbsorption: { value: number };
   waterLevel: { value: number };
   waterStreakStrength: { value: number };
   waterFresnelStrength: { value: number };
+  /** 0..1 scale on the caustic net seen on submerged faces from below. */
+  bedCausticScale: { value: number };
+  /**
+   * The surface's underside while submerged: 0 off, 1 one continuous
+   * rippled ceiling the scene above shows through most straight up, 2 the
+   * texel-stepped window and caustic web, 3 the clear Snell window over a
+   * calm mirror (2 and 3 kept for A/B captures).
+   */
+  surfaceUndersideScale: { value: number };
+  /**
+   * Style 1's ceiling, live-tunable: x film brightness against the water's
+   * scatter colour, y the share of the scene above shown straight up, z the
+   * power of the cosine it falls off with toward grazing, w the ripples'
+   * light-and-shade on the film. Defaults are `WATER_OPTICS.underside*`.
+   */
+  surfaceUndersideTuning: { value: Vector4 };
+  /**
+   * 1 draws the water surface per 1/16-block texel (ripples sampled at
+   * texel centres, fresnel and glint in three flat steps); 0 the earlier
+   * smooth surface, for A/B.
+   */
+  waterSurfaceCrisp: { value: number };
   skyTopColor: { value: Color };
   skyMiddleColor: { value: Color };
   shadowDebugMode: { value: number };
@@ -72,6 +122,10 @@ export class ChunkRenderer {
     fogNear: { value: number };
     fogFar: { value: number };
     ao: { value: Vector4 };
+    stageTints: { value: Float32Array };
+    /** The colour table: 16 linear RGB multipliers a face with a pigment
+     * mask takes by its voxel stage. Entry 0 is the untinted material. */
+    pigmentTints: { value: Float32Array };
     faceShades: { value: Vector4 };
     minLightLevel: { value: number };
     baseAmbient: { value: number };
@@ -82,6 +136,8 @@ export class ChunkRenderer {
     showGreedyDebug: { value: number };
     fogHeightOrigin: { value: number };
     fogHeightDensity: { value: number };
+    /** 0..1 blend from horizontal to true 3D fog distance (caves). */
+    fogVerticalBlend: { value: number };
     windDirection: { value: Vector2 };
     windOffset: { value: Vector2 };
     windSpeed: { value: number };
@@ -94,23 +150,74 @@ export class ChunkRenderer {
     skyFogExponent2: { value: number };
     skyFogDimension: { value: number };
     skyFogStrength: { value: number };
-    sceneColor: { value: FramebufferTexture };
+    /**
+     * The sky's own light, the same objects the sky dome draws with
+     * (`Sky.glow`), so every fogged surface glows toward the sun and moon
+     * exactly as the sky behind it does. Black adds nothing.
+     */
+    skyGlowSunDirection: { value: Vector3 };
+    skyGlowColor: { value: Color };
+    skySunHaloColor: { value: Color };
+    skyMoonHaloColor: { value: Color };
+    skySunDiscColor: { value: Color };
+    skyMoonDiscColor: { value: Color };
+    skyDiscRadii: { value: Vector2 };
+    /**
+     * What the water refracts: a copy of the frame drawn before it, or with
+     * order-independent transparency the scene target's own colour, read
+     * while the blended layers draw elsewhere.
+     */
+    sceneColor: { value: Texture };
     sceneTextureSize: { value: Vector2 };
     waterRefractionReady: { value: number };
+    /**
+     * The depth of the water near the panes in view, and how to read it
+     * (`WaterDepthPass`): which side of the water each pane fragment draws.
+     */
+    waterDepth: { value: Texture | null };
+    waterDepthState: { value: number };
+    waterDepthViewport: { value: Vector2 };
+    waterDepthClip: { value: Vector2 };
+    /**
+     * Behind each pixel, the nearest place the water near the panes ends
+     * (`WaterDepthPass`), and the frame's own depth as the water starts to
+     * draw: the two ends of the run of water a tank window shows.
+     */
+    waterExitDepth: { value: Texture | null };
+    waterExitReady: { value: number };
+    sceneDepth: { value: Texture | null };
+    sceneDepthReady: { value: number };
     waterRefractionStrength: { value: number };
+    waterNormalMap: { value: DataTexture };
     cameraSubmersion: { value: number };
     cameraWaterPlaneY: { value: number };
     underwaterAmbient: { value: Color };
-  } = {
+    underwaterViewScale: { value: number };
+    /**
+     * The far layer's chunk-coverage mask and its placement, written by
+     * `FarTerrain`: chunk fragments read them to yield their outer half
+     * chunk to the far layer across a dithered band. See far-terrain-seam.
+     */
+    farCoverMask: { value: Texture | null };
+    /** x, y: mask origin in chunk columns; z: blocks per chunk; w: texels per side. */
+    farCover: { value: Vector4 };
+    /** The seam band's ramp scale; 0 keeps the loaded edge hard. */
+    farSeam: { value: number };
+  } & SurfaceWeatherUniforms = {
+    // Weather on surfaces (surface-weather.ts): off until a host sets it.
+    ...createSurfaceWeatherUniforms(),
     fogColor: { value: new Color("#B1CCFD") },
     fogNear: { value: 100 },
     fogFar: { value: 200 },
     fogHeightOrigin: { value: 80 },
     fogHeightDensity: { value: 0.005 },
+    fogVerticalBlend: { value: 0 },
     windDirection: { value: new Vector2(0.7, 0.7) },
     windOffset: { value: new Vector2(0, 0) },
     windSpeed: { value: 1.0 },
     ao: { value: new Vector4(45.0, 105.0, 180.0, 255.0) },
+    stageTints: { value: new Float32Array(16 * 3).fill(1) },
+    pigmentTints: { value: new Float32Array(16 * 3).fill(1) },
     faceShades: { value: new Vector4(0.7, 0.85, 0.62, 1.0) },
     minLightLevel: { value: 0.04 },
     baseAmbient: { value: 0.005 },
@@ -119,6 +226,9 @@ export class ChunkRenderer {
     lightIntensityAdjustment: { value: 0.8 },
     atlasSize: { value: 16 },
     showGreedyDebug: { value: 0 },
+    farCoverMask: { value: null },
+    farCover: { value: new Vector4(0, 0, 16, 1) },
+    farSeam: { value: 0 },
     skyFogTopColor: { value: new Color(0.4, 0.6, 0.9) },
     skyFogMiddleColor: { value: new Color(0.7, 0.8, 0.95) },
     skyFogBottomColor: { value: new Color(0.15, 0.18, 0.25) },
@@ -128,17 +238,39 @@ export class ChunkRenderer {
     skyFogExponent2: { value: 1.2 },
     skyFogDimension: { value: 2000 },
     skyFogStrength: { value: 1.0 },
+    skyGlowSunDirection: { value: new Vector3(0, 1, 0) },
+    skyGlowColor: { value: new Color(0, 0, 0) },
+    skySunHaloColor: { value: new Color(0, 0, 0) },
+    skyMoonHaloColor: { value: new Color(0, 0, 0) },
+    skySunDiscColor: { value: new Color(0, 0, 0) },
+    skyMoonDiscColor: { value: new Color(0, 0, 0) },
+    skyDiscRadii: { value: new Vector2(0.07, 0.07) },
     sceneColor: { value: makeSceneColorTexture() },
     sceneTextureSize: { value: new Vector2(1, 1) },
     waterRefractionReady: { value: 0 },
+    waterDepth: { value: null },
+    waterDepthState: { value: 0 },
+    waterDepthViewport: { value: new Vector2(1, 1) },
+    waterDepthClip: { value: new Vector2(0.1, 1000) },
+    waterExitDepth: { value: null },
+    waterExitReady: { value: 0 },
+    sceneDepth: { value: null },
+    sceneDepthReady: { value: 0 },
     waterRefractionStrength: { value: 0.08 },
+    // Baked once per world, at construction: measured 20-30ms of CPU, in
+    // the load phase, shared by every fluid material.
+    waterNormalMap: {
+      value: makeWaterNormalTexture(WATER_OPTICS.surfaceNormalTexture),
+    },
     cameraSubmersion: { value: 0 },
     cameraWaterPlaneY: { value: 0 },
     underwaterAmbient: { value: new Color(0, 0, 0) },
+    underwaterViewScale: { value: 1 },
   };
 
   public shaderLightingUniforms: ShaderLightingUniforms = {
     sunDirection: { value: new Vector3(0.5, 1.0, 0.3).normalize() },
+    celestialDirection: { value: new Vector3(0.5, 1.0, 0.0).normalize() },
     sunColor: { value: new Color(1.0, 0.98, 0.9) },
     ambientColor: { value: new Color(0.15, 0.17, 0.2) },
     shadowMap0: { value: null },
@@ -158,11 +290,23 @@ export class ChunkRenderer {
     shadowSideFaceBiasScale: { value: 1.0 },
     shadowStrength: { value: 1.0 },
     sunlightIntensity: { value: 1.0 },
+    directSunlight: { value: 1.0 },
     waterTint: { value: new Color("#1F8BD8") },
     waterAbsorption: { value: 1 },
     waterLevel: { value: 86 },
     waterStreakStrength: { value: 0.1 },
     waterFresnelStrength: { value: 0.5 },
+    bedCausticScale: { value: 1 },
+    surfaceUndersideScale: { value: 1 },
+    waterSurfaceCrisp: { value: 1 },
+    surfaceUndersideTuning: {
+      value: new Vector4(
+        WATER_OPTICS.undersideFilmScale,
+        WATER_OPTICS.undersideTransmitOverhead,
+        WATER_OPTICS.undersideTransmitFalloff,
+        WATER_OPTICS.undersideRippleShade,
+      ),
+    },
     skyTopColor: { value: new Color(0.4, 0.6, 0.9) },
     skyMiddleColor: { value: new Color(0.7, 0.8, 0.95) },
     shadowDebugMode: { value: 0 },

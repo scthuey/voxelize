@@ -45,6 +45,9 @@ const makeStats = (): LocalLightStats => ({
   scanMsPeak: 0,
   sectionsPendingScan: 0,
   selectionChurn: 0,
+  fadingSlots: 0,
+  fadingLights: 0,
+  highResolution: 0,
   gridTextureUploads: 0,
   dataTextureUploads: 0,
   shadowed: 0,
@@ -74,12 +77,18 @@ const shadowLight = (
   ...overrides,
 });
 
-const makeScheduler = (registry: LightSourceRegistry, maxShadowedLights = 2) =>
+const makeScheduler = (
+  registry: LightSourceRegistry,
+  maxShadowedLights = 2,
+  options: { temporalStability?: boolean; now?: () => number } = {},
+) =>
   new LocalShadowScheduler(registry, {
     maxShadowedLights,
     shadowAtlasSize: 2048,
     shadowSlotSize: 256,
     shadowEvictionHysteresis: { ratio: 1.25, frames: 5 },
+    shadowFadeMs: 320,
+    ...options,
   });
 
 const indexOf = (registry: LightSourceRegistry, handle: number) =>
@@ -305,7 +314,7 @@ describe("LocalShadowScheduler", () => {
 
   it("evicts only after the challenger sustains its lead (hysteresis)", () => {
     const registry = new LightSourceRegistry(16);
-    const scheduler = makeScheduler(registry, 1);
+    const scheduler = makeScheduler(registry, 1, { temporalStability: false });
     const stats = makeStats();
 
     // Holder: modest light near the camera. Challenger: far brighter.
@@ -323,13 +332,107 @@ describe("LocalShadowScheduler", () => {
         scheduler.recordForIndex(indexOf(registry, holder)),
       ).not.toBeNull();
     }
-    // Fifth frame: swap.
+    // Fifth frame: swap (the legacy frame hands over at once).
     scheduler.update(selection, 2, 0, 60, 0, stats);
     expect(scheduler.recordForIndex(indexOf(registry, holder))).toBeNull();
     expect(
       scheduler.recordForIndex(indexOf(registry, challenger)),
     ).not.toBeNull();
     expect(stats.atlasEvictions).toBe(1);
+  });
+
+  it("fades a shadow in once its faces exist and out before handing it over", () => {
+    const registry = new LightSourceRegistry(16);
+    let clock = 0;
+    const scheduler = makeScheduler(registry, 1, { now: () => clock });
+    const stats = makeStats();
+    const frame = (selection: Uint32Array, count: number) => {
+      clock += 16;
+      scheduler.update(selection, count, 0, 60, 0, stats);
+    };
+    const anyScheduler = scheduler as unknown as {
+      slots: { staticPending: number; staticMask: number }[];
+    };
+    const weightOf = (handle: number) =>
+      scheduler.recordForIndex(indexOf(registry, handle))?.weight ?? -1;
+
+    const holder = registry.add(shadowLight({ intensity: 1 }), 6, 60, 0);
+    const alone = selectionOf(registry, [holder]);
+    frame(alone, 1);
+    // No faces yet: nothing to show, and the weight waits for them.
+    expect(weightOf(holder)).toBe(0);
+    frame(alone, 1);
+    expect(weightOf(holder)).toBe(0);
+    // Faces land: the shadow fades in over shadowFadeMs, never at once.
+    anyScheduler.slots[0].staticPending = 0;
+    anyScheduler.slots[0].staticMask = 0b111111;
+    frame(alone, 1);
+    expect(weightOf(holder)).toBeGreaterThan(0);
+    expect(weightOf(holder)).toBeLessThan(0.1);
+    for (let n = 0; n < 30; n++) frame(alone, 1);
+    expect(weightOf(holder)).toBe(1);
+
+    // A much brighter challenger wins after the hysteresis frames, but the
+    // holder keeps its slot while its shadow fades out.
+    const challenger = registry.add(shadowLight({ intensity: 10 }), 0, 60, 6);
+    const both = selectionOf(registry, [holder, challenger]);
+    for (let n = 0; n < 5; n++) frame(both, 2);
+    const fading = weightOf(holder);
+    expect(fading).toBeGreaterThan(0.8);
+    expect(fading).toBeLessThan(1);
+    expect(stats.atlasEvictions).toBe(0);
+    let previous = fading;
+    for (let n = 0; n < 40 && weightOf(holder) >= 0; n++) {
+      frame(both, 2);
+      const weight = weightOf(holder);
+      if (weight >= 0) {
+        expect(weight).toBeLessThanOrEqual(previous);
+        // One frame never removes more than a frame's share of the shadow.
+        expect(previous - weight).toBeLessThan(0.06);
+        previous = weight;
+      }
+    }
+    // Handed over once gone: the challenger starts from zero.
+    expect(scheduler.recordForIndex(indexOf(registry, holder))).toBeNull();
+    expect(weightOf(challenger)).toBe(0);
+    expect(stats.atlasEvictions).toBe(1);
+  });
+
+  it("keeps sampling a light's last map while an invalidated face re-renders", () => {
+    // A remesh inside a torch's range re-renders its faces; until each one
+    // lands the old map keeps its shadows. Blanking it lit every shadowed
+    // corner until the budgeted FIFO caught up: a flash per nearby remesh.
+    const registry = new LightSourceRegistry(16);
+    const stable = makeScheduler(registry, 1);
+    const legacy = makeScheduler(registry, 1, { temporalStability: false });
+    const light = registry.add(shadowLight({ range: 10 }), 0, 60, 0);
+    for (const scheduler of [stable, legacy]) {
+      scheduler.update(
+        selectionOf(registry, [light]),
+        1,
+        0,
+        60,
+        0,
+        makeStats(),
+      );
+      const anyScheduler = scheduler as unknown as {
+        slots: { staticPending: number; staticMask: number }[];
+      };
+      anyScheduler.slots[0].staticPending = 0;
+      anyScheduler.slots[0].staticMask = 0b111111;
+      scheduler.notifyChunkMeshed({
+        minX: 0,
+        minZ: 0,
+        maxX: 16,
+        maxZ: 16,
+        maxHeight: 256,
+      });
+      expect(anyScheduler.slots[0].staticPending).toBe(0b111111);
+    }
+    expect(stable.recordForIndex(indexOf(registry, light))?.staticMask).toBe(
+      0b111111,
+    );
+    expect(legacy.recordForIndex(indexOf(registry, light))?.staticMask).toBe(0);
   });
 
   it("invalidates cached maps only for edits inside a light's range", () => {
@@ -864,7 +967,7 @@ describe("fluid local-light fallback (shader source)", () => {
     expect(specularBody).toContain("uLocalMaskKnee");
     expect(specularBody).toContain("llOcclusion");
     expect(SHADER_LIGHTING_FLUID_CHUNK_SHADERS.fragment).toContain(
-      "localLightSpecular(wPos, waterNormal, viewDir, vLight.rgb)",
+      "localLightSpecular(wPos, waterNormal, viewDir, voxelLight.rgb)",
     );
     expect(SHADER_LIGHTING_FLUID_CHUNK_SHADERS.fragment).toContain(
       "vIsFluid > 0.5",
@@ -901,7 +1004,12 @@ describe("world-cell caster exclusion (stamped-silhouette regression)", () => {
   // moment of every render call — the exact instant a caster would rasterize
   // into a cached cell.
   const makeVisibilityRenderer = (watch: Object3D[]) => {
-    const renders: { scene: unknown; visibleAtRender: boolean[] }[] = [];
+    const renders: {
+      scene: unknown;
+      visibleAtRender: boolean[];
+      parentsAtRender: (Object3D | null)[];
+      childrenAtRender: Object3D[];
+    }[] = [];
     let target: unknown = null;
     const renderer = {
       getRenderTarget: () => target,
@@ -909,10 +1017,12 @@ describe("world-cell caster exclusion (stamped-silhouette regression)", () => {
         target = t;
       },
       clear: () => {},
-      render: (scene: unknown) => {
+      render: (scene: Object3D) => {
         renders.push({
           scene,
           visibleAtRender: watch.map((object) => object.visible),
+          parentsAtRender: watch.map((object) => object.parent),
+          childrenAtRender: [...scene.children],
         });
       },
     } as unknown as WebGLRenderer;
@@ -947,16 +1057,50 @@ describe("world-cell caster exclusion (stamped-silhouette regression)", () => {
     for (const pass of worldPasses) {
       expect(pass.visibleAtRender).toEqual([false, false]);
     }
-    // The overlay pass still renders the caster (reparented, visible).
-    const overlayPasses = renders.filter(
-      (r) => r.scene !== scene && r.scene !== pool,
-    );
-    expect(overlayPasses.length).toBe(1);
+    // The overlay still draws the caster, visible, then the pool: two
+    // borrowed lists, and neither ever leaves the world scene.
+    const overlayPasses = renders.filter((r) => r.scene !== scene);
+    expect(overlayPasses.length).toBe(2);
+    expect(overlayPasses[0].childrenAtRender).toEqual([caster]);
     expect(overlayPasses[0].visibleAtRender[0]).toBe(true);
+    expect(overlayPasses[1].childrenAtRender).toEqual([pool]);
+    for (const pass of renders) {
+      expect(pass.parentsAtRender).toEqual([scene, scene]);
+    }
 
     // Exact scene state restored afterward.
     expect(caster.visible).toBe(true);
     expect(pool.visible).toBe(true);
+    expect(caster.parent).toBe(scene);
+    expect(scene.children).toEqual([caster, pool]);
+  });
+
+  it("keeps the old reparenting overlay behind the A/B switch", () => {
+    const registry = new LightSourceRegistry(16);
+    const scheduler = makeScheduler(registry);
+    scheduler.isBorrowingCasters = false;
+    const stats = makeStats();
+    const lamp = registry.add(shadowLight(), 4, 60, 4);
+    scheduler.update(selectionOf(registry, [lamp]), 1, 0, 60, 0, stats);
+
+    const scene = new Scene();
+    const caster = new Object3D();
+    caster.position.set(8, 60, 4);
+    scene.add(caster);
+    const pool = new Group();
+    scene.add(pool);
+
+    const { renders, renderer } = makeVisibilityRenderer([caster, pool]);
+    const ledger = new ShadowFrameLedger();
+    ledger.beginFrame(100);
+    scheduler.render(renderer, scene, ledger, [caster], [pool], [], stats);
+
+    const overlayPasses = renders.filter(
+      (r) => r.scene !== scene && r.scene !== pool,
+    );
+    expect(overlayPasses.length).toBe(1);
+    expect(overlayPasses[0].parentsAtRender[0]).not.toBe(scene);
+    expect(renders.filter((r) => r.scene === pool).length).toBe(1);
     expect(caster.parent).toBe(scene);
   });
 
@@ -1284,11 +1428,14 @@ describe("holder occlusion composition (top-down leak regression)", () => {
     // ceiling-mounted lamp pours full unoccluded light through the roof
     // above it: the giant colored top-down patches. Composing keeps the
     // mask as the conservative floor and lets the maps refine it.
-    expect(LOCAL_LIGHTS_FUNCTIONS).toMatch(
-      /llOcclusion \*= localLightShadow\(/,
-    );
+    // The response a slot lights with already carries the mask
+    // (localLightResponse); the slot loop multiplies the atlas onto it.
+    expect(LOCAL_LIGHTS_FUNCTIONS).toMatch(/llLit \*= localLightShadow\(/);
     expect(LOCAL_LIGHTS_FUNCTIONS).not.toMatch(
-      /llOcclusion = localLightShadow\(/,
+      /(llOcclusion|llLit) = localLightShadow\(/,
+    );
+    expect(LOCAL_LIGHTS_FUNCTIONS).toMatch(
+      /return llT1\.rgb \* \([^)]*llOcclusion/,
     );
     // The masked bit must gate holders too (set for static shadow
     // requesters), or the composition has no mask to stand on.
@@ -1365,7 +1512,7 @@ describe("top-down hub camera sweep (exact-coordinate regression)", () => {
 
     const stats = makeStats();
     const raw = grid as unknown as {
-      gridData: Uint8Array;
+      gridData: Uint16Array;
       lightData: Float32Array;
     };
     const sample = {
@@ -1401,10 +1548,12 @@ describe("top-down hub camera sweep (exact-coordinate regression)", () => {
             }
           }
           for (let n = 0; n < raw.gridData.length; n++) {
-            // Every nonzero grid byte is a 1-based reference into the
+            // Every nonzero slot's low byte is a 1-based reference into the
             // packed records; a reference past the live count would read
             // garbage rows in the shader — colored patches from nowhere.
-            expect(raw.gridData[n]).toBeLessThanOrEqual(grid.selectedCount);
+            expect(raw.gridData[n] & 0xff).toBeLessThanOrEqual(
+              grid.packedCount,
+            );
           }
 
           // Roof-plane probe: with the flood sealed (mask 0), no mounted

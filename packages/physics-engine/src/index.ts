@@ -8,6 +8,13 @@ function approxEquals(a: number, b: number) {
   return Math.abs(a - b) < 1e-5;
 }
 
+/**
+ * Numeric slop granted on top of `stepHeight` when deciding whether an
+ * obstruction is climbable. Bodies rest an epsilon above surfaces, so a
+ * step exactly `stepHeight` tall measures a hair over it.
+ */
+const STEP_HEIGHT_SLOP = 1e-3;
+
 export type BodyOptions = {
   aabb: AABB;
   mass: number;
@@ -17,6 +24,14 @@ export type BodyOptions = {
   onStep: (newAABB: AABB, resting: number[]) => void;
   onCollide: (impacts?: number[]) => void;
   stepHeight: number;
+  /**
+   * Along-face to into-face motion ratio above which contact with an
+   * obstruction counts as grazing: the body slides along it instead of
+   * auto-stepping onto it. `4` skips approaches shallower than ~14°, so
+   * brushing a ledge while walking past it does not pop the body onto it.
+   * `0` disables the check and any blocked contact attempts a step.
+   */
+  stepGrazeRatio: number;
 };
 
 export type EngineOptions = {
@@ -25,6 +40,25 @@ export type EngineOptions = {
   airDrag: number;
   fluidDrag: number;
   fluidDensity: number;
+};
+
+/**
+ * The first voxel a box would touch travelling along a vector.
+ */
+export type SweepHit = {
+  /** Distance travelled before contact. */
+  distance: number;
+  /** Axis of the face hit: 0 = x, 1 = y, 2 = z. */
+  axis: number;
+  /** Sign of travel along that axis at contact. */
+  dir: number;
+  /** Voxel coordinates of the block hit. */
+  voxel: number[];
+  /**
+   * World-space top of the tallest collision box in that voxel, or of the
+   * voxel's barrier when that stands higher (see {@link Engine.voxelTop}).
+   */
+  top: number;
 };
 
 export class Engine {
@@ -39,6 +73,17 @@ export class Engine {
     private getVoxelStage: (vx: number, vy: number, vz: number) => number,
     private getFluidFlowForce: (vx: number, vy: number, vz: number) => number,
     public options: EngineOptions,
+    /**
+     * World-space top of a voxel's barrier: how high other bodies (a
+     * server's simulated ones) find it standing, above the boxes `getVoxel`
+     * gives these. `-Infinity` where the voxel has none. These bodies never
+     * collide with it; only {@link Engine.voxelTop} reads it.
+     */
+    private getBarrierTop: (
+      vx: number,
+      vy: number,
+      vz: number,
+    ) => number = () => -Infinity,
   ) {}
 
   addBody = (options: Partial<BodyOptions>) => {
@@ -49,6 +94,7 @@ export class Engine {
       restitution: 0,
       gravityMultiplier: 1,
       stepHeight: 0.0,
+      stepGrazeRatio: 4.0,
     };
 
     const {
@@ -58,6 +104,7 @@ export class Engine {
       restitution,
       gravityMultiplier,
       stepHeight,
+      stepGrazeRatio,
       onStep,
       onCollide,
     } = {
@@ -75,6 +122,7 @@ export class Engine {
       onStep,
       onCollide,
     );
+    b.stepGrazeRatio = stepGrazeRatio;
     this.bodies.push(b);
     return b;
   };
@@ -156,6 +204,7 @@ export class Engine {
     let drag = body.airDrag >= 0 ? body.airDrag : this.options.airDrag;
     if (body.inFluid) {
       drag = body.fluidDrag >= 0 ? body.fluidDrag : this.options.fluidDrag;
+      drag *= body.fluidDragMultiplier;
       drag *= 1 - (1 - body.ratioInFluid) ** 2;
     }
     const mult = Math.max(1 - (drag * dt) / body.mass, 0);
@@ -406,6 +455,25 @@ export class Engine {
     return result.length === 0;
   };
 
+  /**
+   * The height of the fluid's surface over the column `applyFluidForces`
+   * reads for `box` (the one under its minimum corner), climbing the fluid
+   * from its feet: `null` when its feet are not in fluid, `Infinity` when
+   * the fluid still goes on `reach` blocks above its top.
+   */
+  fluidSurfaceOver = (box: AABB, reach: number): number | null => {
+    const cx = Math.floor(box.minX);
+    const cz = Math.floor(box.minZ);
+    let cy = Math.floor(box.minY);
+    if (!this.testFluid(cx, cy, cz)) return null;
+    const limit = box.maxY + reach;
+    while (this.testFluid(cx, cy + 1, cz)) {
+      cy++;
+      if (cy >= limit) return Infinity;
+    }
+    return cy + 1;
+  };
+
   applyFluidForces = (body: RigidBody) => {
     const box = body.aabb;
     const cx = Math.floor(box.minX);
@@ -462,14 +530,18 @@ export class Engine {
         -body.mass *
         this.options.gravity[1] *
         effectiveGravityMult *
-        ratioInFluid;
+        ratioInFluid *
+        body.fluidBuoyancyMultiplier;
       body.applyForce([0, neutralBuoyancyY, 0]);
     } else {
       const vol =
         (box.maxX - box.minX) * (box.maxY - box.minY) * (box.maxZ - box.minZ);
       const displaced = vol * ratioInFluid;
       const scale =
-        -this.options.fluidDensity * displaced * effectiveGravityMult;
+        -this.options.fluidDensity *
+        displaced *
+        effectiveGravityMult *
+        body.fluidBuoyancyMultiplier;
       const f = [
         this.options.gravity[0] * scale,
         this.options.gravity[1] * scale,
@@ -600,6 +672,67 @@ export class Engine {
     }
   };
 
+  /**
+   * World-space top of the tallest collision box in a voxel, raised to its
+   * barrier when that stands higher, or `-Infinity` when the voxel has no
+   * box. Automatic moves plan with this (auto-step, auto-jump, a swim exit),
+   * so they never carry a body over a barrier it could only clear with a
+   * jump it chose to make.
+   */
+  voxelTop = (voxel: number[]): number => {
+    let top = -Infinity;
+    for (const a of this.getVoxel(voxel[0], voxel[1], voxel[2])) {
+      if (a.maxY > top) top = a.maxY;
+    }
+    if (top === -Infinity) return top;
+    return Math.max(top, this.getBarrierTop(voxel[0], voxel[1], voxel[2]));
+  };
+
+  /**
+   * The first voxel `box` would touch travelling along `vector`, or `null`
+   * when the path is clear. `box` is not moved. Look-ahead probes (auto-jump
+   * scanning for a ledge before the body reaches it) build on this.
+   */
+  sweepObstruction = (box: AABB, vector: number[]): SweepHit | null => {
+    let hit: SweepHit | null = null;
+
+    sweep(
+      this.getVoxel,
+      box.clone(),
+      vector,
+      (dist, axis, dir, _leftover, voxel) => {
+        if (voxel && voxel.length === 3) {
+          hit = { distance: dist, axis, dir, voxel, top: this.voxelTop(voxel) };
+        }
+        return true;
+      },
+      false,
+    );
+
+    return hit;
+  };
+
+  /**
+   * Whether `box` can travel the whole of `vector` without touching a voxel.
+   * `box` is not moved.
+   */
+  isSweepClear = (box: AABB, vector: number[]): boolean => {
+    let clear = true;
+
+    sweep(
+      this.getVoxel,
+      box.clone(),
+      vector,
+      () => {
+        clear = false;
+        return true;
+      },
+      false,
+    );
+
+    return clear;
+  };
+
   processCollisions = (
     box: AABB,
     velocity: number[],
@@ -625,14 +758,37 @@ export class Engine {
     );
   };
 
+  /**
+   * Lift a grounded body onto the obstruction that just blocked its X/Z
+   * motion, when that obstruction is no taller than `body.stepHeight`.
+   *
+   * The trial runs on `oldBox`, a scratch copy of the pre-move box: sweep to
+   * the obstruction, rise to its top, replay the leftover X/Z motion up
+   * there, and drop back onto whatever is underneath. `body.aabb` stays at
+   * its post-collision position unless the step commits, and a committed
+   * step is reported through `onStep` (or applied directly without one).
+   */
   tryAutoStepping = (body: RigidBody, oldBox: AABB, dx: number[]) => {
-    if (body.inFluid) return;
+    // Wading on solid footing still permits a normal step. The grounding
+    // check below prevents swimming bodies from climbing an underwater wall.
     if (body.resting[1] >= 0) return;
 
-    // // direction movement was blocked before trying a step
+    // direction movement was blocked before trying a step
     const xBlocked = body.resting[0] !== 0;
     const zBlocked = body.resting[2] !== 0;
     if (!(xBlocked || zBlocked)) return;
+
+    // grazing contact slides along the obstruction instead of stepping onto
+    // it: brushing a ledge while walking past must not pop the body up
+    if (body.stepGrazeRatio > 0) {
+      const ratio = Math.abs(dx[0] / dx[2]);
+      if (
+        (!xBlocked && ratio > body.stepGrazeRatio) ||
+        (!zBlocked && ratio < 1 / body.stepGrazeRatio)
+      ) {
+        return;
+      }
+    }
 
     // original target position before being obstructed
     const targetPos = [
@@ -665,19 +821,22 @@ export class Engine {
       },
     );
 
+    // the blocking came from something the re-sweep cannot see (a
+    // cliff-hang wall, for one), so there is nothing to step onto
+    if (voxel.length !== 3) return;
+
     const y = body.aabb.minY;
 
-    let maxStep = 0;
+    // getVoxel hands back world-space boxes, so the tallest maxY of the
+    // obstruction is the exact plane the feet have to reach
+    const obstructionTop = this.voxelTop(voxel);
+    if (obstructionTop === -Infinity) return;
 
-    if (voxel) {
-      const aabbs = this.getVoxel(voxel[0], voxel[1], voxel[2]);
-      aabbs.forEach((a) => {
-        if (a.maxY > maxStep) maxStep = a.maxY;
-      });
-    }
+    const yDist = obstructionTop - y + Engine.EPSILON;
+    if (yDist <= Engine.EPSILON) return;
+    if (yDist > body.stepHeight + STEP_HEIGHT_SLOP) return;
 
-    const yDist = Math.floor(y) + maxStep - y + Engine.EPSILON;
-    const upVec = [0, Math.min(yDist, body.stepHeight + 0.001), 0];
+    const upVec = [0, yDist, 0];
     let collided = false;
 
     // sweep up, bailing on any obstruction
@@ -699,6 +858,13 @@ export class Engine {
     leftover[1] = 0;
     const tmpResting = [0, 0, 0];
     this.processCollisions(oldBox, leftover, tmpResting);
+
+    // bail unless the raised body actually got past the obstruction on a
+    // blocked axis: a wall taller than the step must not report a step at
+    // all, let alone lift the body against it
+    const xMoved = xBlocked && !approxEquals(oldBox.minX, body.aabb.minX);
+    const zMoved = zBlocked && !approxEquals(oldBox.minZ, body.aabb.minZ);
+    if (!xMoved && !zMoved) return;
 
     // move down a bit to avoid stepping too high, bail on collision
     const temp = oldBox.clone();

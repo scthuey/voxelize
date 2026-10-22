@@ -6,6 +6,23 @@ description = "Deterministic, content-free world generation mechanisms for Voxel
 license = "MIT"
 repository = "https://github.com/voxelize/voxelize"
 
+[features]
+default = []
+# The `landscape` generator (docs/landscape.md) stays behind this non-default
+# feature until its design is frozen, so no consumer compiles or links it.
+# It must never enable a feature on a shared dependency (serde_json
+# `float_roundtrip`, `arbitrary_precision`, `preserve_order`): Cargo unifies
+# features across a consumer's whole build, so that would change the
+# consumer's own parsing. Optional dependencies join it with the first code
+# that uses them.
+unstable-landscape = []
+# The landscape test kit: `assert_no_libm!` for game crates now; the
+# landform, province, structure and determinism suites join as the plugin
+# kinds they test land.
+kit = ["unstable-landscape"]
+# Deterministic work counters for the budget gate: cost only, never output.
+gen-counters = ["unstable-landscape"]
+
 [dependencies]
 voxelize = { path = "../..", version = "3.0.0" }
 serde = { version = "1.0", features = ["derive"] }
@@ -21,3 +38,22 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name = "gen_bench"
 harness = false
+
+[[bench]]
+name = "landscape_kernel"
+harness = false
+required-features = ["unstable-landscape"]
+
+[[test]]
+name = "landscape_kernel"
+required-features = ["unstable-landscape"]
+
+[[example]]
+name = "landscape_profiles"
+required-features = ["unstable-landscape"]
+
+# `cargo test` runs this example's own tests (its SHA-256 known answers and
+# the budget gate's rules), which it would otherwise only build.
+[[example]]
+name = "walk_bench"
+test = true

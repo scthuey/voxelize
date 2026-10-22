@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use crate::{
-    ChunkUtils, LightColor, LightPassInfo, Registry, Vec2, Vec3, VoxelAccess, WorldConfig,
+    ChunkUtils, LightColor, LightPassInfo, Registry, Space, Vec2, Vec3, VoxelAccess, WorldConfig,
 };
 
 pub const VOXEL_NEIGHBORS: [[i32; 3]; 6] = [
@@ -228,6 +228,7 @@ impl Lights {
         let max_light_level = config.max_light_level;
 
         let mut fill = VecDeque::<LightNode>::new();
+        let mut emitters = Vec::<LightNode>::new();
         let mut queue = VecDeque::<LightNode>::new();
 
         let is_sunlight = *color == LightColor::Sunlight;
@@ -265,13 +266,14 @@ impl Lights {
                 let rotation = space.get_voxel_rotation(nvx, nvy, nvz);
                 let n_transparency = n_block.get_rotated_transparency(&rotation);
 
-                // if the neighboring block doesn't allow light, then it wouldn't be a potential light entrance.
-                if if is_sunlight {
-                    true
+                let emission_level = if is_sunlight {
+                    0
                 } else {
-                    n_block.get_torch_light_level_at(&n_voxel_pos, space, color) == 0
-                } && !Lights::can_enter_into(&n_transparency, *ox, *oy, *oz)
-                {
+                    n_block.get_torch_light_level_at(&n_voxel_pos, space, color)
+                };
+
+                // if the neighboring block doesn't allow light, then it wouldn't be a potential light entrance.
+                if emission_level == 0 && !Lights::can_enter_into(&n_transparency, *ox, *oy, *oz) {
                     continue;
                 }
 
@@ -284,6 +286,17 @@ impl Lights {
 
                 if nl == 0 {
                     continue;
+                }
+
+                // A remaining emitter the front crosses shines again at its own
+                // level, whichever branch it lands in below: one lit brighter by
+                // the removed light (a dim lamp beside a bright one) is zeroed
+                // like any cell, and the liveness filter cannot keep it as fill.
+                if emission_level > 0 {
+                    emitters.push(LightNode {
+                        voxel: [nvx, nvy, nvz],
+                        level: emission_level,
+                    });
                 }
 
                 if nl < level
@@ -307,45 +320,40 @@ impl Lights {
                 } else {
                     nl >= level
                 } {
-                    if is_sunlight {
-                        fill.push_back(LightNode {
-                            voxel: n_voxel,
-                            level: nl,
-                        });
-                        continue;
-                    }
-
-                    let emission_level =
-                        n_block.get_torch_light_level_at(&n_voxel_pos, space, color);
-
-                    if emission_level == 0 {
-                        queue.push_back(LightNode {
-                            voxel: n_voxel,
-                            level: nl,
-                        });
-                        space.set_torch_light(nvx, nvy, nvz, 0, color);
-                        continue;
-                    }
-
-                    if nl == emission_level {
-                        fill.push_back(LightNode {
-                            voxel: n_voxel,
-                            level: emission_level,
-                        });
-                        continue;
-                    }
-
-                    queue.push_back(LightNode {
+                    fill.push_back(LightNode {
                         voxel: n_voxel,
                         level: nl,
                     });
-                    space.set_torch_light(nvx, nvy, nvz, 0, color);
                 }
             }
         }
 
-        let fill = Lights::retain_live_fill_nodes(space, fill, color);
+        let mut fill = Lights::retain_live_fill_nodes(space, fill, color);
+        Lights::reseed_emitters(space, &mut fill, emitters, color);
         Lights::flood_light(space, fill, color, registry, config, None, None);
+    }
+
+    /// Writes each emitter a removal front crossed back to its own emission
+    /// (keeping any brighter light it still holds) and queues it as a flood
+    /// seed. `flood_light` spreads from a node's level without writing the
+    /// node itself, so a zeroed emitter has to be restored here first.
+    fn reseed_emitters(
+        space: &mut dyn VoxelAccess,
+        fill: &mut VecDeque<LightNode>,
+        emitters: Vec<LightNode>,
+        color: &LightColor,
+    ) {
+        for LightNode { voxel, level } in emitters {
+            let [vx, vy, vz] = voxel;
+            let current = space.get_torch_light(vx, vy, vz, color);
+            if current < level {
+                space.set_torch_light(vx, vy, vz, level, color);
+            }
+            fill.push_back(LightNode {
+                voxel,
+                level: current.max(level),
+            });
+        }
     }
 
     fn retain_live_fill_nodes(
@@ -521,6 +529,55 @@ impl Lights {
         ]
     }
 
+    /// Lights a freshly generated chunk inside its space. One sweep over
+    /// every chunk the space holds seeds each emitter and each sideways
+    /// sunlight edge; each colour then floods within the space's margin,
+    /// and the chunk's own light array is what the caller keeps.
+    ///
+    /// The sweep covers the whole neighbourhood at once on purpose. Run
+    /// chunk by chunk, a sideways sunlight seed (a full-sun column beside a
+    /// shaded one) was only placed when both columns fell in the same
+    /// sweep, so an overhang straddling the edge between two neighbours
+    /// lost its seeds in this chunk's pass and kept them in the neighbour's
+    /// own: the two then disagreed about the light under it along their
+    /// shared border.
+    pub fn light_fresh_chunk(space: &mut Space, registry: &Registry, config: &WorldConfig) {
+        let chunk_size = config.chunk_size as i32;
+        let rings = (config.max_light_level as f32 / config.chunk_size as f32).ceil() as i32;
+        let Vec2(cx, cz) = space.coords.to_owned();
+        let seed_min = Vec3((cx - rings) * chunk_size, 0, (cz - rings) * chunk_size);
+        let seed_width = (chunk_size * (rings * 2 + 1)) as usize;
+        let seed_shape = Vec3(seed_width, config.max_height as usize, seed_width);
+
+        let started = std::time::Instant::now();
+        let queues = Lights::propagate(space, &seed_min, &seed_shape, registry, config);
+        super::gen_profiler::record("lights: propagate scan", started.elapsed());
+
+        let flood_min = space.min.to_owned();
+        let flood_shape = space.shape.to_owned();
+        let colors = [
+            LightColor::Sunlight,
+            LightColor::Red,
+            LightColor::Green,
+            LightColor::Blue,
+        ];
+        let started = std::time::Instant::now();
+        for (queue, color) in queues.into_iter().zip(colors.iter()) {
+            if !queue.is_empty() {
+                Lights::flood_light(
+                    space,
+                    queue,
+                    color,
+                    registry,
+                    config,
+                    Some(&flood_min),
+                    Some(&flood_shape),
+                );
+            }
+        }
+        super::gen_profiler::record("lights: flood", started.elapsed());
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn seed_torch_queues(
         space: &mut dyn VoxelAccess,
@@ -693,6 +750,7 @@ impl Lights {
         let max_light_level = config.max_light_level;
 
         let mut fill = VecDeque::<LightNode>::new();
+        let mut emitters = Vec::<LightNode>::new();
         let mut queue = VecDeque::<LightNode>::new();
 
         let is_sunlight = *color == LightColor::Sunlight;
@@ -736,13 +794,14 @@ impl Lights {
                 let rotation = space.get_voxel_rotation(nvx, nvy, nvz);
                 let n_transparency = n_block.get_rotated_transparency(&rotation);
 
-                // if the neighboring block doesn't allow light, then it wouldn't be a potential light entrance.
-                if if is_sunlight {
-                    true
+                let emission_level = if is_sunlight {
+                    0
                 } else {
-                    n_block.get_torch_light_level_at(&n_voxel_pos, space, color) == 0
-                } && !Lights::can_enter_into(&n_transparency, *ox, *oy, *oz)
-                {
+                    n_block.get_torch_light_level_at(&n_voxel_pos, space, color)
+                };
+
+                // if the neighboring block doesn't allow light, then it wouldn't be a potential light entrance.
+                if emission_level == 0 && !Lights::can_enter_into(&n_transparency, *ox, *oy, *oz) {
                     continue;
                 }
 
@@ -754,6 +813,17 @@ impl Lights {
 
                 if nl == 0 {
                     continue;
+                }
+
+                // A remaining emitter the front crosses shines again at its own
+                // level, whichever branch it lands in below: one lit brighter by
+                // the removed light (a dim lamp beside a bright one) is zeroed
+                // like any cell, and the liveness filter cannot keep it as fill.
+                if emission_level > 0 {
+                    emitters.push(LightNode {
+                        voxel: [nvx, nvy, nvz],
+                        level: emission_level,
+                    });
                 }
 
                 if nl < level
@@ -777,44 +847,20 @@ impl Lights {
                 } else {
                     nl >= level
                 } {
-                    if is_sunlight {
-                        fill.push_back(LightNode {
-                            voxel: [nvx, nvy, nvz],
-                            level: nl,
-                        });
-                        continue;
-                    }
-
-                    let emission_level =
-                        n_block.get_torch_light_level_at(&n_voxel_pos, space, color);
-
-                    if emission_level == 0 {
-                        queue.push_back(LightNode {
-                            voxel: [nvx, nvy, nvz],
-                            level: nl,
-                        });
-                        space.set_torch_light(nvx, nvy, nvz, 0, color);
-                        continue;
-                    }
-
-                    if nl == emission_level {
-                        fill.push_back(LightNode {
-                            voxel: [nvx, nvy, nvz],
-                            level: emission_level,
-                        });
-                        continue;
-                    }
-
-                    queue.push_back(LightNode {
+                    fill.push_back(LightNode {
                         voxel: [nvx, nvy, nvz],
                         level: nl,
                     });
-                    space.set_torch_light(nvx, nvy, nvz, 0, color);
                 }
             }
         }
 
-        let fill = Lights::retain_live_fill_nodes(space, fill, color);
+        let mut fill = Lights::retain_live_fill_nodes(space, fill, color);
+        Lights::reseed_emitters(space, &mut fill, emitters, color);
         Lights::flood_light(space, fill, color, registry, config, None, None);
     }
 }
+
+#[cfg(test)]
+#[path = "lights_tests.rs"]
+mod tests;

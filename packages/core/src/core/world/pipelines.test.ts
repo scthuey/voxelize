@@ -1,11 +1,15 @@
 import { ChunkProtocol } from "@voxelize/protocol";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { Coords2 } from "../../types";
 import { ChunkUtils } from "../../utils";
 
 import { Chunk } from "./chunk";
-import { ChunkPipeline, MeshPipeline } from "./pipelines";
+import {
+  ChunkPipeline,
+  MeshPipeline,
+  describeChunkRequestHistory,
+} from "./pipelines";
 
 const options = {
   size: 2,
@@ -73,6 +77,77 @@ describe("ChunkPipeline.resyncForRejoin", () => {
   });
 });
 
+describe("ChunkPipeline data for a loaded chunk", () => {
+  it("keeps the chunk loaded and queues the data for that same chunk", () => {
+    const pipeline = new ChunkPipeline();
+    const loaded = makeChunk([0, 0]);
+    const name = ChunkUtils.getChunkName([0, 0]);
+    pipeline.markLoaded([0, 0], loaded);
+
+    pipeline.markProcessing([0, 0], "load", protocolFor([0, 0]));
+
+    expect(pipeline.getStage(name)).toBe("loaded");
+    expect(pipeline.getLoadedChunk(name)).toBe(loaded);
+    expect(pipeline.getReloads().get(name)?.data.x).toBe(0);
+    expect(pipeline.isAwaitingData(name)).toBe(true);
+    expect(pipeline.processingCount).toBe(1);
+
+    pipeline.markLoaded([0, 0], loaded);
+
+    expect(pipeline.getReloads().size).toBe(0);
+    expect(pipeline.isAwaitingData(name)).toBe(false);
+    expect(pipeline.processingCount).toBe(0);
+  });
+
+  it("layers the voxel message over the mesh message it follows", () => {
+    const pipeline = new ChunkPipeline();
+    const name = ChunkUtils.getChunkName([0, 0]);
+    pipeline.markLoaded([0, 0], makeChunk([0, 0]));
+    const meshes = [{ level: 0, geometries: [] }] as ChunkProtocol["meshes"];
+    const voxels = new Uint32Array([7]);
+
+    pipeline.markProcessing([0, 0], "load", {
+      ...protocolFor([0, 0]),
+      meshes,
+      voxels: undefined,
+      lights: undefined,
+    });
+    pipeline.markProcessing([0, 0], "load", {
+      ...protocolFor([0, 0]),
+      meshes: [],
+      voxels,
+    });
+
+    const data = pipeline.getReloads().get(name)?.data;
+    expect(data?.meshes).toBe(meshes);
+    expect(data?.voxels).toBe(voxels);
+  });
+
+  it("drops queued data when the chunk is removed", () => {
+    const pipeline = new ChunkPipeline();
+    const name = ChunkUtils.getChunkName([0, 0]);
+    pipeline.markLoaded([0, 0], makeChunk([0, 0]));
+    pipeline.markProcessing([0, 0], "load", protocolFor([0, 0]));
+
+    pipeline.remove(name);
+
+    expect(pipeline.getReloads().size).toBe(0);
+    expect(pipeline.getStage(name)).toBeNull();
+  });
+
+  it("still sends a chunk it has no data for through processing", () => {
+    const pipeline = new ChunkPipeline();
+    const name = ChunkUtils.getChunkName([1, 0]);
+    pipeline.markRequested([1, 0]);
+
+    pipeline.markProcessing([1, 0], "load", protocolFor([1, 0]));
+
+    expect(pipeline.getStage(name)).toBe("processing");
+    expect(pipeline.getReloads().size).toBe(0);
+    expect(pipeline.isAwaitingData(name)).toBe(true);
+  });
+});
+
 describe("ChunkPipeline.isRequestStale", () => {
   it("presumes a request lost once its own elapsed time passes the threshold", () => {
     const pipeline = new ChunkPipeline();
@@ -108,6 +183,218 @@ describe("ChunkPipeline.isRequestStale", () => {
   });
 });
 
+describe("ChunkPipeline request history", () => {
+  let now = 0;
+  const at = (ms: number) => {
+    now = ms;
+  };
+  const pipelineAtClock = () => {
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    return new ChunkPipeline();
+  };
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("keeps a chunk's first request and counts every attempt across retries", () => {
+    const pipeline = pipelineAtClock();
+    const name = ChunkUtils.getChunkName([0, 0]);
+    at(1_000);
+    pipeline.markRequested([0, 0]);
+
+    at(6_000);
+    pipeline.expireRequest(name);
+    expect(pipeline.getStage(name)).toBeNull();
+    pipeline.markRequested([0, 0]);
+    at(11_000);
+    pipeline.expireRequest(name);
+    pipeline.markRequested([0, 0]);
+
+    expect(pipeline.getRequestHistory(name)).toEqual({
+      firstRequestedAt: 1_000,
+      attempts: 3,
+      lastSentAt: null,
+    });
+    expect(pipeline.getTiming(name)?.requestedAt).toBe(11_000);
+  });
+
+  it("keeps the history of the requests a rejoin drops", () => {
+    const pipeline = pipelineAtClock();
+    const name = ChunkUtils.getChunkName([2, 1]);
+    at(500);
+    pipeline.markRequested([2, 1]);
+    pipeline.markSent([2, 1], 520);
+
+    at(9_000);
+    pipeline.resyncForRejoin();
+    expect(pipeline.getStage(name)).toBeNull();
+    pipeline.markRequested([2, 1]);
+
+    expect(pipeline.getRequestHistory(name)).toEqual({
+      firstRequestedAt: 500,
+      attempts: 2,
+      lastSentAt: 520,
+    });
+  });
+
+  it("records when the latest attempt reached the socket", () => {
+    const pipeline = pipelineAtClock();
+    const name = ChunkUtils.getChunkName([3, 3]);
+    pipeline.markRequested([3, 3]);
+    pipeline.markSent([3, 3], 40);
+    pipeline.expireRequest(name);
+    pipeline.markRequested([3, 3]);
+    expect(pipeline.getRequestHistory(name)?.lastSentAt).toBe(40);
+
+    pipeline.markSent([3, 3], 90);
+    expect(pipeline.getRequestHistory(name)?.lastSentAt).toBe(90);
+  });
+
+  it("forgets the history once data for the chunk arrives", () => {
+    const pipeline = pipelineAtClock();
+    const name = ChunkUtils.getChunkName([0, 1]);
+    pipeline.markRequested([0, 1]);
+
+    pipeline.markProcessing([0, 1], "load", protocolFor([0, 1]));
+
+    expect(pipeline.getRequestHistory(name)).toBeUndefined();
+  });
+
+  it("forgets the history of a chunk that is dropped", () => {
+    const pipeline = pipelineAtClock();
+    const name = ChunkUtils.getChunkName([0, 2]);
+    pipeline.markRequested([0, 2]);
+
+    pipeline.remove(name);
+
+    expect(pipeline.getRequestHistory(name)).toBeUndefined();
+  });
+
+  it("reports a request unanswered past the threshold once per interval", () => {
+    const pipeline = pipelineAtClock();
+    const name = ChunkUtils.getChunkName([-10, -5]);
+    at(0);
+    pipeline.markRequested([-10, -5]);
+    pipeline.markSent([-10, -5], 10);
+
+    expect(pipeline.takeOverdueRequests(59_999, 60_000)).toEqual([]);
+    expect(pipeline.takeOverdueRequests(60_000, 60_000)).toEqual([
+      { name, firstRequestedAt: 0, attempts: 1, lastSentAt: 10 },
+    ]);
+    expect(pipeline.takeOverdueRequests(60_001, 60_000)).toEqual([]);
+    expect(pipeline.takeOverdueRequests(120_000, 60_000)).toHaveLength(1);
+  });
+
+  it("forgets requests the caller no longer wants, between attempts too", () => {
+    const pipeline = pipelineAtClock();
+    const near = ChunkUtils.getChunkName([1, 1]);
+    const far = ChunkUtils.getChunkName([40, 40]);
+    pipeline.markRequested([1, 1]);
+    pipeline.markRequested([40, 40]);
+    pipeline.expireRequest(far);
+
+    pipeline.forgetRequestsWhere((name) => name === far);
+
+    expect(pipeline.getRequestHistory(far)).toBeUndefined();
+    expect(pipeline.getRequestHistory(near)).toBeDefined();
+  });
+
+  it("says how long a chunk has been asked for and whether it ever left", () => {
+    expect(
+      describeChunkRequestHistory(
+        { firstRequestedAt: 0, attempts: 13, lastSentAt: 62_800 },
+        64_000,
+      ),
+    ).toBe("asked 13x over 64s, last sent 1.2s ago");
+    expect(
+      describeChunkRequestHistory(
+        { firstRequestedAt: 1_000, attempts: 2, lastSentAt: null },
+        7_500,
+      ),
+    ).toBe("asked 2x over 6.5s, never sent");
+  });
+});
+
+describe("ChunkPipeline.getTiming", () => {
+  it("carries the request time through receive and load", () => {
+    const pipeline = new ChunkPipeline();
+    const name = ChunkUtils.getChunkName([0, 0]);
+    pipeline.markRequested([0, 0]);
+    const requestedAt = pipeline.getTiming(name)?.requestedAt;
+    expect(requestedAt).not.toBeNull();
+
+    pipeline.markProcessing([0, 0], "load", protocolFor([0, 0]));
+    const afterReceive = pipeline.getTiming(name);
+    expect(afterReceive?.requestedAt).toBe(requestedAt);
+    expect(afterReceive?.receivedAt).not.toBeNull();
+    expect(afterReceive?.loadedAt).toBeNull();
+
+    pipeline.markLoaded([0, 0], makeChunk([0, 0]));
+    const afterLoad = pipeline.getTiming(name);
+    expect(afterLoad?.requestedAt).toBe(requestedAt);
+    expect(afterLoad?.receivedAt).toBe(afterReceive?.receivedAt);
+    expect(afterLoad?.loadedAt).not.toBeNull();
+    expect(afterLoad?.loadedAt ?? -Infinity).toBeGreaterThanOrEqual(
+      afterLoad?.receivedAt ?? Infinity,
+    );
+  });
+
+  it("keeps the first receive and arrival times when a second payload merges in", () => {
+    const pipeline = new ChunkPipeline();
+    const name = ChunkUtils.getChunkName([1, 0]);
+    pipeline.markProcessing([1, 0], "load", protocolFor([1, 0]), 41);
+    const first = pipeline.getTiming(name)?.receivedAt;
+
+    pipeline.markProcessing([1, 0], "load", protocolFor([1, 0]), 99);
+
+    expect(pipeline.getTiming(name)?.receivedAt).toBe(first);
+    expect(pipeline.getTiming(name)?.arrivedAt).toBe(41);
+    expect(pipeline.getTiming(name)?.requestedAt).toBeNull();
+
+    pipeline.markLoaded([1, 0], makeChunk([1, 0]));
+    expect(pipeline.getTiming(name)?.arrivedAt).toBe(41);
+  });
+
+  it("stamps the send once and carries it through to loaded", () => {
+    const pipeline = new ChunkPipeline();
+    const name = ChunkUtils.getChunkName([3, 0]);
+    pipeline.markRequested([3, 0]);
+    expect(pipeline.getTiming(name)?.sentAt).toBeNull();
+
+    pipeline.markSent([3, 0], 500);
+    pipeline.markSent([3, 0], 900);
+    expect(pipeline.getTiming(name)?.sentAt).toBe(500);
+
+    pipeline.markProcessing([3, 0], "load", protocolFor([3, 0]), 700);
+    pipeline.markLoaded([3, 0], makeChunk([3, 0]));
+    expect(pipeline.getTiming(name)?.sentAt).toBe(500);
+    expect(pipeline.getTiming(name)?.arrivedAt).toBe(700);
+  });
+
+  it("ignores a send stamp for a chunk that is no longer waiting", () => {
+    const pipeline = new ChunkPipeline();
+    const name = ChunkUtils.getChunkName([4, 0]);
+    pipeline.markProcessing([4, 0], "load", protocolFor([4, 0]));
+
+    pipeline.markSent([4, 0], 123);
+
+    expect(pipeline.getTiming(name)?.sentAt).toBeNull();
+  });
+
+  it("has no arrival time for a payload the transport did not stamp", () => {
+    const pipeline = new ChunkPipeline();
+    const name = ChunkUtils.getChunkName([2, 0]);
+    pipeline.markProcessing([2, 0], "load", protocolFor([2, 0]));
+
+    expect(pipeline.getTiming(name)?.arrivedAt).toBeNull();
+  });
+
+  it("knows nothing about a chunk it never saw", () => {
+    const pipeline = new ChunkPipeline();
+    expect(pipeline.getTiming(ChunkUtils.getChunkName([9, 9]))).toBeUndefined();
+  });
+});
+
 describe("MeshPipeline voxel-change remesh", () => {
   it("marks dirty immediately so remesh can run before light workers finish", () => {
     const pipeline = new MeshPipeline();
@@ -137,6 +424,18 @@ describe("MeshPipeline voxel-change remesh", () => {
     expect(pipeline.needsRemesh("1,1:0")).toBe(true);
     expect(pipeline.onJobComplete("1,1:0", generation)).toBe(false);
     expect(pipeline.getDirtyKeys()).toEqual(["1,1:0"]);
+  });
+
+  it("knows whether a section has ever shown a mesh", () => {
+    const pipeline = new MeshPipeline();
+    expect(pipeline.hasDisplayed("0,0:0")).toBe(false);
+    pipeline.onVoxelChange(0, 0, 0);
+    const generation = pipeline.startJob("0,0:0");
+    expect(pipeline.hasDisplayed("0,0:0")).toBe(false);
+    expect(pipeline.onJobComplete("0,0:0", generation)).toBe(true);
+    // Still true while a newer mesh is pending: the old one is on screen.
+    pipeline.onVoxelChange(0, 0, 0);
+    expect(pipeline.hasDisplayed("0,0:0")).toBe(true);
   });
 
   it("failJob requeues remesh after a null mesh-worker result", () => {
@@ -177,6 +476,43 @@ describe("MeshPipeline voxel-change remesh", () => {
     expect(pipeline.onJobComplete("7,7:1", freshGeneration)).toBe(true);
   });
 
+  it("an expired job that lands before its key is dispatched again leaves the key clean", () => {
+    // A job held past the watchdog's ceiling (a border swap waiting on a
+    // neighbour) is expired and its key re-queued; when the job then lands,
+    // its generation is the newest and goes on screen. The key must leave
+    // the dirty set: no dispatch would start for it, so it would hold the
+    // dirty count up and keep the page from ever reading as drained.
+    const pipeline = new MeshPipeline();
+    pipeline.onVoxelChange(5, 6, 3);
+    const generation = pipeline.startJob("5,6:3", 0);
+    expect(pipeline.expireStuckJobs(31_000, 30_000)).toEqual(["5,6:3"]);
+    expect(pipeline.dirtyCount).toBe(1);
+
+    expect(pipeline.onJobComplete("5,6:3", generation)).toBe(true);
+
+    expect(pipeline.dirtyCount).toBe(0);
+    expect(pipeline.isDirty("5,6:3")).toBe(false);
+    expect(pipeline.isUrgent("5,6:3")).toBe(false);
+    expect(pipeline.getDirtyKeys()).toEqual([]);
+    expect(pipeline.hasDirtyChunks()).toBe(false);
+    expect(pipeline.needsRemesh("5,6:3")).toBe(false);
+  });
+
+  it("an expired job whose key moved on while it was out keeps the key dirty", () => {
+    const pipeline = new MeshPipeline();
+    pipeline.onVoxelChange(5, 6, 3);
+    const generation = pipeline.startJob("5,6:3", 0);
+    expect(pipeline.expireStuckJobs(31_000, 30_000)).toEqual(["5,6:3"]);
+    pipeline.onVoxelChange(5, 6, 3);
+
+    expect(pipeline.onJobComplete("5,6:3", generation)).toBe(false);
+
+    expect(pipeline.dirtyCount).toBe(1);
+    expect(pipeline.getDirtyKeys()).toEqual(["5,6:3"]);
+    expect(pipeline.needsRemesh("5,6:3")).toBe(true);
+    expect(pipeline.shouldStartJob("5,6:3")).toBe(true);
+  });
+
   it("a healthy in-flight job is never expired", () => {
     const pipeline = new MeshPipeline();
     pipeline.onVoxelChange(4, 4, 0);
@@ -205,11 +541,128 @@ describe("MeshPipeline voxel-change remesh", () => {
     ]);
   });
 
+  it("picks the nearest dirty keys without sorting them all", () => {
+    const pipeline = new MeshPipeline();
+    const columns: [number, number][] = [];
+    for (let cx = -6; cx <= 6; cx++) {
+      for (let cz = -6; cz <= 6; cz++) columns.push([cx, cz]);
+    }
+    // A shuffled insertion order, so the pass cannot lean on it.
+    for (let i = columns.length - 1; i > 0; i--) {
+      const j = (i * 7919) % (i + 1);
+      [columns[i], columns[j]] = [columns[j], columns[i]];
+    }
+    for (const [cx, cz] of columns) pipeline.onVoxelChange(cx, cz, 1);
+    pipeline.onVoxelChange(40, 40, 0, true);
+    const inFlight = MeshPipeline.makeKey(0, 0, 1);
+    pipeline.startJob(inFlight);
+    pipeline.onVoxelChange(0, 0, 1);
+
+    for (const center of [
+      [0, 0],
+      [5, -3],
+      [-20, 7],
+    ] as [number, number][]) {
+      const full = pipeline.getDirtyKeys(center);
+      const nearest = pipeline.nearestDirtyKeys(center, 12);
+      // The urgent lane leads, whole; then the regular lane's nearest 12,
+      // exactly the full sort's first 12 (an in-flight key in neither).
+      expect(nearest).toEqual(full.slice(0, 13));
+      expect(nearest[0]).toBe("40,40:0");
+      expect(nearest).not.toContain(inFlight);
+    }
+    expect(pipeline.nearestDirtyKeys([0, 0], 1000)).toEqual(
+      pipeline.getDirtyKeys([0, 0]),
+    );
+  });
+
+  it("dispatches sections with nothing drawn ahead of nearer rebuilds, two at most", () => {
+    const pipeline = new MeshPipeline();
+    const shown = (cx: number) => {
+      pipeline.onVoxelChange(cx, 0, 0);
+      const key = MeshPipeline.makeKey(cx, 0, 0);
+      pipeline.onJobComplete(key, pipeline.startJob(key));
+      pipeline.onVoxelChange(cx, 0, 0);
+    };
+    // Rebuilds at 1..4 columns from the centre, fresh sections at 5 and 6.
+    for (const cx of [1, 2, 3, 4]) shown(cx);
+    pipeline.onVoxelChange(5, 0, 0);
+    pipeline.onVoxelChange(6, 0, 0);
+
+    expect(pipeline.nearestDirtyKeys([0, 0], 10)).toEqual([
+      "1,0:0",
+      "2,0:0",
+      "5,0:0",
+      "3,0:0",
+      "4,0:0",
+      "6,0:0",
+    ]);
+    // A rebuild farther than every fresh section waits for them all.
+    expect(pipeline.nearestDirtyKeys([7, 0], 10)).toEqual([
+      "6,0:0",
+      "5,0:0",
+      "4,0:0",
+      "3,0:0",
+      "2,0:0",
+      "1,0:0",
+    ]);
+  });
+
+  it("reads negative and multi-digit columns off the key for that order", () => {
+    const pipeline = new MeshPipeline();
+    const columns: [number, number][] = [
+      [-12, 3],
+      [7, -140],
+      [-1, -1],
+      [0, 0],
+      [33, 21],
+      [-250, 18],
+    ];
+    for (const [cx, cz] of columns) pipeline.onVoxelChange(cx, cz, 3);
+
+    const center: [number, number] = [-3, 2];
+    const byParsedDistance = columns
+      .map(([cx, cz]) => MeshPipeline.makeKey(cx, cz, 3))
+      .sort((a, b) => {
+        const pa = MeshPipeline.parseKey(a);
+        const pb = MeshPipeline.parseKey(b);
+        return (
+          (pa.cx - center[0]) ** 2 +
+          (pa.cz - center[1]) ** 2 -
+          ((pb.cx - center[0]) ** 2 + (pb.cz - center[1]) ** 2)
+        );
+      });
+    expect(pipeline.getDirtyKeys(center)).toEqual(byParsedDistance);
+  });
+
   it("keeps the urgent lane in insertion order ahead of sorted regular keys", () => {
     const pipeline = new MeshPipeline();
     pipeline.onVoxelChange(50, 50, 0, true);
     pipeline.onVoxelChange(1, 1, 0);
 
     expect(pipeline.getDirtyKeys([0, 0])).toEqual(["50,50:0", "1,1:0"]);
+  });
+});
+
+describe("ChunkPipeline.loadedGeneration", () => {
+  it("bumps only when a chunk enters or leaves the loaded stage", () => {
+    const pipeline = new ChunkPipeline();
+    const start = pipeline.loadedGeneration;
+
+    pipeline.markRequested([0, 0]);
+    pipeline.markProcessing([0, 0], "load", protocolFor([0, 0]), null);
+    expect(pipeline.loadedGeneration).toBe(start);
+
+    pipeline.markLoaded([0, 0], makeChunk([0, 0]));
+    expect(pipeline.loadedGeneration).toBe(start + 1);
+
+    pipeline.markRequested([1, 0]);
+    expect(pipeline.loadedGeneration).toBe(start + 1);
+
+    pipeline.remove(ChunkUtils.getChunkName([0, 0]));
+    expect(pipeline.loadedGeneration).toBe(start + 2);
+
+    pipeline.remove(ChunkUtils.getChunkName([1, 0]));
+    expect(pipeline.loadedGeneration).toBe(start + 2);
   });
 });

@@ -28,19 +28,112 @@ export type {
   RequestedCaptureViewport,
 } from "./capture-viewport";
 export { evaluateAgentHealth } from "./health";
+export {
+  assertUncappedWindow,
+  CappedFrameRateError,
+  MIN_DRAWN_FRAME_SHARE,
+} from "./frame-rate-guard";
 export type { AgentHealth, AgentHealthInput, AgentWorldHealth } from "./health";
 export { AgentDaemon } from "./daemon";
 export type {
   DaemonEvent,
   DaemonLeaseStatus,
+  DaemonMetaResponse,
   DaemonOptions,
   DaemonStatus,
 } from "./daemon";
 export {
+  SESSION_LAUNCHER_ENV,
+  SESSION_META_ENV,
+  SESSION_META_KEY_PATTERN,
+  SESSION_META_MAX_KEYS,
+  SESSION_META_MAX_KEY_LENGTH,
+  SESSION_META_MAX_VALUE_LENGTH,
+  SESSION_META_WELL_KNOWN_KEYS,
+  SESSION_ORIGIN_ENV,
+  SessionMetaError,
+  applySessionMetaPatch,
+  normalizeSessionMeta,
+  parseSessionMetaAssignments,
+  parseSessionMetaEnv,
+  parseSessionOriginEnv,
+} from "./session-meta";
+export type {
+  SessionMeta,
+  SessionMetaPatch,
+  SessionOrigin,
+  SessionOriginCursor,
+  SessionOriginParent,
+} from "./session-meta";
+export { AuthUrlError, signInThrough } from "./auth-url";
+export type { AuthPage, AuthResponse } from "./auth-url";
+export {
+  AUTH_FAILED_EXIT_CODE,
+  AUTH_FAILED_LOG_MARKER,
   DEFAULT_IDLE_TTL_MS,
   IDLE_TTL_EXIT_CODE,
+  MOUNT_FAILED_EXIT_CODE,
+  PAGE_UNAVAILABLE_EXIT_CODE,
   agentPidFile,
   resolveIdleTtlMs,
   watchdogLogFile,
 } from "./browser-lifecycle";
+export {
+  DEFAULT_NAVIGATION_RETRY_MS,
+  PageUnavailableError,
+  classifyDocumentStatus,
+  findPageUnavailableLine,
+  formatPageUnavailable,
+  isTransientLoadError,
+  openPage,
+  parsePageUnavailableLine,
+  resolveNavigationRetryMs,
+} from "./page-availability";
+export type {
+  PageLoad,
+  PageUnavailable,
+  PageUnavailableLine,
+} from "./page-availability";
+export {
+  DEFAULT_WATCH_HOLD_MS,
+  MAX_WATCH_HOLD_MS,
+  WATCH_BEAT_TIMEOUT_MS,
+  WatchError,
+  WatchLedger,
+  watchSession,
+} from "./session-watch";
+export type {
+  SessionWatch,
+  SessionWatchHandle,
+  WatchBeat,
+} from "./session-watch";
+export {
+  assertMethodRan,
+  describeMethodFailure,
+  MethodOutcomeError,
+  outcomeOf,
+} from "./method-outcome";
+export {
+  boxVolume,
+  censusVoxel,
+  DEFAULT_FILL_LANDING,
+  FillLandingError,
+  fillLandingTimeoutMs,
+  landFill,
+  MAX_FILL_LANDING_VOLUME,
+} from "./fill-landing";
+export type {
+  BoxLanding,
+  FillBox,
+  FillLandingReport,
+  FillLandingStatus,
+  FillSend,
+  FillSendReason,
+} from "./fill-landing";
 export * from "./bridge";
+export { formatProfileSummary, summarizeProfile } from "./profile-summary";
+export type {
+  ProfileAllocationCost,
+  ProfileFunctionCost,
+  ProfileSummary,
+} from "./profile-summary";

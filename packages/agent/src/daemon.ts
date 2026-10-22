@@ -8,20 +8,81 @@ import Fastify, {
 } from "fastify";
 import { z } from "zod";
 
-import { Agent, PageStallError } from "./agent";
-import type { AgentEventMap, ConnectionSnapshot } from "./bridge";
+import { Agent, PageStallError, resolveReadyTimeoutMs } from "./agent";
+import {
+  type AgentEventMap,
+  CAPTURE_CAVEATS_HEADER,
+  type CaptureCaveat,
+  type CommandDispatch,
+  type ConnectionSnapshot,
+  type Snapshot,
+} from "./bridge";
 import { DEFAULT_IDLE_TTL_MS } from "./browser-lifecycle";
 import { ensureCaptureDir } from "./capture-dir";
 import {
   CaptureViewportError,
   parseCaptureViewportQuery,
 } from "./capture-viewport";
+import type { ClientUpdateMode } from "./client-updates";
+import { composeWorldSwitchUrl } from "./client-url";
+import {
+  DEFAULT_FILL_LANDING,
+  FillLandingError,
+  FillPageUnavailableError,
+  MAX_FILL_LANDING_VOLUME,
+  boxVolume,
+  fillLandingTimeoutMs,
+  landFill,
+  type FillBox,
+} from "./fill-landing";
 import { computeFramePose } from "./frame-pose";
+import { CappedFrameRateError } from "./frame-rate-guard";
+import {
+  describeDrawInterval,
+  idleDrawIntervalFor,
+  isDrawCapStillOn,
+  resolveIdleDrawAfterMs,
+  type DrawThrottleTarget,
+} from "./idle-draw";
+import { MethodOutcomeError, assertMethodRan } from "./method-outcome";
+import { PageUnavailableError } from "./page-availability";
 import {
   createAgentPerfTraceId,
   isAgentPerfLogging,
   logAgentPerf,
 } from "./perf";
+import {
+  EMPTY_POSE_INTENT,
+  carriedPoseIntent,
+  describeJoinChange,
+  describePose,
+  isMidWorldSwitch,
+  isNewJoin,
+  isPoseSuperseded,
+  mergePoseIntent,
+  poseRestoreSkipReason,
+  rememberPose,
+  resolvePoseRestore,
+  type JoinIdentity,
+  type PoseIntent,
+  type PoseRestoreRecord,
+  type RememberedPose,
+} from "./pose-memory";
+import { replayPose } from "./pose-restore";
+import { DEFAULT_ARENA_METHODS } from "./scenario";
+import {
+  SessionMetaError,
+  applySessionMetaPatch,
+  normalizeSessionMeta,
+  type SessionMeta,
+  type SessionOrigin,
+} from "./session-meta";
+import {
+  WATCH_BEAT_TIMEOUT_MS,
+  WatchError,
+  WatchLedger,
+  type SessionWatch,
+} from "./session-watch";
 import {
   describeLastSeen,
   filterWaitCandidates,
@@ -48,6 +109,14 @@ export type DaemonOptions = {
    * active one defers idle retirement and protects against sweeps.
    */
   leaseMinutes?: number;
+  /** Worker-declared notes (label, purpose, owner, ...); patchable via /meta. */
+  meta?: SessionMeta;
+  /** Launch provenance captured by whatever started this daemon; read-only. */
+  origin?: SessionOrigin | null;
+  /** How long the first page may take to mount; 0 disables. */
+  mountTimeoutMs?: number;
+  /** Called once when the first page never mounted in time. */
+  onMountFailed?: (reason: string) => void;
 };
 
 export type DaemonLeaseStatus = {
@@ -62,6 +131,8 @@ export type DaemonStatus = {
   pid: number;
   port: number;
   world: string;
+  /** In-game display name the agent joined with. */
+  name: string;
   browserPid: number | null;
   watchdogPid: number | null;
   startedAt: number;
@@ -80,20 +151,130 @@ export type DaemonStatus = {
   /** Milliseconds a video take has been open, so a leaked one is visible in
    * the same place every other stuck resource is. */
   recordingForMs: number | null;
+  /** True while an idle draw cap is on the page (lifted by any command). */
+  isDrawThrottled: boolean;
+  /** The cap's ms between drawn frames, or null when drawing every frame. */
+  drawIntervalMs: number | null;
   lease: DaemonLeaseStatus | null;
+  /** Passive watchers whose heartbeats are keeping the session (POST /watch). */
+  watches: SessionWatch[];
+  meta: SessionMeta;
+  origin: SessionOrigin | null;
+  client: DaemonClientStatus;
+  pose: DaemonPoseStatus;
+};
+
+/** Why a page document loaded: the daemon asked for it, or the page did.
+ * `world` is a world switch the daemon made by navigating (`POST /world`). */
+export type DocumentCause = "launch" | "reset" | "reload" | "world" | "page";
+
+export type DaemonClientStatus = {
+  /** `hold`: dev-server hot updates are held back; `live`: they apply. */
+  updates: ClientUpdateMode;
+  documentId: number | null;
+  documentLoadedAt: number | null;
+  title: string | null;
+  /** Documents this session has loaded, by cause (launch counts once). */
+  documentsByCause: Record<DocumentCause, number>;
+  /** Hot updates held back from the loaded document; a reload picks them up. */
+  updatesBehind: number;
+  lastHeldUpdateAt: number | null;
+  lastHeldUpdateTypes: string[];
+  devServerRestarts: number;
+  isHmrConnected: boolean | null;
+};
+
+export type DaemonPoseStatus = {
+  isRestoreEnabled: boolean;
+  remembered: RememberedPose | null;
+  intent: PoseIntent;
+  restoreCount: number;
+  lastRestore: PoseRestoreRecord | null;
+};
+
+/** What `POST /world` answers. */
+export type WorldSwitchResult = {
+  ok: boolean;
+  /** How the switch was made: in place by the page's host, or by navigation. */
+  mode: "soft" | "hard";
+  world: string;
+  from: string;
+  /**
+   * The world the session is listed under as the call answers (`/meta`'s
+   * world): `world` after a switch that landed, and whichever world the
+   * page reports after one that did not.
+   */
+  sessionWorld: string;
+  /** From the request to the page standing in the world with chunks in. */
+  hopMs: number;
+  /** A new page document loaded (always true for a hard switch). */
+  documentChanged: boolean;
+  joinSerial: number | null;
+  joinGeneration: number | null;
+  chunksLoaded: number | null;
+  /** Why a soft switch was asked for and a hard one made, when it was. */
+  note?: string;
+  error?: string;
+};
+
+export type DaemonMetaResponse = {
+  port: number;
+  world: string;
+  name: string;
+  meta: SessionMeta;
+  origin: SessionOrigin | null;
 };
 
 // Liveness probes must not count as activity, or anything that watches the
 // fleet (session list, PM2 health checks, humans curling healthz) would reset
-// every idle clock and no session could ever expire.
-const PASSIVE_ROUTES = new Set(["/healthz", "/status"]);
+// every idle clock and no session could ever expire. Labeling is bookkeeping
+// about the session, not work done through it, so it is passive too: an
+// admin page renaming a forgotten session must not immortalize it.
+// `/watch` counts only the beats it accepts, never the request itself.
+const PASSIVE_ROUTES = new Set(["/healthz", "/status", "/meta", "/watch"]);
+
+const metaPatchSchema = z.object({
+  set: z.record(z.string(), z.string()).optional(),
+  unset: z.array(z.string()).optional(),
+});
 
 // A busy claim (in-flight command) defers idle expiry, but only for so long:
 // if the in-flight counter ever leaked, an unbounded claim would immortalize
 // the daemon and recreate exactly the orphan problem the TTL exists to kill.
 const INFLIGHT_MAX_AGE_MS = 15 * 60_000;
 
+// An idle session draws slowly, in two steps (idle-draw.ts): a few frames a
+// second after a short idle, a frame every few seconds after a long one. The
+// next command lifts the cap before it runs. `AGENT_IDLE_DRAW_AFTER_MS=0`
+// disables both, `AGENT_IDLE_DEEP_AFTER_MS=0` the second (frame-rate
+// measurements start with a command, so they are never taken under a cap).
+const IDLE_DRAW_CHECK_INTERVAL_MS = 5_000;
+
 const CONNECTION_WATCH_INTERVAL_MS = 2_000;
+// The page document and its held hot updates are read on their own timer,
+// from launch on: a page that never installs a bridge still reloads.
+const PAGE_WATCH_INTERVAL_MS = 2_000;
+// A new document seen within this long of a daemon-requested navigation is
+// that navigation; anything else the page did on its own.
+const EXPECTED_NAVIGATION_WINDOW_MS = 10 * 60_000;
+const POSE_CHANGING_ACTIONS = new Set([
+  "teleport",
+  "face",
+  "walk",
+  "walk-to",
+  "view",
+  "follow",
+]);
+// The pose commands that move the agent: one of these after the pose was
+// remembered means a restore must leave the position alone. Turning the head
+// is not one; it must not cost the restore its position.
+const MOVING_ACTIONS = new Set([
+  "teleport",
+  "walk",
+  "walk-to",
+  "view",
+  "follow",
+]);
 // The in-page network layer retries on its own every ~3s; the daemon only
 // intervenes after this grace so it never races a reconnect already landing.
 const RECOVERY_GRACE_MS = 10_000;
@@ -102,10 +283,14 @@ const RECOVERY_BACKOFF_MAX_MS = 60_000;
 // In-page reconnects are attempted this many times before escalating to a
 // page reset (which also refreshes an outdated client build).
 const IN_PAGE_RECONNECT_ATTEMPTS = 2;
+const STALLED_PAGE_RESET_AFTER_MS = 180_000;
 
 const WAIT_DEFAULT_TIMEOUT_MS = 30_000;
 const WAIT_MAX_TIMEOUT_MS = 300_000;
 const WAIT_DEFAULT_POLL_MS = 250;
+/** How often `POST /world` looks for the page standing in the new world. */
+const WORLD_ARRIVAL_POLL_MS = 250;
+const WORLD_NAME_PATTERN = /^[A-Za-z0-9_-]+$/;
 const WAIT_MIN_POLL_MS = 50;
 const WAIT_DEFAULT_RADIUS = 32;
 const WAIT_LAST_SEEN_LIMIT = 5;
@@ -116,6 +301,9 @@ const FRAME_SETTLE_TIMEOUT_MS = 10_000;
 // leave a permanently frozen entity behind.
 const FRAME_FREEZE_SECONDS = 30;
 const FRAME_OUTPUT_SUBDIR = "agent-frames";
+/** Heap snapshots land beside the captures, in their own folder: each is a
+ * few hundred megabytes and nobody wants one mixed into a contact sheet. */
+const HEAP_SNAPSHOT_SUBDIR = "heap";
 
 // A take is filmed at the size it will be published at, so the default is a
 // social-media 1080p rather than the burst's thumbnail viewport. Motion is the
@@ -160,6 +348,18 @@ function sanitizeFileLabel(label: string): string {
   return label.replace(/[^a-z0-9_-]/gi, "_");
 }
 
+const describeError = (error: unknown): string =>
+  error instanceof Error ? error.message : String(error);
+
+/** A page call that failed because the page could not answer now (stalled,
+ * reloading, its bridge not yet back), not because the call was wrong. */
+function isPageUnavailable(error: unknown): boolean {
+  if (error instanceof PageStallError) return true;
+  return /Agent bridge is not installed|Execution context was destroyed|Target closed|Session closed|detached Frame/i.test(
+    describeError(error),
+  );
+}
+
 const vec3Schema = z.object({
   x: z.number(),
   y: z.number(),
@@ -173,6 +373,14 @@ const faceInputSchema = z.union([
 ]);
 
 const walkDirectionSchema = z.enum(["forward", "back", "left", "right"]);
+
+const voxelTupleSchema = z.tuple([z.number(), z.number(), z.number()]);
+
+// The host's fill payload, one box: min, max and block are read back; the
+// rest (rotation, stage) goes to the host method untouched.
+const fillBoxSchema = z
+  .object({ min: voxelTupleSchema, max: voxelTupleSchema, block: z.string() })
+  .passthrough();
 
 const actSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("chat"), text: z.string() }),
@@ -188,6 +396,7 @@ const actSchema = z.discriminatedUnion("type", [
     direction: walkDirectionSchema,
     durationMs: z.number().optional(),
     isSprinting: z.boolean().optional(),
+    isJumping: z.boolean().optional(),
   }),
   z.object({
     type: z.literal("walk-to"),
@@ -217,13 +426,47 @@ const actSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("set-flying"), isFlying: z.boolean() }),
   z.object({ type: z.literal("set-render-radius"), radius: z.number() }),
   z.object({
+    type: z.literal("set-fog-distance"),
+    blocks: z.number().nullable(),
+  }),
+  z.object({
     type: z.literal("call"),
     method: z.string(),
     payload: z.unknown(),
   }),
   z.object({
+    type: z.literal("fill"),
+    /** The host's fill method; the scenario SDK's default when absent. */
+    method: z.string().optional(),
+    fills: z.array(fillBoxSchema).min(1),
+    /** false: send and report the dispatches, read nothing back. */
+    isVerifying: z.boolean().optional(),
+    timeoutMs: z.number().positive().optional(),
+    maxSends: z.number().int().min(1).max(10).optional(),
+  }),
+  z.object({
+    type: z.literal("lose-calls"),
+    method: z.string(),
+    count: z.number().int().min(0).max(100),
+  }),
+  z.object({
     type: z.literal("break-voxel"),
     pos: vec3Schema,
+  }),
+  z.object({
+    type: z.literal("place-voxel"),
+    pos: vec3Schema,
+    block: z.union([z.string(), z.number()]),
+  }),
+  z.object({
+    type: z.literal("select-hotbar"),
+    slot: z.number().int().min(0).max(8),
+  }),
+  z.object({
+    type: z.literal("interact"),
+    button: z.enum(["left", "right"]).optional(),
+    holdMs: z.number().min(0).max(15_000).optional(),
+    isShift: z.boolean().optional(),
   }),
   z.object({ type: z.literal("wait"), ms: z.number() }),
   z.object({
@@ -242,6 +485,8 @@ export class AgentDaemon {
   private readonly port: number;
   private readonly idleTtlMs: number;
   private readonly leaseMinutes: number;
+  private meta: SessionMeta;
+  private readonly origin: SessionOrigin | null;
   private readonly startedAt = Date.now();
   private lastActivityAt = Date.now();
   private inflightCount = 0;
@@ -260,22 +505,73 @@ export class AgentDaemon {
   private recoveryAttemptCount = 0;
   private lastRecoveryAt = 0;
   private isRecoveryInFlight = false;
+  private idleDrawTimer: NodeJS.Timeout | null = null;
+  private isDrawThrottled = false;
+  private drawIntervalMs: number | null = null;
+  // The page join the cap was put on: a reload, page reset or world switch
+  // in place starts a frame loop drawing every frame, whatever the daemon
+  // last asked of the old one.
+  private drawThrottleTarget: DrawThrottleTarget | null = null;
+  private drawThrottleChange: Promise<void> | null = null;
+
+  private pageWatchTimer: NodeJS.Timeout | null = null;
+  private expectedNavigation: { cause: DocumentCause; at: number } | null =
+    null;
+  private clientStatus: DaemonClientStatus = {
+    updates: "hold",
+    documentId: null,
+    documentLoadedAt: null,
+    title: null,
+    documentsByCause: { launch: 0, reset: 0, reload: 0, world: 0, page: 0 },
+    updatesBehind: 0,
+    lastHeldUpdateAt: null,
+    lastHeldUpdateTypes: [],
+    devServerRestarts: 0,
+    isHmrConnected: null,
+  };
+  private readonly isPoseRestoreEnabled = resolvePoseRestore();
+  private pose: RememberedPose | null = null;
+  private poseIntent: PoseIntent = EMPTY_POSE_INTENT;
+  private poseRestoreCount = 0;
+  private lastPoseRestore: PoseRestoreRecord | null = null;
+  private poseSync: Promise<void> | null = null;
+  private lastMoveCommandAt = 0;
+  private moveCommandsInFlight = 0;
+  private isNextRestoreSkipped = false;
+  private pageStalledSinceAt: number | null = null;
+  private isStallNoted = false;
+  private readonly mountTimeoutMs: number;
+  private readonly onMountFailed: ((reason: string) => void) | null;
+  private hasMounted = false;
+  private isMountFailureReported = false;
+  private readonly watches = new WatchLedger();
+  /** Watchers already told their hold ran out, so the log says it once. */
+  private readonly refusedWatchers = new Set<string>();
 
   constructor(options: DaemonOptions) {
     this.agent = options.agent;
     this.port = options.port;
     this.idleTtlMs = options.idleTtlMs ?? DEFAULT_IDLE_TTL_MS;
     this.leaseMinutes = options.leaseMinutes ?? 0;
+    this.meta = normalizeSessionMeta(options.meta ?? {});
+    this.origin = options.origin ?? null;
+    this.mountTimeoutMs = options.mountTimeoutMs ?? 0;
+    this.onMountFailed = options.onMountFailed ?? null;
     this.server = Fastify({ logger: false });
     this.registerActivityTracking();
     this.registerEventTaps();
     this.registerErrorMapping();
     this.registerRoutes();
+    this.clientStatus.updates = this.agent.clientUpdateMode;
+    this.startPageWatch();
     // The watcher only makes sense once the bridge exists; a rejected ready
     // promise means the process is exiting anyway.
     void this.agent
       .ready()
-      .then(() => this.startConnectionWatch())
+      .then(() => {
+        this.startConnectionWatch();
+        this.startIdleDrawWatch();
+      })
       .catch(() => undefined);
   }
 
@@ -288,7 +584,140 @@ export class AgentDaemon {
       clearInterval(this.connectionWatchTimer);
       this.connectionWatchTimer = null;
     }
+    if (this.idleDrawTimer) {
+      clearInterval(this.idleDrawTimer);
+      this.idleDrawTimer = null;
+    }
+    if (this.pageWatchTimer) {
+      clearInterval(this.pageWatchTimer);
+      this.pageWatchTimer = null;
+    }
     await this.server.close();
+  }
+
+  private startIdleDrawWatch(): void {
+    if (this.idleDrawTimer || resolveIdleDrawAfterMs() === 0) return;
+    this.idleDrawTimer = setInterval(() => {
+      void this.idleDrawTick();
+    }, IDLE_DRAW_CHECK_INTERVAL_MS);
+    this.idleDrawTimer.unref();
+  }
+
+  /** The page join a cap put on now would land on. */
+  private currentDrawTarget(): DrawThrottleTarget {
+    return {
+      documentId: this.clientStatus.documentId,
+      joinSerial: this.freshness.lastConnection?.joinSerial ?? null,
+    };
+  }
+
+  private async idleDrawTick(): Promise<void> {
+    if (
+      this.isDrawThrottled &&
+      !isDrawCapStillOn(this.drawThrottleTarget, this.currentDrawTarget())
+    ) {
+      // The page's loop is drawing every frame again; cap it afresh.
+      console.log(
+        `[agent-daemon] ${new Date().toISOString()} new page join (document or bridge changed): the idle draw cap is re-applied`,
+      );
+      this.isDrawThrottled = false;
+      this.drawIntervalMs = null;
+    }
+    const wanted = idleDrawIntervalFor(this.idleMs());
+    if (
+      wanted === null ||
+      (this.drawIntervalMs !== null && wanted <= this.drawIntervalMs) ||
+      this.drawThrottleChange ||
+      this.freshness.isStale ||
+      this.inflightCount > 0 ||
+      // A take records whatever the loop draws; capping it mid-clip would
+      // turn a 30s shot into a 2fps flipbook.
+      this.agent.recordingForMs() !== null
+    ) {
+      return;
+    }
+    await this.changeDrawThrottle(wanted);
+  }
+
+  /**
+   * Serialized so a lift racing a cap cannot leave the page throttled while
+   * a command runs. Failures are logged and leave the flag honest: a page
+   * that never took the cap is not marked as throttled.
+   */
+  private changeDrawThrottle(intervalMs: number | null): Promise<void> {
+    if (this.drawThrottleChange) return this.drawThrottleChange;
+    const change = (async () => {
+      try {
+        const status = await this.agent.setDrawThrottle(intervalMs);
+        if (!status.isSupported) {
+          // No point re-trying every tick against a client that lacks it.
+          if (this.idleDrawTimer) {
+            clearInterval(this.idleDrawTimer);
+            this.idleDrawTimer = null;
+          }
+          return;
+        }
+        this.isDrawThrottled = status.intervalMs !== null;
+        this.drawIntervalMs = status.intervalMs;
+        this.drawThrottleTarget = this.currentDrawTarget();
+        console.log(
+          this.isDrawThrottled
+            ? `[agent-daemon] idle for ${Math.round(this.idleMs() / 1000)}s: drawing every ${status.intervalMs}ms (${describeDrawInterval(status.intervalMs)}) until the next command`
+            : "[agent-daemon] command received: drawing every frame again",
+        );
+        this.appendEvent("draw-throttle", { intervalMs: status.intervalMs });
+      } catch (error) {
+        console.warn(
+          `[agent-daemon] draw throttle change failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      } finally {
+        this.drawThrottleChange = null;
+      }
+    })();
+    this.drawThrottleChange = change;
+    return change;
+  }
+
+  /** Lift the idle draw cap before a command touches the page. */
+  private async wakeForCommand(): Promise<void> {
+    if (this.drawThrottleChange) await this.drawThrottleChange;
+    if (!this.isDrawThrottled) return;
+    await this.changeDrawThrottle(null);
+  }
+
+  /**
+   * A frame-rate window must run uncapped from its first warmup frame to its
+   * last. The activity hook lifts a cap the daemon recorded, but a lift that
+   * failed leaves the page capped, and a cap call that timed out on this side
+   * can still land on the page later, unrecorded. So the page itself is
+   * asked, whatever cap it reports is lifted, and a page that keeps one is
+   * refused. Nothing re-caps it mid-window: `idleDrawTick` stands down while
+   * any command is in flight.
+   */
+  private async liftDrawCapForMeasurement(): Promise<void> {
+    if (this.drawThrottleChange) await this.drawThrottleChange;
+    const status = await this.agent.drawThrottleStatus();
+    if (!status.isSupported || status.intervalMs === null) return;
+    const wasRecorded = this.isDrawThrottled;
+    const lifted = await this.agent.setDrawThrottle(null);
+    if (lifted.intervalMs !== null) {
+      throw new Error(
+        `the page kept a ${lifted.intervalMs}ms draw cap after being asked to lift it`,
+      );
+    }
+    this.isDrawThrottled = false;
+    this.drawIntervalMs = null;
+    this.drawThrottleTarget = this.currentDrawTarget();
+    console.log(
+      `[agent-daemon] frame-rate: lifted a ${status.intervalMs}ms draw cap the page ${
+        wasRecorded
+          ? "kept after an earlier lift"
+          : "held without the daemon's record"
+      } before measuring`,
+    );
+    this.appendEvent("draw-throttle", { intervalMs: null });
   }
 
   noteActivity(): void {
@@ -320,11 +749,34 @@ export class AgentDaemon {
     };
   }
 
+  sessionMeta(): SessionMeta {
+    return { ...this.meta };
+  }
+
+  patchSessionMeta(patch: {
+    set?: Record<string, string>;
+    unset?: string[];
+  }): SessionMeta {
+    this.meta = applySessionMetaPatch(this.meta, patch);
+    return this.sessionMeta();
+  }
+
+  metaResponse(): DaemonMetaResponse {
+    return {
+      port: this.port,
+      world: this.agent.worldName,
+      name: this.agent.name,
+      meta: this.sessionMeta(),
+      origin: this.origin,
+    };
+  }
+
   status(): DaemonStatus {
     return {
       pid: process.pid,
       port: this.port,
       world: this.agent.worldName,
+      name: this.agent.name,
       browserPid: this.agent.browserPid() ?? null,
       watchdogPid: this.agent.watchdogPid() ?? null,
       startedAt: this.startedAt,
@@ -343,8 +795,508 @@ export class AgentDaemon {
         this.freshness.lastConnection?.droppedCommandCount ?? null,
       stalledPageCalls: this.agent.stalledPageCallLabels(),
       recordingForMs: this.agent.recordingForMs(),
+      isDrawThrottled: this.isDrawThrottled,
+      drawIntervalMs: this.drawIntervalMs,
       lease: this.leaseStatus(),
+      watches: this.watches.live(),
+      meta: this.sessionMeta(),
+      origin: this.origin,
+      client: {
+        ...this.clientStatus,
+        documentsByCause: { ...this.clientStatus.documentsByCause },
+      },
+      pose: this.poseStatus(),
     };
+  }
+
+  private poseStatus(): DaemonPoseStatus {
+    return {
+      isRestoreEnabled: this.isPoseRestoreEnabled,
+      remembered: this.pose,
+      intent: this.poseIntent,
+      restoreCount: this.poseRestoreCount,
+      lastRestore: this.lastPoseRestore,
+    };
+  }
+
+  private startPageWatch(): void {
+    if (this.pageWatchTimer) return;
+    void this.pageWatchTick();
+    this.pageWatchTimer = setInterval(() => {
+      void this.pageWatchTick();
+    }, PAGE_WATCH_INTERVAL_MS);
+    this.pageWatchTimer.unref();
+  }
+
+  /**
+   * Every page reset or reload the daemon itself asks for goes through here.
+   * Recovery holds off while it runs, and the new page gets the full grace
+   * to join before recovery may touch it.
+   */
+  private async resetPage(cause: "reset" | "reload"): Promise<void> {
+    this.expectedNavigation = { cause, at: Date.now() };
+    const wasRecoveryInFlight = this.isRecoveryInFlight;
+    this.isRecoveryInFlight = true;
+    try {
+      await this.agent.reset();
+    } finally {
+      if (!wasRecoveryInFlight) this.isRecoveryInFlight = false;
+      this.pageStalledSinceAt = null;
+      if (this.freshness.isStale) this.freshness.staleSinceAt = Date.now();
+    }
+  }
+
+  /** A first page that never mounts ends the session instead of holding it. */
+  private checkMountDeadline(isMounted: boolean): void {
+    if (this.hasMounted || this.isMountFailureReported) return;
+    if (isMounted) {
+      this.hasMounted = true;
+      return;
+    }
+    const waitedMs = Date.now() - this.startedAt;
+    if (this.mountTimeoutMs <= 0 || waitedMs < this.mountTimeoutMs) return;
+    this.isMountFailureReported = true;
+    const reason = `page never mounted: no client after ${Math.round(waitedMs / 1000)}s (limit ${Math.round(this.mountTimeoutMs / 1000)}s)`;
+    console.error(
+      `[agent-daemon] ${new Date().toISOString()} ${reason}; ending the session so it stops holding a browser`,
+    );
+    this.appendEvent("mount-failed", { waitedMs });
+    this.onMountFailed?.(reason);
+  }
+
+  /** Logs every watch that stopped holding the session, and why. */
+  private sweepWatches(): void {
+    for (const { watch, reason } of this.watches.sweep()) {
+      this.refusedWatchers.delete(watch.watcher);
+      console.log(
+        `[agent-daemon] ${new Date().toISOString()} watch '${watch.watcher}' ended: ${reason}; after ${watch.beats} beat(s) since ${new Date(watch.startedAt).toISOString()}, the idle clock runs from the last activity again (idle ${Math.round(this.idleMs() / 1000)}s)`,
+      );
+      this.appendEvent("watch-ended", { watcher: watch.watcher, reason });
+    }
+  }
+
+  private async pageWatchTick(): Promise<void> {
+    this.sweepWatches();
+    let page: Awaited<ReturnType<Agent["pageDocument"]>>;
+    try {
+      page = await this.agent.pageDocument();
+    } catch {
+      // Mid-navigation or wedged: the connection watcher owns that story,
+      // but a page that never answers still counts against its mount time.
+      this.checkMountDeadline(false);
+      return;
+    }
+    this.checkMountDeadline(page.isMounted);
+    const status = this.clientStatus;
+    status.title = page.title;
+    if (page.documentId !== status.documentId) {
+      const isFirst = status.documentId === null;
+      const expected = this.expectedNavigation;
+      const cause: DocumentCause = isFirst
+        ? "launch"
+        : expected && Date.now() - expected.at < EXPECTED_NAVIGATION_WINDOW_MS
+          ? expected.cause
+          : "page";
+      if (!isFirst) this.expectedNavigation = null;
+      const heldBefore = status.updatesBehind;
+      status.documentId = page.documentId;
+      status.documentLoadedAt = Date.now();
+      status.documentsByCause[cause] += 1;
+      status.updatesBehind = 0;
+      status.lastHeldUpdateAt = null;
+      status.lastHeldUpdateTypes = [];
+      status.devServerRestarts = 0;
+      if (!isFirst) {
+        const loads = Object.values(status.documentsByCause).reduce(
+          (sum, count) => sum + count,
+          0,
+        );
+        const message =
+          cause === "page"
+            ? "the page reloaded itself (not requested by the daemon)"
+            : `page ${cause} loaded a new document`;
+        console.log(
+          `[agent-daemon] ${new Date().toISOString()} ${message}; now running current client code` +
+            `${heldBefore > 0 ? ` (${heldBefore} held update(s) picked up)` : ""}; ${loads} document(s) since launch, ${status.documentsByCause.page} self-initiated`,
+        );
+        this.appendEvent("page-document", {
+          cause,
+          documents: loads,
+          pickedUpUpdates: heldBefore,
+        });
+      }
+    }
+    const held = page.clientUpdates;
+    status.isHmrConnected = held ? held.isConnected : null;
+    if (held && held.updates > status.updatesBehind) {
+      console.log(
+        `[agent-daemon] ${new Date().toISOString()} held client update #${held.updates} (${held.lastUpdateTypes.join(", ") || "update"}): ` +
+          "this page keeps the client code it loaded; `reload` picks it up",
+      );
+      this.appendEvent("client-update-held", {
+        updatesBehind: held.updates,
+        types: held.lastUpdateTypes,
+      });
+    }
+    if (held && held.serverRestarts > status.devServerRestarts) {
+      console.log(
+        `[agent-daemon] ${new Date().toISOString()} dev server restarted under this page; the page keeps its code (held, not reloaded)`,
+      );
+    }
+    if (held) {
+      status.updatesBehind = held.updates;
+      status.lastHeldUpdateAt = held.lastUpdateAt;
+      status.lastHeldUpdateTypes = held.lastUpdateTypes;
+      status.devServerRestarts = held.serverRestarts;
+    }
+  }
+
+  private currentJoin(snapshot: ConnectionSnapshot | null): JoinIdentity {
+    return {
+      documentId: this.clientStatus.documentId,
+      joinSerial: snapshot?.joinSerial ?? null,
+      joinGeneration: snapshot?.joinGeneration ?? null,
+      world: snapshot?.world ?? null,
+    };
+  }
+
+  /**
+   * Remember the live pose; on the first fresh tick of a new join, put the
+   * remembered one back first. Serialized: the timer, /healthz and /reload
+   * all reach it.
+   */
+  private syncPose(snapshot: ConnectionSnapshot): Promise<void> {
+    if (this.poseSync) return this.poseSync;
+    this.poseSync = (async () => {
+      let sample;
+      try {
+        sample = await this.agent.poseSample();
+      } catch {
+        return;
+      }
+      const join: JoinIdentity = {
+        documentId: sample.documentId,
+        joinSerial: sample.joinSerial ?? snapshot.joinSerial ?? null,
+        joinGeneration:
+          sample.joinGeneration ?? snapshot.joinGeneration ?? null,
+        world: sample.world ?? snapshot.world ?? null,
+      };
+      this.agent.observeWorld(join.world);
+      // The old world's bridge answering after the address moved on: its
+      // pose is the old world's, so it is not taken for the new one.
+      if (this.pose && isMidWorldSwitch(this.pose, join)) return;
+      if (this.pose && isNewJoin(this.pose, join)) {
+        const detectedAt = Date.now();
+        const previous = this.pose;
+        const skipReason = poseRestoreSkipReason(previous, join);
+        if (skipReason !== null) {
+          console.log(
+            `[agent-daemon] ${new Date().toISOString()} rejoined (${describeJoinChange(previous.join, join)}): ${skipReason}`,
+          );
+          this.isNextRestoreSkipped = false;
+          // Nor its fly and view radius: a later rejoin in the new world
+          // would replay them there.
+          this.poseIntent = carriedPoseIntent(
+            this.poseIntent,
+            previous.join,
+            join,
+          );
+          this.appendEvent("pose-restore-skipped", {
+            reason: skipReason,
+            from: previous.join,
+            to: join,
+          });
+        } else if (!this.isPoseRestoreEnabled || this.isNextRestoreSkipped) {
+          console.log(
+            `[agent-daemon] ${new Date().toISOString()} rejoined; not restoring the pose (${
+              this.isNextRestoreSkipped
+                ? "reload asked not to"
+                : "AGENT_RESTORE_POSE=0"
+            })`,
+          );
+          this.isNextRestoreSkipped = false;
+        } else {
+          await this.restorePose(previous, join, detectedAt);
+        }
+        try {
+          sample = await this.agent.poseSample();
+        } catch {
+          return;
+        }
+      }
+      this.pose = rememberPose(
+        sample,
+        { ...join, documentId: sample.documentId },
+        this.poseIntent,
+        Date.now(),
+      );
+    })().finally(() => {
+      this.poseSync = null;
+    });
+    return this.poseSync;
+  }
+
+  private async restorePose(
+    pose: RememberedPose,
+    to: JoinIdentity,
+    detectedAt: number,
+  ): Promise<void> {
+    const record: PoseRestoreRecord = {
+      at: detectedAt,
+      pose,
+      from: pose.join,
+      to,
+      error: null,
+    };
+    const report = await replayPose(
+      pose,
+      {
+        // A page busy finishing its join may not answer yet: not finished.
+        isJoinFinished: () =>
+          this.agent
+            .snapshot()
+            .then((snapshot) => snapshot.isReady === true)
+            .catch(() => false),
+        setFlying: (isFlying) => this.agent.setFlying(isFlying),
+        teleport: (position) => this.agent.teleport(position),
+        face: (facing) => this.agent.face({ ...facing }),
+        setRenderRadius: (radius) => this.agent.setRenderRadius(radius),
+        isMoveOverridden: () =>
+          isPoseSuperseded(
+            pose,
+            this.lastMoveCommandAt,
+            this.moveCommandsInFlight,
+          ),
+        isRadiusOverridden: () =>
+          this.poseIntent.renderRadius !== pose.renderRadius,
+        isSameJoin: async () => {
+          const connection = this.freshness.lastConnection;
+          if (this.freshness.isStale || connection === null) return false;
+          if (
+            (connection.joinGeneration ?? null) !== to.joinGeneration ||
+            (connection.joinSerial ?? null) !== to.joinSerial
+          ) {
+            return false;
+          }
+          const sample = await this.agent.poseSample().catch(() => null);
+          return sample === null || sample.documentId === to.documentId;
+        },
+      },
+      {
+        retryMs: resolveReadyTimeoutMs().timeoutMs,
+        log: (line) =>
+          console.log(
+            `[agent-daemon] ${new Date().toISOString()} pose restore: ${line}`,
+          ),
+      },
+    );
+    record.error = report.error;
+    this.lastPoseRestore = record;
+    if (record.error === null) this.poseRestoreCount += 1;
+    const age = Math.round((detectedAt - pose.sampledAt) / 1000);
+    const waits = [
+      report.joinWaitMs > 0
+        ? `waited ${Math.round(report.joinWaitMs / 100) / 10}s for the join to finish`
+        : null,
+      report.renderRadiusAttempts > 1
+        ? `render radius took ${report.renderRadiusAttempts} tries`
+        : null,
+    ].filter((wait) => wait !== null);
+    console.log(
+      `[agent-daemon] ${new Date().toISOString()} ${
+        record.error === null ? "restored pose" : "pose restore incomplete"
+      } after rejoin (${describeJoinChange(pose.join, to)}): ${describePose(pose)}, remembered ${age}s before${
+        waits.length > 0 ? ` (${waits.join("; ")})` : ""
+      }${record.error ? ` — ${record.error}` : ""}`,
+    );
+    this.appendEvent("pose-restored", {
+      isRestored: record.error === null,
+      error: record.error,
+      position: pose.position,
+      facing: pose.facing,
+      isFlying: pose.isFlying,
+      renderRadius: pose.renderRadius,
+    });
+  }
+
+  /**
+   * Move this tab to another world and wait until it stands there. Recovery
+   * holds off throughout: the page goes away on purpose, and a reset in the
+   * middle would reload the world being left.
+   */
+  private async switchWorld(
+    world: string,
+    requested: "soft" | "hard",
+  ): Promise<WorldSwitchResult> {
+    const startedAt = Date.now();
+    await this.pageWatchTick();
+    const from = {
+      world: this.agent.worldName,
+      url: this.agent.pageUrl(),
+      documentId: this.clientStatus.documentId,
+      joinSerial: this.freshness.lastConnection?.joinSerial ?? null,
+    };
+    let mode: "soft" | "hard" = "hard";
+    let note: string | undefined;
+    const result = (
+      fields: Partial<WorldSwitchResult> & { ok: boolean },
+    ): WorldSwitchResult => ({
+      mode,
+      world,
+      from: from.world,
+      sessionWorld: this.agent.worldName,
+      hopMs: Date.now() - startedAt,
+      documentChanged: this.clientStatus.documentId !== from.documentId,
+      joinSerial: null,
+      joinGeneration: null,
+      chunksLoaded: null,
+      ...(note !== undefined ? { note } : {}),
+      ...fields,
+    });
+    console.log(
+      `[agent-daemon] ${new Date().toISOString()} world switch ${from.world} -> ${world} requested (${requested})`,
+    );
+    const wasRecoveryInFlight = this.isRecoveryInFlight;
+    this.isRecoveryInFlight = true;
+    try {
+      if (requested === "soft") {
+        try {
+          if (await this.agent.switchWorldInPage(world)) {
+            mode = "soft";
+          } else {
+            note =
+              "the page did not switch in place (it has no in-page world switch, or it declined or failed: see the page log); opened the world's page instead";
+          }
+        } catch (error) {
+          note = `the in-page world switch failed (${
+            error instanceof Error ? error.message : String(error)
+          }); opened the world's page instead`;
+        }
+      }
+      if (mode === "hard") {
+        this.expectedNavigation = { cause: "world", at: Date.now() };
+        try {
+          await this.agent.navigateTo(composeWorldSwitchUrl(from.url, world));
+        } catch (error) {
+          // The world's page cannot load (the client answered an error, or
+          // nothing loaded within the retry budget): stand back in the world
+          // being left rather than on an error page. A load still going on
+          // timeouts alone does not throw here (navigateTo waits for it).
+          if (
+            !(error instanceof PageUnavailableError) ||
+            !from.url.startsWith("http")
+          ) {
+            throw error;
+          }
+          this.expectedNavigation = { cause: "world", at: Date.now() };
+          const isBack = await this.agent.navigateTo(from.url).then(
+            () => true,
+            () => false,
+          );
+          return result({
+            ok: false,
+            error: `${error.message}; ${
+              isBack
+                ? `went back to ${from.world}`
+                : `could not go back to ${from.world} either`
+            }`,
+          });
+        }
+      }
+      const deadline = Date.now() + resolveReadyTimeoutMs().timeoutMs;
+      let last: Snapshot | null = null;
+      while (Date.now() < deadline) {
+        await this.pageWatchTick();
+        await this.watchConnectionTick();
+        last = await this.agent.snapshot().catch(() => null);
+        const isNewJoin =
+          this.clientStatus.documentId !== from.documentId ||
+          (last?.joinSerial ?? null) !== from.joinSerial;
+        if (
+          last !== null &&
+          isNewJoin &&
+          last.world === world &&
+          last.isReady === true &&
+          last.chunks.loaded > 0
+        ) {
+          this.agent.observeWorld(last.world);
+          const arrived = result({
+            ok: true,
+            joinSerial: last.joinSerial ?? null,
+            joinGeneration:
+              this.freshness.lastConnection?.joinGeneration ?? null,
+            chunksLoaded: last.chunks.loaded,
+          });
+          // The new join is taken in (the old world's fly and view radius
+          // dropped) before the switch answers, so a command sent right
+          // after it is remembered as the new world's.
+          if (this.poseSync) await this.poseSync;
+          const connection = this.freshness.lastConnection;
+          if (!this.freshness.isStale && connection) {
+            await this.syncPose(connection);
+          }
+          console.log(
+            `[agent-daemon] ${new Date().toISOString()} world switch ${from.world} -> ${world} (${mode}${
+              arrived.documentChanged ? ", new page document" : ", same page"
+            }): standing there after ${(arrived.hopMs / 1000).toFixed(2)}s with ${last.chunks.loaded} chunk(s)${
+              note ? `; ${note}` : ""
+            }`,
+          );
+          this.appendEvent("world-switch", arrived);
+          return arrived;
+        }
+        await new Promise((resolve) =>
+          setTimeout(resolve, WORLD_ARRIVAL_POLL_MS),
+        );
+      }
+      return result({
+        ok: false,
+        chunksLoaded: last?.chunks.loaded ?? null,
+        error: `the page did not stand in ${world} within ${Math.round(
+          (Date.now() - startedAt) / 1000,
+        )}s (last: ${
+          last
+            ? `world=${last.world} ready=${last.isReady} chunks=${last.chunks.loaded} bridge=${last.joinSerial ?? "?"}`
+            : "no bridge answered"
+        })`,
+      });
+    } catch (error) {
+      return result({
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      if (!wasRecoveryInFlight) this.isRecoveryInFlight = false;
+      this.pageStalledSinceAt = null;
+      if (this.freshness.isStale) this.freshness.staleSinceAt = Date.now();
+    }
+  }
+
+  /** A command that moves the agent: remember where it ended up at once. */
+  private async notePoseCommand(): Promise<void> {
+    const snapshot = this.freshness.lastConnection;
+    if (!snapshot || !this.pose) return;
+    try {
+      const sample = await this.agent.poseSample();
+      // A page mid-rejoin still knows where its own body is, and that is the
+      // pose the rejoin must put back; only a new document has lost it.
+      if (
+        this.freshness.isStale &&
+        sample.documentId !== this.pose.join.documentId
+      ) {
+        return;
+      }
+      this.pose = rememberPose(
+        sample,
+        this.pose.join.documentId === sample.documentId
+          ? this.pose.join
+          : this.currentJoin(snapshot),
+        this.poseIntent,
+        Date.now(),
+      );
+    } catch {
+      // the next watch tick samples it
+    }
   }
 
   private startConnectionWatch(): void {
@@ -363,12 +1315,21 @@ export class AgentDaemon {
     let failureMessage: string | null = null;
     try {
       snapshot = await this.agent.connection();
+      this.pageStalledSinceAt = null;
     } catch (error) {
       failureMessage = error instanceof Error ? error.message : String(error);
+      if (error instanceof PageStallError) {
+        this.pageStalledSinceAt ??= Date.now();
+      } else {
+        this.pageStalledSinceAt = null;
+      }
     }
     this.updateFreshness(snapshot, failureMessage);
+    if (snapshot) this.agent.observeWorld(snapshot.world);
     if (this.freshness.isStale) {
       await this.maybeRecoverConnection(snapshot);
+    } else if (snapshot) {
+      await this.syncPose(snapshot);
     }
   }
 
@@ -390,7 +1351,9 @@ export class AgentDaemon {
           ? Date.now() - this.freshness.staleSinceAt
           : 0;
       console.log(
-        `[agent-daemon] world fresh again after ${Math.round(staleForMs / 1000)}s ` +
+        `[agent-daemon] world fresh again after ${Math.round(
+          staleForMs / 1000,
+        )}s ` +
           `(join generation ${snapshot?.joinGeneration}, ${this.recoveryAttemptCount} recovery attempt(s))`,
       );
       this.appendEvent("connection-fresh", {
@@ -433,6 +1396,25 @@ export class AgentDaemon {
       return;
     }
 
+    // A page whose calls time out is busy (a bulk remesh on a loaded box),
+    // not gone: resetting it throws away its join and makes the next one
+    // just as slow. Only a stall that outlasts this is treated as wedged.
+    if (
+      snapshot === null &&
+      this.pageStalledSinceAt !== null &&
+      Date.now() - this.pageStalledSinceAt < STALLED_PAGE_RESET_AFTER_MS
+    ) {
+      if (!this.isStallNoted) {
+        console.log(
+          `[agent-daemon] ${new Date().toISOString()} page is busy (its calls time out); waiting up to ${Math.round(
+            STALLED_PAGE_RESET_AFTER_MS / 1000,
+          )}s before treating it as wedged`,
+        );
+        this.isStallNoted = true;
+      }
+      return;
+    }
+    this.isStallNoted = false;
     this.isRecoveryInFlight = true;
     this.recoveryAttemptCount += 1;
     this.lastRecoveryAt = Date.now();
@@ -447,8 +1429,9 @@ export class AgentDaemon {
       attempt > IN_PAGE_RECONNECT_ATTEMPTS;
     const strategy = isResetting ? "page reset" : "in-page reconnect";
     console.log(
-      `[agent-daemon] recovery attempt ${attempt} (${strategy}): stale ${Math.round(staleForMs / 1000)}s, ` +
-        `reason: ${this.freshness.reason}`,
+      `[agent-daemon] recovery attempt ${attempt} (${strategy}): stale ${Math.round(
+        staleForMs / 1000,
+      )}s, ` + `reason: ${this.freshness.reason}`,
     );
     this.appendEvent("reconnect-attempt", {
       attempt,
@@ -458,7 +1441,7 @@ export class AgentDaemon {
     });
     try {
       if (isResetting) {
-        await this.agent.reset();
+        await this.resetPage("reset");
         console.log(
           `[agent-daemon] recovery attempt ${attempt}: page reset completed, awaiting rejoin`,
         );
@@ -508,7 +1491,9 @@ export class AgentDaemon {
       if (error instanceof PageStallError) {
         throw error;
       }
-      reason = `bridge unreachable (${error instanceof Error ? error.message : String(error)})`;
+      reason = `bridge unreachable (${
+        error instanceof Error ? error.message : String(error)
+      })`;
     }
     reply.code(409);
     void reply.send({
@@ -541,6 +1526,15 @@ export class AgentDaemon {
         void reply.code(400).send({ ok: false, error: error.message });
         return;
       }
+      if (error instanceof MethodOutcomeError) {
+        void reply.code(422).send({
+          ok: false,
+          error: error.message,
+          method: error.method,
+          outcome: error.outcome,
+        });
+        return;
+      }
       if (error instanceof z.ZodError) {
         void reply.code(400).send({ ok: false, error: error.flatten() });
         return;
@@ -571,6 +1565,12 @@ export class AgentDaemon {
       if (this.isActivityRequest(req)) {
         this.inflightCount += 1;
         this.noteActivity();
+        // A command against a throttled page waits for the cap to lift and
+        // one frame to draw, so what it reads or captures is current.
+        if (this.isDrawThrottled || this.drawThrottleChange) {
+          void this.wakeForCommand().finally(() => done());
+          return;
+        }
       }
       done();
     });
@@ -638,6 +1638,101 @@ export class AgentDaemon {
     // browser is wedged or dead, so reap/session-list can read the fleet.
     this.server.get("/status", async () => this.status());
 
+    // Who this session is for and what it is doing, editable by anyone who
+    // can reach the daemon (the CLI, a scenario, the local admin page). Like
+    // /status it never touches the page, so a wedged browser still answers.
+    this.server.get("/meta", async () => this.metaResponse());
+    this.server.patch("/meta", async (req, reply) => {
+      const parsed = metaPatchSchema.safeParse(req.body ?? {});
+      if (!parsed.success) {
+        reply.code(400);
+        return {
+          error: "meta patch must be { set?: {key: value}, unset?: [key] }",
+          issues: parsed.error.issues,
+        };
+      }
+      try {
+        this.patchSessionMeta(parsed.data);
+      } catch (error) {
+        if (error instanceof SessionMetaError) {
+          reply.code(400);
+          return { error: error.message };
+        }
+        throw error;
+      }
+      return this.metaResponse();
+    });
+
+    // A passive watcher's heartbeat (session-watch.ts): an accepted beat is
+    // activity, for the hold the watcher declared on its first one. Never
+    // touches the page, so a watcher can keep beating while the page works.
+    this.server.post("/watch", async (req, reply) => {
+      let beat;
+      try {
+        beat = WatchLedger.parse(req.body);
+      } catch (error) {
+        if (!(error instanceof WatchError)) throw error;
+        reply.code(400);
+        return { ok: false, error: error.message };
+      }
+      const result = this.watches.beat(beat);
+      if (!result.isAccepted) {
+        if (!this.refusedWatchers.has(beat.watcher)) {
+          this.refusedWatchers.add(beat.watcher);
+          console.log(
+            `[agent-daemon] ${new Date().toISOString()} refused a beat from watch '${beat.watcher}': ${result.reason}`,
+          );
+        }
+        reply.code(409);
+        return { ok: false, error: result.reason, watch: result.watch };
+      }
+      this.noteActivity();
+      if (result.isNew) {
+        this.refusedWatchers.delete(beat.watcher);
+        const { watch } = result;
+        console.log(
+          `[agent-daemon] ${new Date().toISOString()} watch '${watch.watcher}'${
+            watch.pid ? ` (pid ${watch.pid})` : ""
+          } holds this session until ${new Date(watch.holdUntil).toISOString()} while it beats at least every ${Math.round(WATCH_BEAT_TIMEOUT_MS / 1000)}s${
+            watch.purpose ? `: ${watch.purpose}` : ""
+          }`,
+        );
+        this.appendEvent("watch-started", {
+          watcher: watch.watcher,
+          holdUntil: watch.holdUntil,
+        });
+      }
+      return {
+        ok: true,
+        watch: result.watch,
+        beatTimeoutMs: WATCH_BEAT_TIMEOUT_MS,
+      };
+    });
+
+    this.server.delete<{ Querystring: { watcher?: string } }>(
+      "/watch",
+      async (req, reply) => {
+        const watcher = req.query.watcher ?? "";
+        const watch = this.watches.end(watcher);
+        if (watch === null) {
+          reply.code(404);
+          return {
+            ok: false,
+            error: `no watch named '${watcher}' holds this session`,
+          };
+        }
+        this.refusedWatchers.delete(watcher);
+        console.log(
+          `[agent-daemon] ${new Date().toISOString()} watch '${watch.watcher}' ended by its watcher after ${watch.beats} beat(s); the idle clock runs from the last activity again`,
+        );
+        this.appendEvent("watch-ended", {
+          watcher: watch.watcher,
+          reason: "ended by its watcher",
+        });
+        return { ok: true, watch };
+      },
+    );
+
     this.server.get<{ Querystring: { allowStale?: string } }>(
       "/me",
       async (req, reply) => {
@@ -668,6 +1763,12 @@ export class AgentDaemon {
     // menu, badges, chat). Same width/height/scale options as /screenshot.
     this.registerScreenshotRoute("/sc", true);
 
+    // What would make a capture taken now mislead (a tipped camera, a screen
+    // covering the world), so a script can check before it shoots.
+    this.server.get("/caveats", async () => ({
+      caveats: await this.readCaptureCaveats(),
+    }));
+
     // Same optional width/height/scale override as /screenshot: the page is
     // resized for the measurement only, so FPS can be sampled at a real
     // display resolution (e.g. ?width=1512&height=982&scale=2 for a Retina
@@ -683,6 +1784,18 @@ export class AgentDaemon {
     }>("/frame-rate", async (req, reply) => {
       try {
         const requested = parseCaptureViewportQuery(req.query);
+        try {
+          await this.liftDrawCapForMeasurement();
+        } catch (error) {
+          reply.code(503);
+          return {
+            ok: false,
+            error:
+              "frame-rate refused: could not confirm the page draws every frame " +
+              `(${error instanceof Error ? error.message : String(error)}); a capped ` +
+              "page reports its loop's cadence, not frames drawn",
+          };
+        }
         return await this.agent.measureFrameRate({
           durationMs:
             req.query.durationMs !== undefined
@@ -698,6 +1811,10 @@ export class AgentDaemon {
         if (e instanceof CaptureViewportError) {
           reply.code(400);
           return { ok: false, error: e.message };
+        }
+        if (e instanceof CappedFrameRateError) {
+          reply.code(503);
+          return { ok: false, error: e.message, drawThrottle: e.record };
         }
         throw e;
       }
@@ -802,6 +1919,19 @@ export class AgentDaemon {
             retryAfterMs: e.retryAfterMs,
           };
         }
+        if (e instanceof MethodOutcomeError) {
+          reply.code(422);
+          return {
+            ok: false,
+            error: e.message,
+            method: e.method,
+            outcome: e.outcome,
+          };
+        }
+        if (e instanceof FillLandingError) {
+          reply.code(422);
+          return { ok: false, error: e.message, report: e.report };
+        }
         const message = e instanceof Error ? e.message : String(e);
         reply.code(500);
         return { ok: false, error: message };
@@ -818,7 +1948,94 @@ export class AgentDaemon {
 
     this.server.get("/memory", async () => this.agent.memoryStatus());
 
+    // Main-thread time per function per frame (and, with alloc=1, the
+    // garbage each function minted) over a sampling window. The measurement
+    // behind any "this costs X ms a frame" claim; `watch` is a regex over
+    // the function labels so a gate can name the functions it is about.
+    this.server.get<{
+      Querystring: {
+        durationMs?: string;
+        alloc?: string;
+        watch?: string;
+        top?: string;
+      };
+    }>("/profile", async (req, reply) => {
+      const durationMs =
+        req.query.durationMs !== undefined
+          ? Number(req.query.durationMs)
+          : undefined;
+      if (durationMs !== undefined && !(durationMs > 0)) {
+        reply.code(400);
+        return { ok: false, error: "durationMs must be a positive number" };
+      }
+      const top =
+        req.query.top !== undefined ? Number(req.query.top) : undefined;
+      try {
+        if (req.query.watch) new RegExp(req.query.watch, "i");
+      } catch (error) {
+        reply.code(400);
+        return {
+          ok: false,
+          error: `watch is not a valid regex: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        };
+      }
+      return this.agent.profile({
+        durationMs,
+        isSamplingAllocations:
+          req.query.alloc === "1" || req.query.alloc === "true",
+        watch: req.query.watch ?? null,
+        top,
+      });
+    });
+
+    // A V8 heap snapshot written under the capture dir (heap/), for the
+    // leak hunt the memory trend starts: two of these a few minutes apart,
+    // diffed by class, name what accumulates; the retaining path names who
+    // holds it. Several hundred megabytes and a 10-20 s main-thread hold,
+    // so it is a command, never a poll.
+    this.server.get<{ Querystring: { label?: string } }>(
+      "/heap-snapshot",
+      async (req, reply) => {
+        const label = sanitizeFileLabel(req.query.label ?? "heap");
+        const dir = ensureCaptureDir([HEAP_SNAPSHOT_SUBDIR]);
+        const filePath = path.join(
+          dir,
+          `agent-${Date.now()}_${label}.heapsnapshot`,
+        );
+        try {
+          return await this.agent.heapSnapshot(filePath);
+        } catch (error) {
+          reply.code(500);
+          return {
+            error: `heap snapshot failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          };
+        }
+      },
+    );
+
     this.server.get("/render-stats", async () => this.agent.renderStats());
+
+    this.server.get<{ Querystring: { allowStale?: string } }>(
+      "/block-animations",
+      async (req, reply) => {
+        if (!(await this.assertReadableWorld(req.query, reply))) return reply;
+        return this.agent.blockAnimations();
+      },
+    );
+
+    this.server.get("/textures", async () => this.agent.textureCensus());
+
+    this.server.post<{ Body: { color?: string } }>(
+      "/textures/fill",
+      async (req) =>
+        this.agent.fillUnpaintedSurfaces(
+          req.body?.color ? { color: req.body.color } : undefined,
+        ),
+    );
 
     this.server.get("/mesh-transfer/status", async () =>
       this.agent.meshTransferStatus(),
@@ -853,8 +2070,86 @@ export class AgentDaemon {
     });
 
     this.server.post("/reset", async () => {
-      await this.agent.reset();
+      await this.resetPage("reset");
       return { ok: true };
+    });
+
+    // Fresh client code on request: the page reloads (picking up every held
+    // hot update), rejoins, and is put back where it stood unless asked not
+    // to. Answers once the world is fresh and the pose is back, or when the
+    // bridge wait runs out.
+    const reloadBodySchema = z
+      .object({ isRestoringPose: z.boolean().optional() })
+      .nullish();
+    this.server.post("/reload", async (req, reply) => {
+      const parsed = reloadBodySchema.safeParse(req.body ?? null);
+      if (!parsed.success) {
+        reply.code(400);
+        return { ok: false, error: parsed.error.flatten() };
+      }
+      const isRestoringPose = parsed.data?.isRestoringPose !== false;
+      const pickedUp = this.clientStatus.updatesBehind;
+      const before = this.clientStatus.documentId;
+      console.log(
+        `[agent-daemon] ${new Date().toISOString()} reload requested: picking up ${pickedUp} held client update(s)${
+          isRestoringPose ? "" : "; the pose will not be restored"
+        }`,
+      );
+      if (!isRestoringPose) this.isNextRestoreSkipped = true;
+      // A page that never installed a bridge gets a plain reload: waiting
+      // for a bridge would hang, and its connection is not ours to recover.
+      const isBridgeSession = this.connectionWatchTimer !== null;
+      if (isBridgeSession) {
+        await this.resetPage("reload");
+      } else {
+        this.expectedNavigation = { cause: "reload", at: Date.now() };
+        await this.agent.reloadDocument();
+      }
+      const deadline = Date.now() + resolveReadyTimeoutMs().timeoutMs;
+      let isFresh = false;
+      while (Date.now() < deadline) {
+        await this.pageWatchTick();
+        if (isBridgeSession) await this.watchConnectionTick();
+        const isNewDocument = this.clientStatus.documentId !== before;
+        if (isNewDocument && (!isBridgeSession || !this.freshness.isStale)) {
+          if (this.poseSync) await this.poseSync;
+          isFresh = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      return {
+        ok: isFresh,
+        pickedUpUpdates: pickedUp,
+        isFresh,
+        client: this.status().client,
+        pose: this.poseStatus(),
+        ...(isFresh
+          ? {}
+          : {
+              error:
+                "reloaded, but the world did not rejoin before the bridge wait ran out",
+            }),
+      };
+    });
+
+    // Another world in this tab: in place when the page's host can switch
+    // worlds itself (`AgentBridge.switchWorld`, mode `soft`, the default),
+    // otherwise (or with mode `hard`) by opening that world's page. Answers
+    // once the page stands in the world, its join finished and chunks in.
+    const worldBodySchema = z.object({
+      world: z.string().regex(WORLD_NAME_PATTERN),
+      mode: z.enum(["soft", "hard"]).optional(),
+    });
+    this.server.post("/world", async (req, reply) => {
+      const parsed = worldBodySchema.safeParse(req.body ?? null);
+      if (!parsed.success) {
+        reply.code(400);
+        return { ok: false, error: parsed.error.flatten() };
+      }
+      // Like /reload, a switch that did not land answers 200 with ok false
+      // and says why: the session is still there, in whichever world.
+      return this.switchWorld(parsed.data.world, parsed.data.mode ?? "soft");
     });
 
     const freezeBodySchema = z.object({
@@ -869,7 +2164,7 @@ export class AgentDaemon {
 
     this.server.post("/freeze", async (req, reply) => {
       const body = freezeBodySchema.parse(req.body);
-      await this.agent.call("freeze-entity", {
+      await this.callMethod("freeze-entity", {
         entityId: body.entityId,
         durationSecs: body.durationSecs,
       });
@@ -891,7 +2186,7 @@ export class AgentDaemon {
         const frozenBefore = before.filter(
           (e) => this.metadataFrozenFlag(e.metadata) === true,
         );
-        await this.agent.call("thaw-all", {});
+        await this.callMethod("thaw-all", {});
         const after = await this.agent.entitiesNear(128);
         const thawed = frozenBefore.map((prev) => {
           const now = after.find((e) => e.id === prev.id) ?? prev;
@@ -916,7 +2211,7 @@ export class AgentDaemon {
         reply.code(400);
         return { ok: false, error: "entityId or all:true required" };
       }
-      await this.agent.call("thaw-entity", { entityId });
+      await this.callMethod("thaw-entity", { entityId });
       const entity = await this.waitForFrozenMetadata(entityId, false);
       if (!entity) {
         reply.code(502);
@@ -930,7 +2225,9 @@ export class AgentDaemon {
         }
         return {
           ok: false,
-          error: `entity ${entityId} metadata.frozen did not flip false (still ${String(hit.metadata?.frozen)})`,
+          error: `entity ${entityId} metadata.frozen did not flip false (still ${String(
+            hit.metadata?.frozen,
+          )})`,
         };
       }
       return { ok: true, entity };
@@ -991,7 +2288,12 @@ export class AgentDaemon {
       const { actions, isStoppingOnError } = parsed.data;
       const results: Array<
         | { ok: true; result: unknown }
-        | { ok: false; error: string; retryAfterMs?: number }
+        | {
+            ok: false;
+            error: string;
+            retryAfterMs?: number;
+            outcome?: MethodOutcomeError["outcome"];
+          }
       > = [];
       for (const action of actions) {
         try {
@@ -1003,6 +2305,7 @@ export class AgentDaemon {
             ...(e instanceof PageStallError
               ? { retryAfterMs: e.retryAfterMs }
               : {}),
+            ...(e instanceof MethodOutcomeError ? { outcome: e.outcome } : {}),
           });
           if (isStoppingOnError) break;
         }
@@ -1216,13 +2519,17 @@ export class AgentDaemon {
           error: body.entityId
             ? `no entity with id ${body.entityId} within ${FRAME_SEARCH_RADIUS} blocks`
             : `no entity matching kind ~= "${body.kind}" within ${FRAME_SEARCH_RADIUS} blocks ` +
-              `(have: ${[...new Set(entities.map((entity) => entity.kind))].join(", ") || "none"})`,
+              `(have: ${
+                [...new Set(entities.map((entity) => entity.kind))].join(
+                  ", ",
+                ) || "none"
+              })`,
         };
       }
 
       const isFreezing = body.isFreezing === true;
       if (isFreezing) {
-        await this.agent.call("freeze-entity", {
+        await this.callMethod("freeze-entity", {
           entityId: target.id,
           durationSecs: FRAME_FREEZE_SECONDS,
         });
@@ -1273,7 +2580,7 @@ export class AgentDaemon {
       } finally {
         if (isFreezing) {
           try {
-            await this.agent.call("thaw-entity", { entityId: target.id });
+            await this.callMethod("thaw-entity", { entityId: target.id });
           } catch (e) {
             // The freeze self-expires server-side; a failed thaw only delays
             // the entity, but say so instead of hiding it.
@@ -1494,7 +2801,7 @@ export class AgentDaemon {
       }
       if (parsed.data?.isResetting) {
         console.log("[agent-daemon] manual /reconnect with reset requested");
-        await this.agent.reset();
+        await this.resetPage("reset");
         return { ok: true, action: "reset" };
       }
       let connection: ConnectionSnapshot | null = null;
@@ -1505,7 +2812,7 @@ export class AgentDaemon {
           "[agent-daemon] manual /reconnect: bridge unreachable, resetting page:",
           e instanceof Error ? e.message : e,
         );
-        await this.agent.reset();
+        await this.resetPage("reset");
         return { ok: true, action: "reset", reason: "bridge unreachable" };
       }
       if (isLiveConnection(connection)) {
@@ -1515,12 +2822,14 @@ export class AgentDaemon {
         console.log(
           "[agent-daemon] manual /reconnect: client build outdated, resetting page",
         );
-        await this.agent.reset();
+        await this.resetPage("reset");
         return { ok: true, action: "reset", reason: "client outdated" };
       }
       const isTriggered = await this.agent.reconnectInPage();
       console.log(
-        `[agent-daemon] manual /reconnect: in-page reconnect ${isTriggered ? "triggered" : "reported nothing to do"}`,
+        `[agent-daemon] manual /reconnect: in-page reconnect ${
+          isTriggered ? "triggered" : "reported nothing to do"
+        }`,
       );
       return {
         ok: true,
@@ -1530,6 +2839,21 @@ export class AgentDaemon {
     });
   }
 
+  /** The page's capture caveats; a failed read is a caveat of its own, never
+   * a clean bill. */
+  private async readCaptureCaveats(): Promise<CaptureCaveat[]> {
+    try {
+      return await this.agent.captureCaveats();
+    } catch (error) {
+      return [
+        {
+          code: "unread",
+          message: `could not read what this frame shows: ${error instanceof Error ? error.message : String(error)}`,
+        },
+      ];
+    }
+  }
+
   private registerScreenshotRoute(
     routePath: string,
     isAlwaysPure: boolean,
@@ -1537,6 +2861,7 @@ export class AgentDaemon {
     this.server.get<{
       Querystring: {
         pure?: string;
+        hand?: string;
         width?: string;
         height?: string;
         scale?: string;
@@ -1546,9 +2871,25 @@ export class AgentDaemon {
       if (!(await this.assertReadableWorld(req.query, reply))) return reply;
       const isPure =
         isAlwaysPure || req.query.pure === "true" || req.query.pure === "1";
+      const isIncludingArm =
+        req.query.hand === "true" || req.query.hand === "1";
       try {
         const requested = parseCaptureViewportQuery(req.query);
-        const buffer = await this.agent.screenshot({ isPure, ...requested });
+        const caveats = await this.readCaptureCaveats();
+        const buffer = await this.agent.screenshot({
+          isPure,
+          isIncludingArm,
+          ...requested,
+        });
+        if (caveats.length > 0) {
+          console.warn(
+            `[agent-daemon] ${routePath} captured a frame that misleads: ${caveats.map((c) => c.message).join("; ")}`,
+          );
+        }
+        reply.header(
+          CAPTURE_CAVEATS_HEADER,
+          JSON.stringify(caveats).replace(/[^\x20-\x7e]/g, "?"),
+        );
         reply.header("content-type", "image/png");
         return buffer;
       } catch (e) {
@@ -1561,9 +2902,131 @@ export class AgentDaemon {
     });
   }
 
+  /**
+   * One server method, failed out loud when the server answers that it did
+   * nothing: no handler in this world, or turned down. The thrown
+   * `MethodOutcomeError` reaches the caller as a 422.
+   */
+  private async callMethod(method: string, payload: unknown): Promise<unknown> {
+    const result = await this.agent.call(method, payload);
+    try {
+      assertMethodRan(method, result);
+    } catch (error) {
+      console.log(
+        `[agent-daemon] ${new Date().toISOString()} ${error instanceof Error ? error.message : String(error)}`,
+      );
+      throw error;
+    }
+    return result;
+  }
+
+  /**
+   * The host's fill method, read back until every voxel holds its block.
+   * A sent call is not a landed one: the core drops a page that stops
+   * draining its socket, and calls it had not read yet go with it, while
+   * the page reports them sent. Lost sends go out again; what never lands
+   * fails the act and is named in the report and the log.
+   */
+  private async fill(
+    action: Extract<z.infer<typeof actSchema>, { type: "fill" }>,
+  ): Promise<unknown> {
+    const method = action.method ?? DEFAULT_ARENA_METHODS.fill;
+    const boxes = action.fills as FillBox[];
+    const send = async (box: FillBox): Promise<CommandDispatch> => {
+      try {
+        return (await this.callMethod(method, box)) as CommandDispatch;
+      } catch (error) {
+        if (isPageUnavailable(error)) {
+          throw new FillPageUnavailableError(describeError(error));
+        }
+        throw error;
+      }
+    };
+    if (action.isVerifying === false) {
+      const sends: CommandDispatch[] = [];
+      for (const box of boxes) sends.push(await send(box));
+      return { isVerified: false, sends };
+    }
+    const volume = boxes.reduce((sum, box) => sum + boxVolume(box), 0);
+    if (volume > MAX_FILL_LANDING_VOLUME) {
+      throw new Error(
+        `a fill of ${volume} voxels is past the ${MAX_FILL_LANDING_VOLUME} this daemon reads back; ` +
+          `split it, or send it unverified`,
+      );
+    }
+    const report = await landFill(
+      boxes,
+      {
+        send,
+        census: async (censusBoxes) => {
+          try {
+            return await this.agent.voxelCensus(censusBoxes);
+          } catch (error) {
+            if (isPageUnavailable(error)) {
+              throw new FillPageUnavailableError(describeError(error));
+            }
+            throw error;
+          }
+        },
+        connection: () => this.freshness.lastConnection,
+        now: () => Date.now(),
+        sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+      },
+      {
+        ...DEFAULT_FILL_LANDING,
+        timeoutMs: action.timeoutMs ?? fillLandingTimeoutMs(volume),
+        maxSends: action.maxSends ?? DEFAULT_FILL_LANDING.maxSends,
+      },
+    );
+    const resent = report.boxes.some((box) => box.sends.length > 1);
+    if (report.status !== "landed" || resent) {
+      console.log(
+        `[agent-daemon] ${new Date().toISOString()} ${method} ${report.status}: ${report.message}${
+          report.status === "landed"
+            ? ` (sends: ${report.boxes
+                .flatMap((box) => box.sends.map((s) => s.reason))
+                .join(", ")})`
+            : ""
+        }`,
+      );
+    }
+    if (report.status === "missing") throw new FillLandingError(report);
+    return report;
+  }
+
   private async executeAction(
     action: z.infer<typeof actSchema>,
   ): Promise<unknown> {
+    // Counted from the start: a rejoin noticed while this command is still
+    // running must not put an older position back over it.
+    const isMoveCommand = MOVING_ACTIONS.has(action.type);
+    if (isMoveCommand) {
+      this.lastMoveCommandAt = Date.now();
+      this.moveCommandsInFlight += 1;
+    }
+    let result: unknown;
+    try {
+      result = await this.runAction(action);
+    } finally {
+      if (isMoveCommand) this.moveCommandsInFlight -= 1;
+    }
+    // Flying and the view radius cannot be read back from the page, so the
+    // commands that set them are what a restore replays.
+    if (action.type === "set-flying" || action.type === "set-render-radius") {
+      this.poseIntent = mergePoseIntent(
+        this.poseIntent,
+        action.type === "set-flying"
+          ? { isFlying: action.isFlying }
+          : { renderRadius: (result as { renderRadius: number }).renderRadius },
+      );
+      if (this.pose) this.pose = { ...this.pose, ...this.poseIntent };
+    } else if (POSE_CHANGING_ACTIONS.has(action.type)) {
+      await this.notePoseCommand();
+    }
+    return result;
+  }
+
+  private async runAction(action: z.infer<typeof actSchema>): Promise<unknown> {
     switch (action.type) {
       case "chat":
         return this.agent.chat(action.text);
@@ -1583,6 +3046,7 @@ export class AgentDaemon {
         await this.agent.walk(action.direction, {
           durationMs: action.durationMs,
           isSprinting: action.isSprinting,
+          isJumping: action.isJumping,
         });
         return { walked: true };
       case "walk-to":
@@ -1619,10 +3083,41 @@ export class AgentDaemon {
         return {
           renderRadius: await this.agent.setRenderRadius(action.radius),
         };
+      case "set-fog-distance":
+        return {
+          fogDistance: await this.agent.setFogDistance(action.blocks),
+        };
       case "call":
-        return this.agent.call(action.method, action.payload);
+        return this.callMethod(action.method, action.payload);
+      case "fill":
+        return this.fill(action);
+      case "lose-calls": {
+        const remaining = await this.agent.loseCalls(
+          action.method,
+          action.count,
+        );
+        console.log(
+          `[agent-daemon] ${new Date().toISOString()} ${
+            remaining > 0
+              ? `the page will swallow the next ${remaining} ${action.method} call(s) on purpose, as a dropped socket does`
+              : `the page swallows no ${action.method} calls any more`
+          }`,
+        );
+        return { method: action.method, remaining };
+      }
       case "break-voxel":
         return this.agent.breakVoxel(action.pos);
+      case "place-voxel":
+        return this.agent.placeVoxel(action.pos, action.block);
+      case "select-hotbar":
+        await this.agent.selectHotbar(action.slot);
+        return { selectedSlot: action.slot };
+      case "interact":
+        return this.agent.interact(
+          action.button ?? "right",
+          action.holdMs,
+          action.isShift,
+        );
       case "wait":
         await new Promise((r) => setTimeout(r, action.ms));
         return { waited: action.ms };

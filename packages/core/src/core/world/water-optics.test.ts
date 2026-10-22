@@ -1,14 +1,28 @@
 import { Color } from "three";
 import { describe, expect, it } from "vitest";
 
-import { SHADER_LIGHTING_FLUID_CHUNK_SHADERS } from "./shaders";
 import {
-  ABOVE_SURFACE_WATER_FOG_FRAGMENT,
+  SHADER_LIGHTING_CHUNK_SHADERS,
+  SHADER_LIGHTING_CROSS_CHUNK_SHADERS,
+  SHADER_LIGHTING_FLUID_CHUNK_SHADERS,
+  SHADER_LIGHTING_SEE_THROUGH_CHUNK_SHADERS,
+} from "./shaders";
+import {
+  FLOW_CREST_PHASE_PER_HEIGHT,
+  FLUID_SPILL_CORNER_MIN_HEIGHT,
   getDownwellingTransmittance,
   getUnderwaterAmbientColor,
+  findWaterBodySurface,
   measureWaterColumn,
+  UNDERSIDE_CRITICAL_COS,
   UNDERWATER_FOG_FRAGMENT,
+  underwaterInScatterScale,
+  undersideSceneShare,
+  undersideTransmission,
+  WATER_DOWNWELLING_EXTINCTION_GLSL,
   WATER_OPTICS,
+  WATER_PANE_EXTINCTION_GLSL,
+  WATER_SURFACE_NORMAL_LAYERS_GLSL,
   WATER_VIEW_EXTINCTION_GLSL,
   WaterOptics,
 } from "./water-optics";
@@ -21,9 +35,11 @@ describe("getDownwellingTransmittance", () => {
     expect(out.b).toBeCloseTo(1);
   });
 
-  it("absorbs red within ten blocks and lets blue outlast green", () => {
+  it("keeps shallow reef color and loses red before green and blue", () => {
     const out = getDownwellingTransmittance(10, new Color());
-    expect(out.r).toBeLessThan(0.05);
+    expect(out.r).toBeGreaterThan(0.2);
+    expect(out.r).toBeLessThan(0.3);
+    expect(getDownwellingTransmittance(30, new Color()).r).toBeLessThan(0.02);
     expect(out.b).toBeGreaterThan(out.g);
     expect(out.g).toBeGreaterThan(out.r);
   });
@@ -64,21 +80,206 @@ describe("refraction incidence band", () => {
 });
 
 describe("cheap analytic water gloss", () => {
-  it("keeps the sun glint band ordered and Fresnel opacity bounded", () => {
+  it("keeps the sun glint bands ordered and Fresnel opacity bounded", () => {
     expect(WATER_OPTICS.sunGlintStartCos).toBeGreaterThanOrEqual(0);
     expect(WATER_OPTICS.sunGlintStartCos).toBeLessThan(
       WATER_OPTICS.sunGlintFullCos,
     );
     expect(WATER_OPTICS.sunGlintFullCos).toBeLessThanOrEqual(1);
+    // Far water takes a wider, dimmer disc than near water: the mips have
+    // flattened its normal, and the tight disc would refocus into a blob.
+    expect(WATER_OPTICS.sunGlintFarStartCos).toBeLessThan(
+      WATER_OPTICS.sunGlintStartCos,
+    );
+    expect(WATER_OPTICS.sunGlintFarStrength).toBeLessThan(
+      WATER_OPTICS.sunGlintStrength,
+    );
     expect(WATER_OPTICS.fresnelAlphaStrength).toBeGreaterThan(0);
     expect(WATER_OPTICS.fresnelAlphaStrength).toBeLessThanOrEqual(1);
   });
 
   it("compiles reflected-sun and Fresnel-opacity terms into the fluid shader", () => {
     const fragment = SHADER_LIGHTING_FLUID_CHUNK_SHADERS.fragment;
-    expect(fragment).toContain("float sunGlint = smoothstep(");
-    expect(fragment).toContain("max(dot(reflectDir, uSunDirection), 0.0)");
+    expect(fragment).toContain(
+      "float sunAlignment = max(dot(reflectDir, uCelestialDirection), 0.0);",
+    );
+    expect(fragment).toContain("float sunGlintNear = smoothstep(");
+    expect(fragment).toContain("float sunGlintFar = smoothstep(");
+    expect(fragment).toContain(
+      "float sunGlint = mix(sunGlintFar, sunGlintNear, rippleLod);",
+    );
     expect(fragment).toContain("float fresnelAlpha = fresnel * fresnel");
+  });
+
+  it("mirrors the drawn celestial disc, not the clamped shading light", () => {
+    const fragment = SHADER_LIGHTING_FLUID_CHUNK_SHADERS.fragment;
+    expect(fragment).toContain("uniform vec3 uCelestialDirection;");
+    // The Blinn-Phong lobes and the glint disc must share one sun, or the
+    // halo sits beside the glitter. And that sun is the one the sky box
+    // draws: the shading light is held above a minimum elevation and tilted
+    // off the sun's plane, which is exactly what put the reflection a good
+    // twenty degrees to one side of the disc in the sky.
+    expect(fragment).toContain(
+      "vec3 halfVec = normalize(uCelestialDirection + viewDir);",
+    );
+    expect(fragment).not.toContain("normalize(uSunDirection + viewDir)");
+    expect(fragment).not.toContain("dot(reflectDir, uSunDirection)");
+  });
+
+  it("draws every sun term on and under the water from the beam, not the daylight", () => {
+    const fluid = SHADER_LIGHTING_FLUID_CHUNK_SHADERS.fragment;
+    const terrain = SHADER_LIGHTING_CHUNK_SHADERS.fragment;
+    for (const fragment of [fluid, terrain]) {
+      expect(fragment).toContain("uniform float uDirectSunlight;");
+    }
+    // An overcast still lights the world (diffuse daylight keeps the
+    // weather-dimmed intensity), but leaves no sun on the water to mirror
+    // and nothing for the surface to focus onto the bed.
+    expect(terrain).toContain(
+      "vec3 sunContribution = uSunColor * NdotL * shadow * uSunlightIntensity * sunExposure;",
+    );
+    expect(terrain).toMatch(
+      /float causticSun = smoothstep\([^;]*\)\s*\*\s*uDirectSunlight;/,
+    );
+    const beam = "float sunBeam = uSunlightIntensity * uDirectSunlight;";
+    expect(fluid).toContain(
+      "specularColor += uSunColor * (sunGlint * sunBeam);",
+    );
+    expect(fluid).toContain(
+      "float causticLight = shadow * sunExposure * sunBeam;",
+    );
+    // Lobes, glint, surface caustics, the glitter seen from below and the
+    // A/B undersides: none reads the daylight directly.
+    const start = fluid.indexOf(beam);
+    const end = fluid.indexOf("float waterDepth = max(0.0, vWaterSurfaceY");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    expect(fluid.slice(start + beam.length, end)).not.toMatch(
+      /\buSunlightIntensity\b/,
+    );
+  });
+
+  it("keeps the sky and the sun off water that sees no sky", () => {
+    // The ramp sits inside the light grid's range and leaves full sunlight
+    // (open water) wholly on it, so open water is untouched.
+    expect(WATER_OPTICS.skyExposureNone).toBeGreaterThanOrEqual(0);
+    expect(WATER_OPTICS.skyExposureNone).toBeLessThan(
+      WATER_OPTICS.skyExposureFull,
+    );
+    expect(WATER_OPTICS.skyExposureFull).toBeLessThan(1);
+    expect(WATER_OPTICS.enclosedReflectance).toBeGreaterThan(0);
+    expect(WATER_OPTICS.enclosedReflectance).toBeLessThan(1);
+
+    const fragment = SHADER_LIGHTING_FLUID_CHUNK_SHADERS.fragment;
+    const skyOpenAt = fragment.indexOf("float skyOpen = smoothstep(");
+    expect(skyOpenAt).toBeGreaterThan(-1);
+    expect(fragment.slice(skyOpenAt, skyOpenAt + 120)).toContain("sunExposure");
+    // The reflection falls back to the lit surroundings before the
+    // underside and every highlight read it.
+    const enclosedAt = fragment.indexOf(
+      "skyReflection = mix(\n    totalLight *",
+    );
+    expect(enclosedAt).toBeGreaterThan(skyOpenAt);
+    expect(enclosedAt).toBeLessThan(
+      fragment.indexOf("vec3 belowSurfaceSky = mix("),
+    );
+    // Lobes, glint, surface caustics and the glitter from below all ride
+    // the beam, so gating it gates them all.
+    const beam = "float sunBeam = uSunlightIntensity * uDirectSunlight;";
+    expect(fragment).toContain(`${beam}\n  // Nor does a surface`);
+    expect(fragment).toContain("sunBeam *= skyOpen;");
+    expect(fragment).toContain(
+      "deepScatter = mix(baseWater, deepScatter, skyOpen);",
+    );
+    // Terrain shaders compile the branch out but still parse it.
+    expect(SHADER_LIGHTING_CHUNK_SHADERS.fragment).toContain("if (false) {");
+  });
+
+  it("reflects the sky dome's own gradient along the reflected ray", () => {
+    const fragment = SHADER_LIGHTING_FLUID_CHUNK_SHADERS.fragment;
+    // Same offset and exponent as the sky shader and the sky fog, so the
+    // reflection is the sky the player sees, horizon band included.
+    expect(fragment).toContain(
+      "float skyH = normalize(reflectDir * uSkyFogDimension + uSkyFogOffset).y;",
+    );
+    expect(fragment).toContain("pow(max(skyH, 0.0), uSkyFogExponent)");
+    expect(fragment).not.toContain("reflectDir.y * 0.5 + 0.5");
+  });
+});
+
+describe("ripple slope map", () => {
+  it("keeps the layer table physically plausible", () => {
+    const layers = WATER_OPTICS.surfaceNormalLayers;
+    // The shader reads the medium and fine layers' height channels by
+    // index for crest highlights.
+    expect(layers).toHaveLength(3);
+    for (const layer of layers) {
+      expect(layer.tileBlocks).toBeGreaterThan(0);
+      expect(layer.bump).toBeGreaterThan(0);
+      expect(layer.stretch[0]).toBeGreaterThan(0);
+      expect(layer.stretch[1]).toBeGreaterThan(0);
+    }
+    expect(WATER_OPTICS.specularBroadBaseStrength).toBeGreaterThanOrEqual(0);
+    expect(WATER_OPTICS.specularBroadTopStrength).toBeGreaterThanOrEqual(0);
+    expect(WATER_OPTICS.specularMediumStrength).toBeGreaterThanOrEqual(0);
+    // Coarse to fine, so "medium" and "fine" name what they sample.
+    expect(layers[0].tileBlocks).toBeGreaterThan(layers[1].tileBlocks);
+    expect(layers[1].tileBlocks).toBeGreaterThan(layers[2].tileBlocks);
+    // Summed at their steepest the layers stay well under a 45° facet.
+    const maxSlope = layers.reduce((sum, layer) => sum + layer.bump, 0);
+    expect(maxSlope).toBeLessThan(0.7);
+    expect(WATER_OPTICS.grazingBumpKeep).toBeGreaterThan(0);
+    expect(WATER_OPTICS.grazingBumpKeep).toBeLessThanOrEqual(1);
+    expect(WATER_OPTICS.reflectionFoldbackStrength).toBeGreaterThanOrEqual(0);
+    expect(WATER_OPTICS.reflectionFoldbackStrength).toBeLessThanOrEqual(1);
+    expect(WATER_OPTICS.crestHighlightStart).toBeLessThan(
+      WATER_OPTICS.crestHighlightFull,
+    );
+    expect(WATER_OPTICS.crestHighlightFull).toBeLessThanOrEqual(1);
+    expect(WATER_OPTICS.refractionSlopeScale).toBeGreaterThan(0);
+  });
+
+  it("samples every layer into the surface normal and drives refraction from it", () => {
+    const fragment = SHADER_LIGHTING_FLUID_CHUNK_SHADERS.fragment;
+    expect(fragment).toContain("uniform sampler2D uWaterNormalMap;");
+    expect(fragment).toContain(WATER_SURFACE_NORMAL_LAYERS_GLSL);
+    const layers = WATER_OPTICS.surfaceNormalLayers;
+    layers.forEach((layer, index) => {
+      expect(fragment).toContain(
+        `vec4 waterTexel${index} = texture2D(uWaterNormalMap, waterUv${index});`,
+      );
+      const gate = index === layers.length - 1 ? " * ripplePatch" : "";
+      expect(fragment).toContain(
+        `waterSlopeSum += (waterTexel${index}.rg * 2.0 - 1.0)\n    * ${layer.bump.toFixed(4)}${gate};`,
+      );
+    });
+    // The swell's height gates the finest layer into gust patches.
+    expect(fragment).toContain(
+      `float ripplePatch = mix(\n    ${WATER_OPTICS.ripplePatchFloor.toFixed(4)},\n    1.0,\n    waterTexel0.b\n  );`,
+    );
+    expect(WATER_OPTICS.ripplePatchFloor).toBeGreaterThan(0);
+    expect(WATER_OPTICS.ripplePatchFloor).toBeLessThan(1);
+    expect(fragment).toContain("crestMed = waterTexel1.b;");
+    expect(fragment).toContain("crestFine = waterTexel2.b;");
+    expect(fragment).toContain(
+      "waterNormal = normalize(vec3(waterSlope.x, 1.0, waterSlope.y));",
+    );
+    // The floor bends under the surface slope, not a separate swell.
+    expect(fragment).toContain(
+      `vec2 refractionSlope = waterNormal.xz\n      * ${WATER_OPTICS.refractionSlopeScale.toFixed(4)};`,
+    );
+    expect(fragment).not.toContain("broadRipple");
+    // No per-pixel trigonometry left in the surface normal.
+    expect(fragment).not.toContain("waveDir0");
+  });
+
+  it("compiles out of terrain shaders but still parses there", () => {
+    // The sampler must be declared in every variant for the compiled-out
+    // fluid branch to parse; it is inactive on terrain.
+    expect(SHADER_LIGHTING_CHUNK_SHADERS.fragment).toContain(
+      "uniform sampler2D uWaterNormalMap;",
+    );
+    expect(SHADER_LIGHTING_CHUNK_SHADERS.fragment).toContain("if (false) {");
   });
 });
 
@@ -92,43 +293,404 @@ describe("air-side vertical water faces", () => {
     );
     expect(WATER_OPTICS.airSideFaceTintMix).toBeGreaterThan(0);
     expect(WATER_OPTICS.airSideFaceTintMix).toBeLessThanOrEqual(1);
-    expect(WATER_OPTICS.airSideFaceCullCos).toBeGreaterThan(0.5);
-    expect(WATER_OPTICS.airSideFaceCullCos).toBeLessThan(1);
   });
 
-  it("compiles the air-side discard and gloss fade into the fluid shader", () => {
+  it("compiles the back-face discard and gloss fade into the fluid shader", () => {
     const fragment = SHADER_LIGHTING_FLUID_CHUNK_SHADERS.fragment;
     expect(fragment).toContain("uCameraSubmersion < 0.5 && !gl_FrontFacing");
-    expect(fragment).toContain("airSideFace * airFacing >");
-    expect(fragment).toContain(WATER_OPTICS.airSideFaceCullCos.toFixed(4));
     expect(fragment).toContain("float airSideWeight = airSideFace * NdotV");
     expect(fragment).toContain(WATER_OPTICS.airSideFaceAlphaScale.toFixed(4));
     expect(fragment).toContain(WATER_OPTICS.airSideFaceGlossScale.toFixed(4));
     expect(fragment).toContain(WATER_OPTICS.airSideFaceTintMix.toFixed(4));
   });
+
+  it("applies the window treatment only to faces the mesher flagged as panes", () => {
+    const { vertex, fragment } = SHADER_LIGHTING_FLUID_CHUNK_SHADERS;
+    // Bit 19 is the greedy flag on a solid vertex and the pane flag on a
+    // fluid one; both decodes must come from the same bit.
+    expect(vertex).toContain("#define FLUID_PANE_SHIFT 19");
+    expect(vertex).toContain("#define GREEDY_SHIFT 19");
+    expect(vertex).toContain("int isGreedy = bit19 & (1 - isFluid);");
+    expect(vertex).toContain("int isFluidPane = bit19 & isFluid;");
+    // A wall against air keeps the lake shading: the fade, tint, and
+    // head-on discard all hang off airSideFace, which the pane flag gates.
+    expect(fragment).toContain(
+      "float airSideFace = sideWaterFace * (1.0 - uCameraSubmersion) * vIsFluidPane;",
+    );
+  });
+
+  it("draws a pane at every angle: panes are never discarded", () => {
+    const { fragment } = SHADER_LIGHTING_FLUID_CHUNK_SHADERS;
+    // A pane used to be discarded when looked at head-on, so a tank read as
+    // a dry room with fish floating in it. The test was per fragment against
+    // the direction to the eye — a cone with its apex at the camera — and a
+    // cone through a plane is a circle: a large pane close up drew as a
+    // disc-shaped hole with a tinted rim. Now the tinted sheet always draws.
+    expect(fragment).not.toContain("airSideFace * geoNdotV >");
+    expect(fragment).not.toMatch(/paneCull|headOn|airFacing/);
+    const fluidBranch = fragment.slice(
+      fragment.indexOf("if (vIsFluid > 0.5) {"),
+    );
+    // Two discards: the back face in air, and (under water only) the seam
+    // between two water voxels below the surface, which excludes panes.
+    expect(fluidBranch.match(/discard;/g)).toHaveLength(2);
+    expect(fluidBranch).toContain(
+      "if (uCameraSubmersion >= 0.5 && sideWaterFace > 0.5 && vIsFluidPane < 0.5",
+    );
+  });
 });
 
-describe("ABOVE_SURFACE_WATER_FOG_FRAGMENT", () => {
-  it("reuses the same view extinction as the underwater fog", () => {
-    expect(UNDERWATER_FOG_FRAGMENT).toContain(WATER_VIEW_EXTINCTION_GLSL);
-    expect(SHADER_LIGHTING_FLUID_CHUNK_SHADERS.vertex).toContain(
-      WATER_VIEW_EXTINCTION_GLSL,
+describe("the water behind a tank window", () => {
+  it("fogs a window's run harder than a diver's view, and bounds the run", () => {
+    expect(WATER_OPTICS.paneViewExtinctionScale).toBeGreaterThan(
+      WATER_OPTICS.viewExtinctionScale,
+    );
+    expect(WATER_OPTICS.paneViewExtinctionScale).toBeLessThanOrEqual(1);
+    expect(WATER_OPTICS.paneFallbackPathBlocks).toBeGreaterThan(0);
+    expect(WATER_OPTICS.paneMaxPathBlocks).toBeGreaterThan(
+      WATER_OPTICS.paneFallbackPathBlocks,
+    );
+    // A fish a block behind the glass keeps most of its colour; the far
+    // wall of a two-dozen-block tank has lost most of its red.
+    const red = (blocks: number) =>
+      Math.exp(
+        -WATER_OPTICS.downwellingExtinction.red *
+          WATER_OPTICS.paneViewExtinctionScale *
+          blocks,
+      );
+    expect(red(1)).toBeGreaterThan(0.85);
+    expect(red(24)).toBeLessThan(0.5);
+  });
+
+  it("measures the run from the window to the first thing behind it, never past the water's end", () => {
+    const { fragment } = SHADER_LIGHTING_FLUID_CHUNK_SHADERS;
+    const fluidBranch = fragment.slice(
+      fragment.indexOf("if (vIsFluid > 0.5) {"),
+    );
+    expect(fluidBranch).toContain(
+      "paneEndZ = min(paneEndZ, paneDepthDistance(texture2D(uWaterExitDepth, paneUv).r));",
+    );
+    expect(fluidBranch).toContain(
+      "paneEndZ = min(paneEndZ, paneDepthDistance(texture2D(uSceneDepth, paneUv).r));",
+    );
+    expect(fluidBranch).toContain(
+      `paneTransmit = exp(-${WATER_PANE_EXTINCTION_GLSL} * paneRun);`,
+    );
+    // Only a window seen from the air measures a run.
+    expect(fluidBranch).toContain("if (airSideFace > 0.001) {");
+  });
+
+  it("shows the captured scene at the end of the run, covering what it replaces", () => {
+    const { fragment } = SHADER_LIGHTING_FLUID_CHUNK_SHADERS;
+    expect(fragment).toContain(
+      "refractedScene * paneTransmit + paneScatter * (1.0 - paneTransmit),",
+    );
+    expect(fragment).toContain(
+      "mix(max(diffuseColor.a, paneFog), 1.0, refractionLive),",
     );
   });
 
-  it("fades submerged terrain toward the shared in-scattered water color", () => {
-    expect(ABOVE_SURFACE_WATER_FOG_FRAGMENT).toContain("uUnderwaterAmbient");
-    expect(ABOVE_SURFACE_WATER_FOG_FRAGMENT).toContain(
-      "vAboveSurfaceWaterTransmit",
+  it("declares the run's inputs once in every chunk fragment", () => {
+    for (const { fragment } of [
+      SHADER_LIGHTING_CHUNK_SHADERS,
+      SHADER_LIGHTING_CROSS_CHUNK_SHADERS,
+      SHADER_LIGHTING_FLUID_CHUNK_SHADERS,
+      SHADER_LIGHTING_SEE_THROUGH_CHUNK_SHADERS,
+    ]) {
+      for (const declaration of [
+        "uniform sampler2D uSceneDepth;",
+        "uniform float uSceneDepthReady;",
+        "uniform sampler2D uWaterExitDepth;",
+        "uniform float uWaterExitReady;",
+        "uniform vec2 uPaneDepthClip;",
+      ]) {
+        expect(fragment.split(declaration)).toHaveLength(2);
+      }
+    }
+  });
+});
+
+describe("standing water over ground", () => {
+  it("keeps the floor optics inside physical bounds", () => {
+    expect(WATER_OPTICS.floorAbsorptionPathScale).toBeGreaterThan(0);
+    expect(WATER_OPTICS.floorAbsorptionMaxDepth).toBeGreaterThan(0);
+    expect(WATER_OPTICS.wetFloorDarken).toBeGreaterThan(0);
+    expect(WATER_OPTICS.wetFloorDarken).toBeLessThanOrEqual(1);
+    expect(WATER_OPTICS.shallowScatterDensity).toBeGreaterThan(0);
+    expect(WATER_OPTICS.shallowScatterMaxMix).toBeGreaterThanOrEqual(0);
+    expect(WATER_OPTICS.shallowScatterMaxMix).toBeLessThan(1);
+    expect(WATER_OPTICS.causticStrength).toBeGreaterThanOrEqual(0);
+    expect(WATER_OPTICS.causticLensSlope).toBeGreaterThan(0);
+    expect(WATER_OPTICS.causticDepthFalloff).toBeGreaterThan(0);
+    // The refracted composite owns the floor, so it may be more opaque than
+    // the plain tinted layer, never less.
+    expect(WATER_OPTICS.surfaceAlphaFloor).toBeGreaterThan(0);
+    expect(WATER_OPTICS.refractedSurfaceAlphaFloor).toBeGreaterThanOrEqual(
+      WATER_OPTICS.surfaceAlphaFloor,
+    );
+    expect(WATER_OPTICS.refractedSurfaceAlphaFloor).toBeLessThanOrEqual(1);
+  });
+
+  it("compiles the floor optics into the fluid shader from the shared table", () => {
+    const { vertex, fragment } = SHADER_LIGHTING_FLUID_CHUNK_SHADERS;
+    // Thickness under the surface comes from the rest position plus the
+    // mesher's below-count, so the wave cannot jump it by a block. On a
+    // surface vertex that count is the corner's mean depth in quarter
+    // blocks (mirrors SURFACE_DEPTH_UNITS_PER_BLOCK in vertex_light.rs), so
+    // a step in the bed ramps across faces instead of drawing a hard
+    // rectangle on the surface.
+    expect(vertex).toContain("#define SURFACE_DEPTH_UNITS_PER_BLOCK 4.0");
+    expect(vertex).toContain(
+      "float fluidBelowBlocks = isSurfaceVertex == 1\n  ? stackIndexF / SURFACE_DEPTH_UNITS_PER_BLOCK\n  : stackIndexF;",
+    );
+    expect(vertex).toContain(
+      "vFluidDepthBelow = float(isFluid) * (restWorldPosition.y - fluidVoxelY + fluidBelowBlocks);",
+    );
+    expect(fragment).toContain("vec3 floorTransmit = exp(");
+    expect(fragment).toContain(WATER_DOWNWELLING_EXTINCTION_GLSL);
+    expect(fragment).toContain(
+      WATER_OPTICS.floorAbsorptionPathScale.toFixed(4),
+    );
+    expect(fragment).toContain(WATER_OPTICS.floorAbsorptionMaxDepth.toFixed(4));
+    expect(fragment).toContain(WATER_OPTICS.wetFloorDarken.toFixed(4));
+    expect(fragment).toContain(WATER_OPTICS.shallowScatterDensity.toFixed(4));
+    expect(fragment).toContain(WATER_OPTICS.shallowScatterMaxMix.toFixed(4));
+    expect(fragment).toContain(WATER_OPTICS.causticStrength.toFixed(4));
+    expect(fragment).toContain(WATER_OPTICS.causticLensSlope.toFixed(4));
+    expect(fragment).toContain(WATER_OPTICS.causticDepthFalloff.toFixed(4));
+    expect(fragment).toContain(WATER_OPTICS.surfaceAlphaFloor.toFixed(4));
+    expect(fragment).toContain(
+      WATER_OPTICS.refractedSurfaceAlphaFloor.toFixed(4),
+    );
+    // The floor shading rides the refraction sample; caustics land on the
+    // surface layer when there is no capture to shade.
+    expect(fragment).toContain(
+      "texture2D(uSceneColor, refractedUv).rgb * floorShade;",
+    );
+    expect(fragment).toContain("causticLens = 1.0 - smoothstep(");
+    // Caustics only where the sun's beam reaches the surface.
+    expect(fragment).toContain(
+      "float causticLight = shadow * sunExposure * sunBeam;",
+    );
+  });
+});
+
+describe("air-side walls", () => {
+  it("keeps the wall path inside the floor's absorption range", () => {
+    // A face exists only where its voxel holds fluid, so a wall always has
+    // at least that voxel behind it; more than the absorption cap is moot.
+    expect(WATER_OPTICS.wallPathBlocks).toBeGreaterThan(0);
+    expect(WATER_OPTICS.wallPathBlocks).toBeLessThanOrEqual(
+      WATER_OPTICS.floorAbsorptionMaxDepth,
+    );
+    // Under water a wall is lighter than the surface, never heavier.
+    expect(WATER_OPTICS.submergedWallAlphaScale).toBeGreaterThan(0);
+    expect(WATER_OPTICS.submergedWallAlphaScale).toBeLessThan(1);
+  });
+
+  it("looks through a wall's own water and gives it the surface's opacity", () => {
+    const { fragment } = SHADER_LIGHTING_FLUID_CHUNK_SHADERS;
+    // The wall's refraction sample takes the floor absorption and in-scatter
+    // over its own voxel of water; a pane keeps its window treatment. A wall
+    // at zero depth composited the dry scene behind it untouched and read as
+    // a hole — a cascade drew as floating sheets with every riser missing.
+    expect(fragment).toContain(
+      `float wallDepth = sideWaterFace * (1.0 - vIsFluidPane)\n    * ${WATER_OPTICS.wallPathBlocks.toFixed(4)};`,
+    );
+    expect(fragment).toContain("vFluidDepthBelow * topWaterFace + wallDepth,");
+    // From the air, the same alpha floor as a top face, not a fraction of
+    // it; from under water the wall keeps its lighter floor so the view out
+    // of a tank stays clear, blended on the smoothed submersion.
+    expect(fragment).toContain(
+      `float wallOpacity = mix(\n    ${WATER_OPTICS.submergedWallAlphaScale.toFixed(4)},\n    1.0,\n    1.0 - uCameraSubmersion\n  );`,
+    );
+    expect(fragment).toContain(
+      "float refractionFace = max(topWaterFace, sideWaterFace * wallOpacity);",
+    );
+    expect(fragment).not.toMatch(/sideWaterFace \* 0\.\d+\)/);
+  });
+});
+
+describe("flow direction", () => {
+  it("keeps the flow cue tunables inside physical bounds", () => {
+    expect(WATER_OPTICS.fluidStageDropoff).toBeGreaterThan(0);
+    expect(WATER_OPTICS.flowCrestSpacingBlocks).toBeGreaterThan(0);
+    expect(WATER_OPTICS.flowBandSpeed).toBeGreaterThan(0);
+    expect(WATER_OPTICS.flowSlopeAmplitude).toBeGreaterThanOrEqual(0);
+    expect(WATER_OPTICS.flowStreakStrength).toBeGreaterThanOrEqual(0);
+    expect(WATER_OPTICS.flowStreakStrength).toBeLessThanOrEqual(1);
+    // One crest per spacing on a full-stage slope.
+    expect(
+      FLOW_CREST_PHASE_PER_HEIGHT *
+        WATER_OPTICS.fluidStageDropoff *
+        WATER_OPTICS.flowCrestSpacingBlocks,
+    ).toBeCloseTo(2 * Math.PI, 6);
+  });
+
+  it("decodes the mesher's per-vertex flow from the surface vertex's count field", () => {
+    const { vertex } = SHADER_LIGHTING_FLUID_CHUNK_SHADERS;
+    // Mirrors FLOW_DIRECTIONS in crates/mesher/src/mesher/vertex_light.rs:
+    // 15 directions in equal steps from +x toward +z, 0 for still water.
+    expect(vertex).toContain("#define FLOW_DIRECTIONS 15.0");
+    expect(vertex).toContain(
+      "#define FLOW_STEP_RADIANS (6.28318530718 / FLOW_DIRECTIONS)",
+    );
+    // Only a waving fluid vertex carries flow there; its count is rebuilt.
+    expect(vertex).toContain(
+      "int isSurfaceVertex = isFluid & ((light >> WAVE_SHIFT) & 0x1);",
+    );
+    expect(vertex).toContain(
+      "int flowCode = (light >> STACK_COUNT_SHIFT) & STACK_FIELD_BITS;",
+    );
+    expect(vertex).toContain("stackCount = stackIndex + 1;");
+    expect(vertex).toContain(
+      "float flowAngle = float(flowCode - 1) * FLOW_STEP_RADIANS;",
+    );
+    expect(vertex).toContain(
+      "vFluidFlow = vec2(cos(flowAngle), sin(flowAngle));",
     );
   });
 
-  it("only affects water-exposed faces viewed from above the surface", () => {
-    expect(ABOVE_SURFACE_WATER_FOG_FRAGMENT).toContain("vWaterExposed > 0.5");
-    expect(SHADER_LIGHTING_FLUID_CHUNK_SHADERS.vertex).toContain(
-      "cameraPosition.y > uWaterLevel",
+  it("draws the crests as contours of the rest surface", () => {
+    const { vertex, fragment } = SHADER_LIGHTING_FLUID_CHUNK_SHADERS;
+    // The rest height is its own varying: the waved position would bend
+    // the contours with the swell, and the depth varying jumps by a whole
+    // block across a hole in the floor while the surface does not.
+    expect(vertex).toContain("vFluidRestY = restWorldPosition.y;");
+    expect(fragment).toContain(
+      `float flowPhase = -vFluidRestY * ${FLOW_CREST_PHASE_PER_HEIGHT.toFixed(4)}`,
     );
-    expect(ABOVE_SURFACE_WATER_FOG_FRAGMENT).toContain("uCameraSubmersion");
+    expect(fragment).toContain(
+      `- waveTime * ${WATER_OPTICS.flowBandSpeed.toFixed(4)}`,
+    );
+    // No per-face slope anywhere in the flow: direction is the interpolated
+    // per-vertex field, and the crests tilt the normal along it.
+    expect(fragment).not.toContain("dFdx(restSurface)");
+    expect(fragment).toContain("flowTilt = vFluidFlow * flowWave;");
+    expect(fragment).toContain(
+      `+ flowTilt * ${WATER_OPTICS.flowSlopeAmplitude.toFixed(4)};`,
+    );
+    expect(fragment).toContain(
+      "flowCrest = flowWave * min(length(vFluidFlow), 1.0);",
+    );
+    expect(fragment).toContain(WATER_OPTICS.flowStreakStrength.toFixed(4));
+    expect(fragment).toContain("smoothstep(0.15, 0.95, flowCrest)");
+  });
+});
+
+describe("terrain seen from under water", () => {
+  it("measures depth from the camera's own water surface, not the nominal waterline", () => {
+    const { fragment } = SHADER_LIGHTING_FLUID_CHUNK_SHADERS;
+    // uWaterLevel is a sea level; a world without a sea keeps the default,
+    // and a pool on flat ground then charged ~80 blocks of extinction to
+    // every fragment in view. The camera's measured column is right for a
+    // pool and agrees with the waterline for a sea.
+    expect(fragment).toContain(
+      "if (uCameraSubmersion > 0.001 && vWorldPosition.y < uCameraWaterPlaneY) {",
+    );
+    expect(fragment).toContain(
+      "float fragmentWaterDepth = uCameraWaterPlaneY - vWorldPosition.y;",
+    );
+    expect(fragment).not.toContain(
+      "float fragmentWaterDepth = uWaterLevel - vWorldPosition.y;",
+    );
+    // Submerged emitters take the same plane.
+    expect(fragment).toContain(
+      "if (uCameraSubmersion > 0.001 && llOrigin.y < uCameraWaterPlaneY) {",
+    );
+    expect(fragment).toContain(
+      "float llSubmersion = clamp(uCameraWaterPlaneY - llOrigin.y, 0.0, 1.0);",
+    );
+    expect(fragment).not.toContain("llOrigin.y < uWaterLevel");
+  });
+
+  it("tells submerged faces from dry ones by the mesher's water contact, not by sunlight", () => {
+    const { fragment } = SHADER_LIGHTING_FLUID_CHUNK_SHADERS;
+    // Water is light-invariant in the light grid, so a seabed under open
+    // sky is as bright as a beach; the old sunlight heuristic declared every
+    // sunlit seabed a dry pocket and dropped its scatter fill.
+    expect(fragment).toContain(
+      "float isFragmentUnderwater = max(vWaterExposed, vIsFluid);",
+    );
+    expect(fragment).not.toContain("expectedUnderwaterSun");
+    // The darkening rides the smoothed submersion so the terrain crosses
+    // over with the fog and the surface at the waterline.
+    expect(fragment).toContain(
+      "float submergedShade = uCameraSubmersion * isFragmentUnderwater;",
+    );
+    expect(fragment).toContain(
+      `downTransmit = mix(\n    vec3(1.0),\n    exp(-${WATER_DOWNWELLING_EXTINCTION_GLSL} * fragmentWaterDepth),\n    submergedShade\n  );`,
+    );
+    expect(fragment).toContain("* downTransmit * submergedShade;");
+  });
+});
+
+describe("spill corners", () => {
+  it("names the corner by a height no resting surface reaches", () => {
+    // The threshold has to clear every stage of a flowing surface (all at
+    // or under the resting height) and sit under the full block.
+    expect(FLUID_SPILL_CORNER_MIN_HEIGHT).toBeGreaterThan(
+      WATER_OPTICS.fluidSurfaceHeight,
+    );
+    expect(FLUID_SPILL_CORNER_MIN_HEIGHT).toBeLessThan(1);
+  });
+
+  it("leaves a spill corner out of the wave so it stays welded to the wall above", () => {
+    const { vertex } = SHADER_LIGHTING_FLUID_CHUNK_SHADERS;
+    // The voxel read matches the depth varying's: a surface vertex sits at
+    // vy + h with h in (0, 1].
+    expect(vertex).toContain(
+      "float waveVoxelY = ceil(worldPosForWave.y - 1e-3) - 1.0;",
+    );
+    expect(vertex).toContain(
+      "float waveRestHeight = worldPosForWave.y - waveVoxelY;",
+    );
+    expect(vertex).toContain(
+      `if (waveRestHeight < ${FLUID_SPILL_CORNER_MIN_HEIGHT.toFixed(4)}) {`,
+    );
+    // The displacement itself lives inside that gate.
+    const gate = vertex.indexOf(
+      `if (waveRestHeight < ${FLUID_SPILL_CORNER_MIN_HEIGHT.toFixed(4)}) {`,
+    );
+    const displacement = vertex.indexOf(
+      "transformed.y += (wave1 + wave2 + wave3) * POSITION_UNITS_PER_BLOCK;",
+    );
+    expect(gate).toBeGreaterThan(-1);
+    expect(displacement).toBeGreaterThan(gate);
+  });
+});
+
+describe("terrain seen from above water", () => {
+  const variants = {
+    opaque: SHADER_LIGHTING_CHUNK_SHADERS,
+    fluid: SHADER_LIGHTING_FLUID_CHUNK_SHADERS,
+    seeThrough: SHADER_LIGHTING_SEE_THROUGH_CHUNK_SHADERS,
+    cross: SHADER_LIGHTING_CROSS_CHUNK_SHADERS,
+  };
+
+  it("is never fogged from the world's nominal waterline", () => {
+    // uWaterLevel is a sea level, and a world without a sea keeps its
+    // default (86): a pool bed at y=2 was fogged as if under 84 blocks of
+    // water whenever the camera rose above y=86, and not at all below it,
+    // so the same pool turned opaque or clear with camera height alone.
+    // The water surface fades what it refracts by its own column instead.
+    for (const [name, { vertex, fragment }] of Object.entries(variants)) {
+      for (const [stage, source] of Object.entries({ vertex, fragment })) {
+        const where = `${name} ${stage}`;
+        expect(source, where).not.toContain("uniform float uWaterLevel;");
+        expect(source, where).not.toContain("vAboveSurfaceWaterTransmit");
+      }
+    }
+  });
+
+  it("leaves the depth haze to the surface's measured column", () => {
+    const { fragment } = SHADER_LIGHTING_FLUID_CHUNK_SHADERS;
+    expect(fragment).toContain(
+      `float deepPath = max(vFluidDepthBelow - ${WATER_OPTICS.deepSurfaceClearDepth.toFixed(4)}, 0.0);`,
+    );
+    expect(fragment).toContain(
+      "diffuseColor.a = 1.0 - (1.0 - diffuseColor.a) * deepTransmit;",
+    );
   });
 });
 
@@ -153,16 +715,101 @@ describe("measureWaterColumn", () => {
     const sample = measureWaterColumn(columnTo(85), 0.5, 85.95, 0.5);
     expect(sample).toBeNull();
   });
+
+  it("puts the waterline at the roof of water sealed under one", () => {
+    const sealedAt = (vx: number, vy: number) => vx === 0 && vy === 85;
+    const sample = measureWaterColumn(columnTo(85), 0.5, 85.95, 0.5, sealedAt);
+    expect(sample?.surfaceY).toBeCloseTo(86);
+    expect(sample?.depth).toBeCloseTo(0.05);
+    expect(sample?.roofed).toBe(true);
+  });
+});
+
+describe("findWaterBodySurface", () => {
+  // Water fills y <= 59 except where `rock` says otherwise.
+  const sea =
+    (rock: (vx: number, vy: number, vz: number) => boolean) =>
+    (vx: number, vy: number, vz: number) =>
+      vy <= 59 && !rock(vx, vy, vz);
+  const sealedUnder =
+    (isFluidAt: (vx: number, vy: number, vz: number) => boolean) =>
+    (vx: number, vy: number, vz: number) =>
+      vy < 59 && !isFluidAt(vx, vy + 1, vz);
+
+  it("climbs out from under a shelf to the open sea's surface", () => {
+    // A shelf at y 55-57 reaching three blocks around the column.
+    const isFluidAt = sea(
+      (vx, vy, vz) =>
+        vy >= 55 && vy <= 57 && Math.abs(vx) <= 3 && Math.abs(vz) <= 3,
+    );
+    const surfaceY = findWaterBodySurface(
+      isFluidAt,
+      sealedUnder(isFluidAt),
+      0,
+      54,
+      0,
+    );
+    expect(surfaceY).toBeCloseTo(59 + WATER_OPTICS.fluidSurfaceHeight);
+  });
+
+  it("keeps the highest roof of a cave sealed all round", () => {
+    // A flooded chamber, x and z in 0..9, its roof at y 50 over x < 5 and
+    // y 53 over the rest.
+    const isFluidAt = (vx: number, vy: number, vz: number) =>
+      vx >= 0 &&
+      vx <= 9 &&
+      vz >= 0 &&
+      vz <= 9 &&
+      vy >= 40 &&
+      vy < (vx < 5 ? 50 : 53);
+    const surfaceY = findWaterBodySurface(
+      isFluidAt,
+      (vx, vy, vz) => isFluidAt(vx, vy, vz) && !isFluidAt(vx, vy + 1, vz),
+      1,
+      49,
+      1,
+    );
+    expect(surfaceY).toBe(53);
+  });
+
+  it("sees past an air bell to the sea it sits in", () => {
+    // A bell over x and z in -3..3 traps air at y 49-53 in a sea to y 59.
+    const isFluidAt = sea(
+      (vx, vy, vz) =>
+        vy >= 49 && vy <= 54 && Math.abs(vx) <= 3 && Math.abs(vz) <= 3,
+    );
+    const surfaceY = findWaterBodySurface(
+      isFluidAt,
+      sealedUnder(isFluidAt),
+      0,
+      48,
+      0,
+      true,
+    );
+    expect(surfaceY).toBeCloseTo(59 + WATER_OPTICS.fluidSurfaceHeight);
+  });
+
+  it("keeps a pool's own surface when nothing rises above it", () => {
+    // A pool to y 48 in a dry cave: no water anywhere higher.
+    const isFluidAt = (vx: number, vy: number, vz: number) =>
+      Math.abs(vx) <= 5 && Math.abs(vz) <= 5 && vy >= 44 && vy <= 48;
+    const surfaceY = findWaterBodySurface(
+      isFluidAt,
+      () => false,
+      0,
+      48,
+      0,
+      true,
+    );
+    expect(surfaceY).toBeCloseTo(48 + WATER_OPTICS.fluidSurfaceHeight);
+  });
 });
 
 describe("WaterOptics", () => {
   it("snaps submersion in quickly when the camera dives", () => {
     const optics = new WaterOptics();
     optics.update({
-      isFluidAt: () => true,
-      cameraX: 0.5,
-      cameraY: 50,
-      cameraZ: 0.5,
+      column: measureWaterColumn(() => true, 0.5, 50, 0.5),
       sunStrength: 1,
       deltaSeconds: 0.1,
     });
@@ -173,24 +820,110 @@ describe("WaterOptics", () => {
   it("clears submersion after surfacing", () => {
     const optics = new WaterOptics();
     optics.update({
-      isFluidAt: () => true,
-      cameraX: 0.5,
-      cameraY: 50,
-      cameraZ: 0.5,
+      column: measureWaterColumn(() => true, 0.5, 50, 0.5),
       sunStrength: 1,
       deltaSeconds: 0.1,
     });
     for (let frame = 0; frame < 20; frame += 1) {
       optics.update({
-        isFluidAt: () => false,
-        cameraX: 0.5,
-        cameraY: 90,
-        cameraZ: 0.5,
+        column: null,
         sunStrength: 1,
         deltaSeconds: 0.1,
       });
     }
     expect(optics.submersion).toBe(0);
     expect(optics.lightFilter.r).toBeCloseTo(1);
+  });
+});
+
+describe("the Snell window underside", () => {
+  it("passes nearly everything straight up and nothing past the critical angle", () => {
+    const critical = Math.asin(1 / WATER_OPTICS.refractiveIndex);
+    expect(undersideTransmission(1)).toBeCloseTo(0.98, 3);
+    expect(undersideTransmission(Math.cos(critical - 0.01))).toBeGreaterThan(0);
+    expect(undersideTransmission(Math.cos(critical + 0.01))).toBe(0);
+    expect(undersideTransmission(0)).toBe(0);
+  });
+
+  it("dims monotonically toward the rim, then drops to a mirror", () => {
+    let previous = Infinity;
+    for (let degrees = 0; degrees <= 60; degrees += 2) {
+      const t = undersideTransmission(Math.cos((degrees * Math.PI) / 180));
+      expect(t).toBeLessThanOrEqual(previous);
+      previous = t;
+    }
+  });
+
+  it("lifts the window above the sky it shows and keeps the band past the rim near the fog", () => {
+    expect(WATER_OPTICS.undersideWindowGain).toBeGreaterThan(1);
+    // The mirror scales the water's scatter colour (as the film did at
+    // 1.3): about the fog's own brightness once the reflected ray's dive
+    // darkens it, so the window is the bright feature without the rest of
+    // the surface turning murkier than the ceiling it replaces.
+    expect(WATER_OPTICS.undersideReflectionScale).toBeGreaterThan(0.9);
+    expect(WATER_OPTICS.undersideReflectionScale).toBeLessThanOrEqual(
+      WATER_OPTICS.undersideFilmScale + 0.1,
+    );
+    expect(WATER_OPTICS.undersideWindowRippleKeep).toBeGreaterThan(0.5);
+    expect(WATER_OPTICS.undersideWindowRippleKeep).toBeLessThanOrEqual(1);
+  });
+
+  it("lets the dry world through past the rim, with no step at the rim", () => {
+    const critical = Math.acos(UNDERSIDE_CRITICAL_COS);
+    expect(Math.sin(critical) * WATER_OPTICS.refractiveIndex).toBeCloseTo(1, 6);
+    const justInside = undersideSceneShare(Math.cos(critical - 0.002));
+    const justOutside = undersideSceneShare(Math.cos(critical + 0.002));
+    // A shore past the rim shows through instead of a blank wall...
+    expect(justOutside).toBeGreaterThan(0.5);
+    expect(undersideSceneShare(0)).toBeGreaterThan(0.3);
+    // ...without a ring where the window meets the rest of the surface,
+    expect(Math.abs(justInside - justOutside)).toBeLessThan(0.05);
+    // and the window overhead still carries the most of it.
+    expect(undersideSceneShare(1)).toBeGreaterThan(justOutside);
+    expect(undersideSceneShare(0)).toBeLessThan(justOutside);
+    expect(SHADER_LIGHTING_FLUID_CHUNK_SHADERS.fragment).toContain(
+      "mix(snellMirror, snellScene * snellRippleShade, snellLeak),",
+    );
+  });
+
+  it("is the default underside and compiles per texel, with the film kept as style 4", () => {
+    expect(SHADER_LIGHTING_FLUID_CHUNK_SHADERS.fragment).toContain(
+      "vec2 snellXZ = (floor(wPos.xz * 16.0) + 0.5) / 16.0;",
+    );
+    expect(SHADER_LIGHTING_FLUID_CHUNK_SHADERS.fragment).toContain(
+      "uSurfaceUndersideScale > 0.5 && uSurfaceUndersideScale < 1.5) {\n    vec2 snellXZ",
+    );
+    expect(SHADER_LIGHTING_FLUID_CHUNK_SHADERS.fragment).toContain(
+      "if (uSurfaceUndersideScale > 3.5) {",
+    );
+  });
+});
+
+describe("underwater in-scatter", () => {
+  it("is brighter looking up than down and unchanged looking level", () => {
+    expect(underwaterInScatterScale(1)).toBeGreaterThan(
+      underwaterInScatterScale(0),
+    );
+    expect(underwaterInScatterScale(0)).toBe(1);
+    expect(underwaterInScatterScale(-1)).toBeLessThan(1);
+    expect(underwaterInScatterScale(-1)).toBeGreaterThan(0.4);
+  });
+
+  it("darkens with depth, since its colour is the depth-filtered scatter", () => {
+    const shallow = getUnderwaterAmbientColor(2, 1, new Color());
+    const deep = getUnderwaterAmbientColor(20, 1, new Color());
+    for (const y of [-1, 0, 1]) {
+      const scale = underwaterInScatterScale(y);
+      expect(deep.g * scale).toBeLessThan(shallow.g * scale);
+      expect(deep.b * scale).toBeLessThan(shallow.b * scale);
+    }
+  });
+
+  it("tilts the fog toward the ray's direction", () => {
+    expect(UNDERWATER_FOG_FRAGMENT).toContain("uwRay.y / uwDist");
+  });
+
+  it("extinguishes along the view ray at the shared view extinction", () => {
+    expect(UNDERWATER_FOG_FRAGMENT).toContain(WATER_VIEW_EXTINCTION_GLSL);
   });
 });

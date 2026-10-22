@@ -3,9 +3,23 @@ use specs::{ReadExpect, System, WriteExpect};
 use std::collections::VecDeque;
 
 use crate::{
-    ChunkInterests, ChunkProtocol, Chunks, ClientFilter, Message, MessageQueues, MessageType,
-    WorldConfig,
+    ChunkInterests, ChunkProtocol, Chunks, ClientFilter, Clients, Message, MessageQueues,
+    MessageType, Stats, Vec2, WorldConfig,
 };
+
+/// A join in flight counts every LOAD queued for its client, to know which
+/// one completes its spawn window (see `JoinTrace`). A meshes-only LOAD
+/// counts but serves nothing: the client waits on the chunk's voxels.
+fn trace_load(clients: &Clients, client_id: &str, chunks: &[ChunkProtocol], has_voxels: bool) {
+    if let Some(trace) = clients
+        .get(client_id)
+        .map(|client| client.sender.join_trace())
+        .filter(|trace| trace.is_active())
+    {
+        let served = chunks.iter().filter(|_| has_voxels);
+        trace.load_queued(served.map(|chunk| Vec2(chunk.x, chunk.z)));
+    }
+}
 
 #[derive(Default)]
 pub struct ChunkSendingSystem;
@@ -19,13 +33,15 @@ impl ChunkSendingSystem {
 impl<'a> System<'a> for ChunkSendingSystem {
     type SystemData = (
         ReadExpect<'a, WorldConfig>,
+        ReadExpect<'a, Stats>,
         ReadExpect<'a, ChunkInterests>,
         WriteExpect<'a, Chunks>,
         WriteExpect<'a, MessageQueues>,
+        ReadExpect<'a, Clients>,
     );
 
     fn run(&mut self, data: Self::SystemData) {
-        let (config, interests, mut chunks, mut queue) = data;
+        let (config, stats, interests, mut chunks, mut queue, clients) = data;
 
         if chunks.to_send.is_empty() {
             return;
@@ -40,6 +56,14 @@ impl<'a> System<'a> for ChunkSendingSystem {
         let mut client_update_data: HashMap<String, Vec<ChunkProtocol>> = HashMap::new();
 
         while let Some((coords, msg_type)) = to_send.pop_front() {
+            if msg_type == MessageType::Load
+                && chunks
+                    .activation
+                    .blocks_delivery(&coords, stats.dispatch_count())
+            {
+                chunks.to_send.push_back((coords, msg_type));
+                continue;
+            }
             let chunk = match chunks.get_mut(&coords) {
                 Some(c) => c,
                 None => panic!("Something went wrong with sending chunks..."),
@@ -100,6 +124,7 @@ impl<'a> System<'a> for ChunkSendingSystem {
 
         for (client_id, chunk_models) in client_load_mesh {
             if !chunk_models.is_empty() {
+                trace_load(&clients, &client_id, &chunk_models, false);
                 queue.push((
                     Message::new(&MessageType::Load)
                         .chunks(&chunk_models)
@@ -111,6 +136,7 @@ impl<'a> System<'a> for ChunkSendingSystem {
 
         for (client_id, chunk_models) in client_load_data {
             if !chunk_models.is_empty() {
+                trace_load(&clients, &client_id, &chunk_models, true);
                 queue.push((
                     Message::new(&MessageType::Load)
                         .chunks(&chunk_models)

@@ -27,6 +27,10 @@ message Chunk {
   repeated Mesh meshes = 4;
   bytes voxels = 5;
   bytes lights = 6;
+  // Optional RGB climate multipliers at the four horizontal chunk corners,
+  // x-fast order: (0,0), (size,0), (0,size), (size,size). Each byte / 128.0.
+  // Adjacent chunks share edge samples. Absent means use the stage palette.
+  bytes biome_tints = 7;
 }
 
 message Peer {
@@ -90,6 +94,12 @@ message ChatMessage {
   string metadata = 4;
   string trace_id = 5;
   double t_send_ms = 6;
+  // Position in the world's chat log (server/world/chat_log.rs); zero for a
+  // line the log does not keep. Lets a client merge the history it joined
+  // with and the live lines after it without showing one twice.
+  uint64 seq = 7;
+  // Unix milliseconds the server logged the line at; zero when unlogged.
+  double sent_at = 8;
 }
 
 message Message {

@@ -37,3 +37,34 @@ caveats for building, running, and testing it in the cloud VM.
 - Rust type check: `pnpm check` (or `cargo check --workspace --all-targets`).
 - Rust tests: `pnpm test:rust` (or `pnpm test:rust:all`).
 - TypeScript tests: `pnpm test`.
+
+### Engine guidance (rules and skills)
+
+Voxelize is the engine; games built on it are consumers. `.cursor/rules/engine-boundary.mdc`
+(always on) keeps it that way, and `node scripts/engine-boundary/check.mjs` enforces it in CI.
+The rest of the shared "how to use Voxelize" guidance lives next to the code it governs:
+
+- Rules (`.cursor/rules/`): `engine-boundary`, `no-banned-game-name`, `honest-failures` (always on);
+  `mesher-parity`, `frame-budget`, `uniform-texel-density`, `canvas-box`, `block-textures`,
+  `server-authority`, `chunk-pipeline`, `ecs-component-storage`, `entity-lighting`,
+  `physics-grounded-bodies`, `agent-harness`, `transparent-passes`, `agent-facing-api` (attached by path).
+- Skills (`.cursor/skills/`): `voxelize-engine-boundary` (the gate, excuses, extension points, the
+  periodic pass), `voxelize-instanced-entities` (roster, warmup, bone textures, density painting),
+  `voxelize-agent-harness` (daemon, bridge contract, scenario SDK, measurement honesty).
+
+### Agent-facing surfaces (for games that use Voxelize)
+
+Agents in a game read what ships in `node_modules/@voxelize/core`, so the consumer docs live in the
+package, not only in this repo (`.cursor/rules/agent-facing-api.mdc` has the rules):
+
+- `packages/core/skills/<name>/SKILL.md`: consumer skills, shipped in the npm tarball; `skills/` at
+  the repo root links to them so `npx skills add voxelize/voxelize --skill <name>` works. Each names
+  its `sources:`; `packages/core/src/agent-skills.test.ts` checks them.
+- `packages/core/AGENTS.consumer.md` + `npx voxelize-agents init` (`packages/core/bin/`): writes the
+  managed Voxelize block into a game's AGENTS.md, imports it from CLAUDE.md, links the skills.
+- `examples/`: the compiling, running version of every skill (`pnpm demo`; the instanced-entity
+  example is `examples/client/src/critters.ts` + `spawn-critter`).
+- `docs/static/llms.txt` and `context7.json`: indexes for agents that browse or use Context7.
+
+A public API change updates its skill, its example and its docs page in the same change.
+

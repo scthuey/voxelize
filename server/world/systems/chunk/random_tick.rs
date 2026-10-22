@@ -6,7 +6,7 @@
 //! If the block at that position is `is_random_tickable` and has an
 //! `active_updater`, it is scheduled via [`Chunks::mark_voxel_active`] at the
 //! **current tick** (earliest-deadline upsert) so the existing active queue
-//! runs the updater -- no Town-side full plant scan.
+//! runs the updater -- no game-side full plant scan.
 //!
 //! Budget: total samples across all sections in one tick are capped by
 //! [`WorldConfig::max_random_ticks_per_tick`]. The scheduled
@@ -66,10 +66,17 @@ pub fn sample_random_ticks(
         }
 
         let min = chunk.min.clone();
+        // Sections entirely above the chunk's tallest block hold only air,
+        // and air never random-ticks: the sky of a tall world costs the
+        // per-tick budget nothing, and a chunk's crops see the same sample
+        // rate whatever the world's ceiling. The height map is the top
+        // non-air row per column, kept current by generation and by edits.
+        let tallest = chunk.height_map.data.iter().copied().max().unwrap_or(0) as usize;
+        let live_sections = (tallest / section_height + 1).min(sub_chunks);
         // Drop chunk borrow before mark_voxel_active.
         drop(chunk);
 
-        for section in 0..sub_chunks {
+        for section in 0..live_sections {
             if samples_taken >= budget {
                 break;
             }
@@ -96,6 +103,7 @@ pub fn sample_random_ticks(
                 if id == 0 {
                     continue;
                 }
+                chunks.watch.note_sample(&Vec3(vx, vy, vz), id);
                 let block = registry.get_block_by_id(id);
                 if !block.is_random_tickable || !block.is_active {
                     continue;
@@ -232,6 +240,62 @@ mod tests {
         );
     }
 
+    /// A chunk whose tallest block sits in its bottom section draws samples
+    /// from that section alone: the sky above costs the budget nothing, so a
+    /// taller world does not dilute the rate its crops are visited at.
+    #[test]
+    fn random_tick_skips_sections_above_the_tallest_block() {
+        let mut registry = Registry::new();
+        registry.register_block(&growth_block(42));
+        let interests = {
+            let mut interests = ChunkInterests::new();
+            interests.add("tester", &Vec2(0, 0));
+            interests
+        };
+        let samples_for = |max_height: usize, sub_chunks: usize| {
+            let config = WorldConfig::new()
+                .chunk_size(16)
+                .max_height(max_height)
+                .sub_chunks(sub_chunks)
+                .random_tick_speed(2)
+                .max_random_ticks_per_tick(4096)
+                .seed(1)
+                .build();
+            let mut chunks = Chunks::new(&config);
+            let mut chunk = ready_chunk(0, 0, 16, max_height, sub_chunks);
+            assert!(chunk.set_raw_voxel(3, 4, 5, BlockUtils::insert_id(0, 42)));
+            chunk.calculate_max_height(&registry);
+            chunks.add(chunk);
+            sample_random_ticks(&mut chunks, &registry, &interests, &config, 7)
+        };
+        // Only the section holding the crop is sampled, at either height.
+        assert_eq!(samples_for(256, 8), 2);
+        assert_eq!(samples_for(384, 12), 2);
+    }
+
+    /// An all-air chunk still gets its bottom section sampled: the height
+    /// map reads 0 there, and the loop never goes below one section.
+    #[test]
+    fn random_tick_samples_one_section_of_an_empty_chunk() {
+        let config = WorldConfig::new()
+            .chunk_size(16)
+            .max_height(64)
+            .sub_chunks(4)
+            .random_tick_speed(3)
+            .max_random_ticks_per_tick(4096)
+            .seed(1)
+            .build();
+        let registry = Registry::new();
+        let mut chunks = Chunks::new(&config);
+        chunks.add(ready_chunk(0, 0, 16, 64, 4));
+        let mut interests = ChunkInterests::new();
+        interests.add("tester", &Vec2(0, 0));
+        assert_eq!(
+            sample_random_ticks(&mut chunks, &registry, &interests, &config, 1),
+            3
+        );
+    }
+
     #[test]
     fn random_tick_skips_chunks_without_interest() {
         let config = WorldConfig::new()
@@ -277,6 +341,43 @@ mod tests {
 
         let taken = sample_random_ticks(&mut chunks, &registry, &interests, &config, 1);
         assert_eq!(taken, 7);
+    }
+
+    #[test]
+    fn random_tick_reports_samples_of_watched_ids_even_on_inert_blocks() {
+        let config = WorldConfig::new()
+            .chunk_size(16)
+            .max_height(16)
+            .sub_chunks(1)
+            .random_tick_speed(16 * 16 * 16)
+            .max_random_ticks_per_tick(16 * 16 * 16)
+            .seed(1)
+            .build();
+
+        let mut registry = Registry::new();
+        registry.register_block(&Block::new("Inert").id(55).build());
+
+        let mut chunks = Chunks::new(&config);
+        let mut chunk = ready_chunk(0, 0, 16, 16, 1);
+        assert!(chunk.set_raw_voxel(4, 4, 4, BlockUtils::insert_id(0, 55)));
+        chunks.add(chunk);
+        chunks.watch.follow_samples(55);
+        let mut interests = ChunkInterests::new();
+        interests.add("tester", &Vec2(0, 0));
+
+        // Samples land with replacement, so give the cell a few passes.
+        let mut is_reported = false;
+        for tick in 1..=16 {
+            sample_random_ticks(&mut chunks, &registry, &interests, &config, tick);
+            is_reported |= chunks.watch.take().changes.iter().any(|c| {
+                c.voxel == Vec3(4, 4, 4) && c.change == crate::WatchedChange::Sampled { id: 55 }
+            });
+        }
+        assert!(is_reported);
+        assert!(
+            chunks.active_voxel_deadline(&Vec3(4, 4, 4)).is_none(),
+            "watching a block never schedules it"
+        );
     }
 
     #[test]

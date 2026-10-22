@@ -394,6 +394,11 @@ export class ItemSlots<T = number> {
   private animationFrame = -1;
   private isRenderQueued = false;
   private visibilityObserver: ResizeObserver | undefined;
+  /**
+   * What the last {@link connect} returned, so {@link dispose} unbinds the
+   * inputs and the canvas handlers even when the caller kept no handle.
+   */
+  private disconnectInputs: (() => void) | undefined;
 
   constructor(options: Partial<ItemSlotsOptions> = {}) {
     const {
@@ -448,6 +453,17 @@ export class ItemSlots<T = number> {
     this.visibilityObserver?.disconnect();
     this.visibilityObserver = undefined;
     this.deactivate();
+    // The mouse handlers `connect` put on the canvas close over this
+    // instance, and a canvas whose WebGL context was just lost outlives
+    // its removal from the document for a while: left on, they kept the
+    // slots, their scenes and whatever made them (a world since switched
+    // away from) alive past the dispose.
+    this.disconnectInputs?.();
+    this.disconnectInputs = undefined;
+    this.canvas.onmousedown = null;
+    this.canvas.onmouseenter = null;
+    this.canvas.onmouseleave = null;
+    this.canvas.onmousemove = null;
 
     for (const row of this.slots) {
       for (const slot of row) {
@@ -703,16 +719,23 @@ export class ItemSlots<T = number> {
         )
       : noop;
 
-    return () => {
+    const disconnect = () => {
+      if (this.disconnectInputs === disconnect) {
+        this.disconnectInputs = undefined;
+      }
       try {
         unbind();
         this.canvas.onmousedown = null;
         this.canvas.onmouseenter = null;
         this.canvas.onmouseleave = null;
+        this.canvas.onmousemove = null;
       } catch (e) {
         // Ignore
       }
     };
+    this.disconnectInputs?.();
+    this.disconnectInputs = disconnect;
+    return disconnect;
   };
 
   requestRender = () => {
@@ -738,7 +761,13 @@ export class ItemSlots<T = number> {
     // visibility observer repaints once layout comes back.
     if (width === 0 || height === 0) return;
 
-    if (this.canvas.width !== width || this.canvas.height !== height) {
+    // The drawing buffer is CSS size times the renderer's pixel ratio;
+    // comparing against CSS size alone would reallocate it every frame.
+    const ratio = this.renderer.getPixelRatio();
+    if (
+      this.canvas.width !== Math.floor(width * ratio) ||
+      this.canvas.height !== Math.floor(height * ratio)
+    ) {
       this.renderer.setSize(width, height, false);
     }
 

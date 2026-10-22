@@ -14,7 +14,20 @@ export class WebRTCConnection {
     return this.dc?.readyState === "open";
   }
 
-  async connect(serverUrl: string, clientId: string): Promise<void> {
+  /**
+   * Open the data channel for an already-registered session. `ticket` is the
+   * same signed session credential the WebSocket upgrade carried; the server
+   * derives the acting client id from it, so without one the offer is only
+   * accepted on servers that trust client-chosen ids. `world` names which of
+   * the client id's sockets the channel belongs to: one id may be in
+   * several worlds at once, each socket with its own channel.
+   */
+  async connect(
+    serverUrl: string,
+    clientId: string,
+    ticket?: string | null,
+    world?: string,
+  ): Promise<void> {
     this.pc = new RTCPeerConnection({
       iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
     });
@@ -37,37 +50,48 @@ export class WebRTCConnection {
       this.handleMessage(event.data as ArrayBuffer);
     };
 
-    const offer = await this.pc.createOffer();
-    await this.pc.setLocalDescription(offer);
+    // A handshake that fails (the offer refused or unreachable) must not
+    // leave the peer connection open: an open one keeps its channel and the
+    // channel's handlers alive, and through `onMessage` the whole network
+    // and world that made it, for the rest of the page.
+    try {
+      const offer = await this.pc.createOffer();
+      await this.pc.setLocalDescription(offer);
 
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-    };
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+      };
 
-    const baseUrl = new URL(serverUrl);
-    baseUrl.protocol = baseUrl.protocol.replace(/^ws/, "http");
+      const baseUrl = new URL(serverUrl);
+      baseUrl.protocol = baseUrl.protocol.replace(/^ws/, "http");
 
-    const offerUrl = new URL("/rtc/offer", baseUrl);
+      const offerUrl = new URL("/rtc/offer", baseUrl);
 
-    const response = await fetch(offerUrl.toString(), {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        sdp: offer.sdp,
-        client_id: clientId,
-      }),
-    });
+      const response = await fetch(offerUrl.toString(), {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          sdp: offer.sdp,
+          client_id: clientId,
+          ...(ticket ? { ticket } : {}),
+          ...(world ? { world } : {}),
+        }),
+      });
 
-    if (!response.ok) {
-      throw new Error(`RTC offer failed: ${response.status}`);
+      if (!response.ok) {
+        throw new Error(`RTC offer failed: ${response.status}`);
+      }
+
+      const { sdp: answerSdp } = await response.json();
+
+      await this.pc.setRemoteDescription({
+        type: "answer",
+        sdp: answerSdp,
+      });
+    } catch (error) {
+      this.close();
+      throw error;
     }
-
-    const { sdp: answerSdp } = await response.json();
-
-    await this.pc.setRemoteDescription({
-      type: "answer",
-      sdp: answerSdp,
-    });
   }
 
   close(): void {

@@ -2,7 +2,9 @@ import { ChunkRenderer } from "./chunk-renderer";
 import { CloudsOptions } from "./clouds";
 import { LocalLightsOptions } from "./local-lights/types";
 import { MemoryPressureOptions } from "./memory-pressure";
+import type { OrderIndependentTransparencyOptions } from "./order-independent-transparency";
 import { SkyOptions } from "./sky";
+import type { VolumetricCloudsOptions } from "./volumetric-clouds";
 
 /**
  * The client-side options to create a world. These are client-side only and can be customized to specific use.
@@ -53,7 +55,34 @@ export type WorldClientOptions = {
    */
   meshJobTimeoutMs: number;
 
+  /**
+   * Chunk sections the mesh dispatcher may start in about a frame, air
+   * sections (which finish without a worker) included; the rest wait for
+   * the next frame. Workers are refilled as their jobs finish, so this only
+   * bounds the main thread's dispatch work. Defaults to `32`.
+   */
   maxMeshesPerUpdate: number;
+
+  /**
+   * Regular (non-urgent) chunk mesh jobs running at once; each worker that
+   * finishes takes the next nearest section. More stream terrain in sooner
+   * and cost frame time: on a sprint flight (M5 Max) 2 drew a column about
+   * 0.9 s after it came into range where 1 took 1.7 s, for about a
+   * millisecond more a frame, and 3 or 4 doubled the slowest frames.
+   * Capped by the mesh worker pool. Defaults to `2`.
+   */
+  meshJobsInFlight: number;
+
+  /**
+   * How long, in milliseconds, a finished re-mesh of a section already on
+   * screen may wait for a ready neighbour to draw before it swaps in. The
+   * re-mesh removes the wall the section drew against that neighbour while
+   * it was missing, so swapping it in first opened a gap along the border.
+   * `0` swaps every re-mesh in on arrival, the old behaviour. Read on every
+   * apply, so it can be flipped for A/B timing. Defaults to `20000`, below
+   * the 30 s mesh-job watchdog the held job still counts against.
+   */
+  borderSwapHoldMs: number;
 
   /**
    * Dedicated mesh workers reserved for client-originated voxel edits.
@@ -141,6 +170,28 @@ export type WorldClientOptions = {
   isCullingChunksByOcclusion: boolean;
 
   /**
+   * Whether a chunk joins the occlusion walk as open air from the moment it
+   * is requested, until its own connectivity lands. A chunk with no node
+   * blocks every path through it (the walk never turns back), so without
+   * this the open terrain behind each still-loading chunk was culled and
+   * popped in when the hole filled. `false` is the old behaviour; read when
+   * each request is issued.
+   */
+  isOcclusionOpenAtPendingChunks: boolean;
+
+  /**
+   * Whether the occlusion walk keeps running for a spectating (noclip)
+   * camera. A noclip camera can sit inside rock, where faces between solid
+   * voxels are never meshed and it sees straight through to whatever the
+   * walk would call hidden; so while any voxel the near plane can touch is
+   * opaque the walk steps aside for frustum-only culling, and everywhere
+   * else (open air, a cave it flew into) it culls exactly as it does for a
+   * walking player. `false` suspends occlusion for the whole flight, the
+   * old behaviour. Read every frame, so it can be flipped for A/B timing.
+   */
+  isCullingSpectatorByOcclusion: boolean;
+
+  /**
    * Whether the occlusion walk also prunes sections past the fog's far edge,
    * where every fragment already resolves to pure fog color.
    */
@@ -170,6 +221,15 @@ export type WorldClientOptions = {
    * the ground cover.
    */
   plantDetailDistance: number | null;
+
+  /**
+   * Block distance out to which blocks' tufts ({@link Block.tufts}) are
+   * drawn; beyond it a chunk's tuft batch is hidden and its canopies are
+   * their plain cubes. `null` (the default) draws them everywhere. Like
+   * {@link plantDetailDistance} it hides whole sections rather than fading,
+   * so set it where a tuft's ragged edge no longer reads.
+   */
+  tuftDetailDistance: number | null;
 
   /**
    * Whether to use client-only meshing. When true, chunks are always meshed locally.
@@ -206,6 +266,16 @@ export type WorldClientOptions = {
   chunkRerequestIntervalMs: number;
 
   /**
+   * How long a chunk may stay asked for with no data arriving before the
+   * world reports it as unanswered, in milliseconds. The request itself is
+   * retried every `chunkRerequestIntervalMs` meanwhile; the report names each
+   * stuck chunk once per interval while it stays stuck, with how often it
+   * was asked for and whether any request left this client. `0` turns the
+   * report off. Defaults to `60000`ms.
+   */
+  chunkRequestOverdueMs: number;
+
+  /**
    * The default render radius of the world, in chunks. Change this through `world.renderRadius`. Defaults to `8` chunks.
    */
   defaultRenderRadius: number;
@@ -221,10 +291,44 @@ export type WorldClientOptions = {
   fogFarRenderRatio: number;
 
   /**
+   * A fixed fog distance in blocks, independent of `renderRadius`. `null`
+   * (the default) derives fog from `fogNearRenderRatio`/`fogFarRenderRatio`
+   * as before, so fog moves every time the radius changes. Set it to hold
+   * fog steady across radius changes — for example raising `renderRadius`
+   * for a vista capture without paying for fog pushed out to match. Always
+   * clamped to at most the current render distance (`world.fogDistance`,
+   * `World.getBaseFogRange`).
+   */
+  fogDistance: number | null;
+
+  /**
+   * How the block atlas samples at glancing angles. `"nearest"` (the
+   * default) is the original path: no mips, so a steep wall far from
+   * straight-on aliases into streaks because there is no lower-resolution
+   * level to fall back to. `"mip-aniso"` builds a full mip chain
+   * (`NearestMipmapNearestFilter` — each level stays hard-edged, only the
+   * level picked changes, so up-close texels stay exactly as crisp) plus
+   * anisotropy 4 for the glancing-angle case specifically. Costs a mip
+   * chain build per atlas upload and `gl.generateMipmap` after every
+   * animated-tile patch (`AtlasTexture.flushAnimationPatches`); A/B before
+   * defaulting a consumer to it. `World.setBlockTextureFiltering` flips it
+   * live for an A/B run without rebuilding the world.
+   */
+  blockTextureFiltering: "nearest" | "mip-aniso";
+
+  /**
    * The default dimension to a single unit of a block face texture. If any texture loaded is greater, it will be downscaled to this resolution.
    * Defaults to `8` pixels.
    */
   textureUnitDimension: number;
+
+  /**
+   * The flat colour {@link World.fillUnpaintedSurfaces} paints over a
+   * surface still wearing the magenta-and-black unknown checker when there
+   * is no better default to give it. A quiet warm grey by default, so a
+   * stage with a missing texture reads as unfinished rather than broken.
+   */
+  unpaintedFallbackColor: string;
 
   /**
    * The exponent applied to the ratio that chunks are loaded, which would then be used to determine whether an angle to a chunk is worth loading.
@@ -241,6 +345,68 @@ export type WorldClientOptions = {
    * The options to create the clouds. Defaults to `{}`.
    */
   cloudsOptions: Partial<CloudsOptions>;
+
+  /**
+   * A volumetric cloud deck drawn beside (or instead of) the meshed one;
+   * `null` draws none. Change it live with `World.setVolumetricClouds`.
+   * Defaults to `null`.
+   */
+  volumetricCloudsOptions: Partial<VolumetricCloudsOptions> | null;
+
+  /**
+   * How far the far-terrain layer reaches past the viewer, in blocks, in a
+   * world that serves far terrain (`farTerrain` in its INIT options). `0`
+   * (the default) draws none. Change it through `world.farTerrainDistance`.
+   */
+  farTerrainDistance: number;
+
+  /**
+   * Linear RGB per class the world's far-terrain sampler emits, flattened
+   * (`[r0, g0, b0, r1, ...]`), for a world whose descriptor names no
+   * `materials` (with materials the layer paints each class from its
+   * blocks' textures). An empty palette (the default) draws every class
+   * grey.
+   */
+  farTerrainPalette: number[];
+
+  /** The far water plane's colour. Defaults to a deep sea blue. */
+  farTerrainWaterColor: string;
+
+  /** Top colour of far floating land, without a `skyMaterial`. */
+  farTerrainSkyTopColor: string;
+
+  /** Underside and wall colour of far floating land, without a `skyMaterial`. */
+  farTerrainSkySideColor: string;
+
+  /**
+   * With the far layer on, fog starts at this fraction of the render
+   * distance and closes at the far layer's edge, so loaded terrain stays
+   * nearly clear and the far layer fades into haze. Defaults to `0.6`.
+   */
+  farTerrainFogNearRatio: number;
+
+  /**
+   * With the far layer on, fog closes at this multiple of its reach. Past
+   * `1` the layer's far stretch stays partly clear (a range 850 blocks off
+   * is about half hazed at 1.6 with a 1024 reach) and the layer thins into
+   * the haze across its outer `farTerrainEdgeBand`. Defaults to `1`.
+   */
+  farTerrainFogFarRatio: number;
+
+  /**
+   * The outer share of the far layer's reach across which it thins into
+   * the haze, so its edge never cuts against the sky. Defaults to `0.1`.
+   */
+  farTerrainEdgeBand: number;
+
+  /**
+   * How many blocks of the loaded area's outer edge hand over to the far
+   * layer across a dithered band, up to half a chunk; 0 leaves the edge
+   * hard. Defaults to `0`: the band dithers by screen pixel, which
+   * shimmers as the view moves, and over anything standing off the ground
+   * (a floating island, a tall crown) it interleaves two different shapes.
+   */
+  farTerrainSeamBand: number;
 
   /**
    * The uniforms to overwrite the default chunk material uniforms. Defaults to `{}`.
@@ -339,11 +505,24 @@ export type WorldClientOptions = {
    * Defaults to `3`.
    */
   meshApplyBudgetMs: number;
+
+  /**
+   * Draw every blended surface order-independently (see
+   * {@link OrderIndependentTransparencyOptions}): water, glass, the
+   * translucent texels of any see-through block, and every transparent
+   * material in the world's scene, accumulated in any order and composited
+   * once. Requires the host to render the world into a render target with
+   * a depth texture, and to call `World.prepareTransparency` before each
+   * frame; a render that cannot accumulate says why and draws its layers in
+   * list order. `null` (the default) keeps the sorted pipeline: per-face
+   * sorting, medium bands and the per-pixel water side of glass.
+   */
+  orderIndependentTransparency: OrderIndependentTransparencyOptions | null;
 };
 
 /**
  * Tunables for the per-region `BatchedMesh` arenas that batch every
- * shared-opaque chunk section into one multi-draw call per region.
+ * section of a batched chunk bucket into a few multi-draw calls per region.
  */
 export type ChunkRegionArenasOptions = {
   /**
@@ -353,23 +532,19 @@ export type ChunkRegionArenasOptions = {
   regionSizeInChunks: number;
 
   /**
-   * Vertex capacity a region arena is created with. Arenas grow geometrically
-   * from here, so this is a floor, not a limit.
+   * Vertices a page of a region holds. A region is pages that never grow:
+   * one that fills opens another, so what one frame uploads when a region
+   * gains room is one page (about 9 MB at the default), never the whole
+   * region. Larger pages mean fewer draws, smaller ones smaller uploads; a
+   * section larger than a page gets a page of its own.
    */
-  initialVertexCapacity: number;
+  pageVertexCapacity: number;
 
   /**
    * Multiplier applied to a section's vertex/index count when reserving its
    * arena slot, so small remeshes update in place instead of reallocating.
    */
   slotSlack: number;
-
-  /**
-   * Factor a full arena's capacity is multiplied by when it grows. Growth
-   * re-uploads the region's buffers, so it should be rare: geometric growth
-   * bounds the number of growth events logarithmically.
-   */
-  growthFactor: number;
 
   /**
    * Index capacity per vertex of capacity. Quad geometry uses six indices for
@@ -387,14 +562,19 @@ export const defaultWorldClientOptions: WorldClientOptions = {
   lightJobTimeoutMs: 20000,
   meshJobTimeoutMs: 30000,
   maxLightsUpdateTime: 5, // ms
-  maxMeshesPerUpdate: 8,
+  maxMeshesPerUpdate: 32,
+  meshJobsInFlight: 2,
+  borderSwapHoldMs: 20000,
   maxUrgentMeshWorkers: 4,
   isCullingChunksByFrustum: true,
   chunkCullShadowSafeDistance: 160,
   isCullingChunksByOcclusion: true,
+  isOcclusionOpenAtPendingChunks: true,
+  isCullingSpectatorByOcclusion: true,
   isCullingChunksByFog: true,
   fogCullSlack: 16,
   plantDetailDistance: null,
+  tuftDetailDistance: null,
   distantDetailCullBelowY: null,
   nearDetailRadius: 10,
   distantDetailCullHysteresis: 8,
@@ -402,13 +582,27 @@ export const defaultWorldClientOptions: WorldClientOptions = {
   clientOnlyMeshing: true,
   minLightLevel: 0.04,
   chunkRerequestIntervalMs: 5000,
+  chunkRequestOverdueMs: 60_000,
   defaultRenderRadius: 6,
   fogNearRenderRatio: 0.45,
   fogFarRenderRatio: 0.78,
+  fogDistance: null,
+  blockTextureFiltering: "nearest",
   textureUnitDimension: 8,
+  unpaintedFallbackColor: "#8f8a84",
   chunkLoadExponent: 8,
   skyOptions: {},
   cloudsOptions: {},
+  volumetricCloudsOptions: null,
+  farTerrainDistance: 0,
+  farTerrainPalette: [],
+  farTerrainWaterColor: "#2d6a9a",
+  farTerrainSkyTopColor: "#6f9d4e",
+  farTerrainSkySideColor: "#6e665c",
+  farTerrainFogNearRatio: 0.6,
+  farTerrainFogFarRatio: 1,
+  farTerrainEdgeBand: 0.1,
+  farTerrainSeamBand: 0,
   chunkUniformsOverwrite: {},
   sunlightStartTimeFrac: 0.25,
   sunlightEndTimeFrac: 0.7,
@@ -427,13 +621,13 @@ export const defaultWorldClientOptions: WorldClientOptions = {
   memoryPressure: {},
   regionArenas: {
     regionSizeInChunks: 8,
-    initialVertexCapacity: 1 << 18,
+    pageVertexCapacity: 1 << 18,
     slotSlack: 1.1,
-    growthFactor: 1.5,
     indexPerVertexRatio: 1.5,
   },
   swayProfileCapacity: 16,
   meshApplyBudgetMs: 3,
+  orderIndependentTransparency: null,
 };
 
 /**
@@ -506,6 +700,13 @@ export type WorldServerOptions = {
    * The nominal water level of this world, in blocks.
    */
   waterLevel: number;
+
+  /**
+   * The server's world seed. Shared cosmetic randomness — the cloud deck, the
+   * shooting-star schedule — derives from it so every client of one world
+   * sees the same sky.
+   */
+  seed: number;
 };
 
 /**

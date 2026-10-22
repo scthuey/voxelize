@@ -1,10 +1,13 @@
 import { Color, Material, Mesh, Object3D, Vector3 } from "three";
 
 import { World } from "../../core";
+import {
+  composeEntityLight,
+  EntityLightSample,
+} from "../../core/world/entity-light";
 import { blockLightFloodRemainder } from "../../core/world/local-lights";
 import {
   getDownwellingTransmittance,
-  measureWaterColumn,
   WATER_OPTICS,
   WATER_SURFACE_SCATTER_COLOR,
 } from "../../core/world/water-optics";
@@ -14,10 +17,33 @@ import { NameTag } from "../nametag";
 const position = new Vector3();
 const tempColor = new Color();
 const waterTransmittance = new Color();
+const underwaterFill = new Color();
+// The analytic lights' hue, written by queryLocalLights and read by
+// composeEntityLight through the sample below.
+const lightHueScratch: [number, number, number] = [0, 0, 0];
+const lightSample: EntityLightSample = {
+  sunExposure: 0,
+  floodR: 0,
+  floodG: 0,
+  floodB: 0,
+  floodRemainder: 1,
+  lightHue: lightHueScratch,
+  clusterR: 0,
+  clusterG: 0,
+  clusterB: 0,
+  shadowFactor: 1,
+  sunlightIntensity: 1,
+  sunColor: new Color(1, 1, 1),
+  ambientColor: new Color(1, 1, 1),
+  ambientFloor: 0,
+  downTransmit: waterTransmittance,
+  underwaterFill,
+};
 const localLightSample = {
   color: [0, 0, 0] as [number, number, number],
   count: 0,
   claim: 0,
+  lightHue: lightHueScratch,
   windowFade: 1,
 };
 const localLightQueryOptions = { floodMask: 1, timeMs: 0 };
@@ -25,13 +51,90 @@ const floodRemainderArgs = { scaledClaim: 0, floodLevel: 0, windowFade: 1 };
 
 type IgnoredType = abstract new (...args: never[]) => object;
 
+type MaterialOwner = {
+  root: Object3D | null;
+  lightUniform: { value: Color };
+  baseOnBeforeCompile: Material["onBeforeCompile"] | undefined;
+  copyOf: Material | null;
+};
+
+const isMesh = (object: Object3D): object is Mesh => object instanceof Mesh;
+
+type CompileHook = Material["onBeforeCompile"];
+
+/**
+ * Every light hook an effect put on a material, to the hook it wrapped
+ * (undefined: the material had none of its own). The hook is made here, at
+ * module level, so it closes over its light uniform and the wrapped hook
+ * and never over the effect: a material that outlives its effect (art
+ * shared page-wide, kept across a world switch) must not keep that effect,
+ * and its world, alive. The next effect to meet such a material wraps what
+ * the old hook wrapped, instead of skipping it as already set up and
+ * leaving it on the dead effect's frozen light.
+ */
+const lightEffectHooks = new WeakMap<CompileHook, CompileHook | undefined>();
+
+const makeLightEffectHook = (
+  base: CompileHook | undefined,
+  lightUniform: { value: Color },
+): CompileHook => {
+  const hook: CompileHook = (shader, renderer) => {
+    if (base) {
+      base(shader, renderer);
+    }
+
+    shader.uniforms.lightEffect = lightUniform;
+    shader.vertexShader = shader.vertexShader.replace(
+      "void main() {",
+      `
+          uniform vec3 lightEffect;
+          void main() {
+          `,
+    );
+    shader.fragmentShader = shader.fragmentShader.replace(
+      "void main() {",
+      `
+          uniform vec3 lightEffect;
+          void main() {
+          `,
+    );
+    shader.fragmentShader = shader.fragmentShader.replace(
+      "#include <color_fragment>",
+      `
+          #include <color_fragment>
+          diffuseColor.rgb *= lightEffect;
+          `,
+    );
+  };
+  lightEffectHooks.set(hook, base);
+  return hook;
+};
+
+const isWithin = (object: Object3D, ancestor: Object3D) => {
+  for (let node: Object3D | null = object; node; node = node.parent) {
+    if (node === ancestor) return true;
+  }
+  return false;
+};
+
+/** Whether `object`'s ancestor chain ends in a Scene, i.e. it can be drawn. */
+const isUnderScene = (object: Object3D): boolean => {
+  let root = object;
+  while (root.parent) root = root.parent;
+  return (root as { isScene?: boolean }).isScene === true;
+};
+
 export type LightShinedOptions = {
   /**
    * The lerping factor of the brightness of each mesh. Defaults to `0.1`.
    */
   lerpFactor: number;
   /**
-   * The maximum brightness cap for the light effect. Defaults to `2.5`.
+   * Cap on the composed light multiplier, applied after tone mapping. The
+   * composition already runs through the chunk shader's ACES curve, which
+   * tops out near `1.03`, so this only trims that asymptote: the materials
+   * under this effect are unlit and untonemapped, and any multiplier past
+   * `1` pushes their texture toward white. Defaults to `1`.
    */
   maxBrightness: number;
   /**
@@ -52,13 +155,37 @@ export type LightShinedOptions = {
    * samples. Defaults to `0.5`.
    */
   resampleDistance: number;
+  /**
+   * Notice children added under a shined object by wrapping every
+   * `children` array and mesh material in its subtree in a Proxy, the old
+   * path, kept only to A/B measure its cost. A Proxy puts a slow path in
+   * every scene-graph walk over those nodes (matrix updates, culling,
+   * traversals) and in every material read three makes per draw, and a
+   * sibling removal re-wrapped the shifted children in nested Proxies. The
+   * default listens for three's `childadded` events instead. Defaults to
+   * `false`.
+   */
+  useProxyChangeDetection: boolean;
+  /**
+   * Skip a registered object whose ancestors do not end in a `Scene`. The
+   * entity manager releases an entity by detaching its root, so an object
+   * lit below that root (a character inside its entity) keeps a parent and
+   * would otherwise be traversed, resampled and lerped every frame although
+   * nothing draws it. Registering and removing in pairs is still the rule;
+   * this only bounds the cost of a missed remove. Needs every lit object to
+   * live under a real `Scene` (the world, an overlay scene), so it is off
+   * by default. Defaults to `false`.
+   */
+  skipDetached: boolean;
 };
 
 const defaultOptions: LightShinedOptions = {
   lerpFactor: 0.1,
-  maxBrightness: 2.5,
+  maxBrightness: 1,
   sampleIntervalFrames: 4,
   resampleDistance: 0.5,
+  useProxyChangeDetection: false,
+  skipDetached: false,
 };
 
 type LightSample = {
@@ -127,11 +254,30 @@ export class LightShined {
 
   private nextSamplePhase = 0;
 
-  private isFluidAt = (vx: number, vy: number, vz: number): boolean => {
-    if (this.world.getVoxelWaterloggedAt(vx, vy, vz)) return true;
-    const block = this.world.getBlockAt(vx, vy, vz);
-    return !!block && block.isFluid;
-  };
+  /**
+   * The shined root a hooked node sets new materials up for. Weak, so a
+   * dropped subtree is not kept alive by the effect.
+   */
+  private owners = new WeakMap<Object3D, Object3D>();
+
+  /**
+   * Every material this effect has set up: the shined root whose light
+   * uniform it carries (null once that root is removed, so the entry does
+   * not keep it alive and the next root to meet the material adopts it),
+   * that uniform, the `onBeforeCompile` it had before the effect wrapped
+   * it, so a copy made for another root starts from that hook, and, for a
+   * copy, the material it was copied from.
+   */
+  private materialOwners = new WeakMap<Material, MaterialOwner>();
+
+  /** The materials set up for each root, released when it is removed. */
+  private rootMaterials = new WeakMap<Object3D, Material[]>();
+
+  /**
+   * The copies made for each root, by the material copied, so every mesh
+   * of one root shares one copy; disposed when the root is removed.
+   */
+  private ownedCopies = new WeakMap<Object3D, Map<Material, Material>>();
 
   /**
    * Construct a light shined effect manager.
@@ -166,6 +312,32 @@ export class LightShined {
   remove = (obj: Object3D) => {
     this.list.delete(obj);
     this.samples.delete(obj);
+    if (!this.options.useProxyChangeDetection) this.unhookSubtree(obj, obj);
+    const materials = this.rootMaterials.get(obj);
+    if (materials) {
+      for (const material of materials) {
+        const owner = this.materialOwners.get(material);
+        if (owner?.root === obj) owner.root = null;
+      }
+      this.rootMaterials.delete(obj);
+    }
+    const copies = this.ownedCopies.get(obj);
+    if (copies) {
+      // Only the copied material: its map and program stay shared.
+      for (const copy of copies.values()) copy.dispose();
+      this.ownedCopies.delete(obj);
+    }
+  };
+
+  /**
+   * Let go of every shined object: their subtree listeners, the light
+   * uniforms and the copies made for them. Materials it set up that outlive
+   * it keep a hook that holds nothing of the effect, and the next effect to
+   * meet them lights them again.
+   */
+  dispose = () => {
+    for (const obj of [...this.list]) this.remove(obj);
+    this.positionOverrides.clear();
   };
 
   /**
@@ -195,102 +367,222 @@ export class LightShined {
     });
   };
 
+  private setupMaterial = (root: Object3D, material: Material) => {
+    // Set up by an earlier effect (a world since switched away from): it is
+    // this effect's to light now, from the hook the earlier one wrapped.
+    const earlierHook = lightEffectHooks.has(material.onBeforeCompile)
+      ? material.onBeforeCompile
+      : null;
+    if (
+      ThreeUtils.isShaderMaterial(material) ||
+      (material.userData.lightEffectSetup && earlierHook === null) ||
+      material.userData.heldObjectLighting === true ||
+      isSelfIlluminated(material)
+    )
+      return;
+
+    const lightUniform = { value: new Color(1, 1, 1) };
+    const baseOnBeforeCompile =
+      earlierHook !== null
+        ? lightEffectHooks.get(earlierHook)
+        : Object.prototype.hasOwnProperty.call(material, "onBeforeCompile")
+          ? material.onBeforeCompile
+          : undefined;
+    this.materialOwners.set(material, {
+      root,
+      lightUniform,
+      baseOnBeforeCompile,
+      copyOf: null,
+    });
+    this.trackRootMaterial(root, material);
+    material.onBeforeCompile = makeLightEffectHook(
+      baseOnBeforeCompile,
+      lightUniform,
+    );
+    material.needsUpdate = true;
+    if (!root.userData.lightUniforms) {
+      root.userData.lightUniforms = [];
+    }
+    root.userData.lightUniforms.push(lightUniform);
+    material.userData.lightEffectSetup = true;
+  };
+
+  /**
+   * The material `mesh` should draw with under `root`. A material carries
+   * one light uniform, so one another shined root already set up (every
+   * pot of one plant shares the cached block mesh's materials, for
+   * instance) would show that root's light here, or a frozen value once
+   * it is gone: this mesh gets a copy set up for `root`, one per root and
+   * material however many of the root's meshes share it. A mesh inside the
+   * owning root's own subtree keeps sharing, lit as part of it. A material
+   * whose root was removed is adopted by the next root that meets it (its
+   * uniform joins that root's), so churn does not pile up copies.
+   */
+  private claimMaterial = (
+    root: Object3D,
+    mesh: Mesh,
+    material: Material,
+  ): Material => {
+    const owner = this.materialOwners.get(material);
+    if (!owner) {
+      this.setupMaterial(root, material);
+      return material;
+    }
+    if (owner.root === null) {
+      this.adoptMaterial(root, material, owner);
+      return material;
+    }
+    if (owner.root === root || isWithin(mesh, owner.root)) return material;
+
+    let copies = this.ownedCopies.get(root);
+    const existing = copies?.get(material);
+    if (existing) return existing;
+    const copy = material.clone();
+    if (owner.baseOnBeforeCompile) {
+      copy.onBeforeCompile = owner.baseOnBeforeCompile;
+    }
+    delete copy.userData.lightEffectSetup;
+    this.setupMaterial(root, copy);
+    const copyOwner = this.materialOwners.get(copy);
+    if (copyOwner) copyOwner.copyOf = material;
+    if (!copies) {
+      copies = new Map();
+      this.ownedCopies.set(root, copies);
+    }
+    copies.set(material, copy);
+    return copy;
+  };
+
+  private adoptMaterial = (
+    root: Object3D,
+    material: Material,
+    owner: MaterialOwner,
+  ) => {
+    owner.root = root;
+    if (!root.userData.lightUniforms) root.userData.lightUniforms = [];
+    const uniforms = root.userData.lightUniforms as { value: Color }[];
+    if (!uniforms.includes(owner.lightUniform))
+      uniforms.push(owner.lightUniform);
+    this.trackRootMaterial(root, material);
+    if (owner.copyOf) {
+      let copies = this.ownedCopies.get(root);
+      if (!copies) {
+        copies = new Map();
+        this.ownedCopies.set(root, copies);
+      }
+      copies.set(owner.copyOf, material);
+    }
+  };
+
+  private trackRootMaterial = (root: Object3D, material: Material) => {
+    const materials = this.rootMaterials.get(root);
+    if (materials) materials.push(material);
+    else this.rootMaterials.set(root, [material]);
+  };
+
+  private setupObjectAndChildren = (root: Object3D, object: Object3D) => {
+    if (isMesh(object)) {
+      if (Array.isArray(object.material)) {
+        const materials = object.material;
+        for (let i = 0; i < materials.length; i++) {
+          materials[i] = this.claimMaterial(root, object, materials[i]);
+        }
+      } else {
+        const claimed = this.claimMaterial(root, object, object.material);
+        if (claimed !== object.material) object.material = claimed;
+      }
+    }
+    for (const child of object.children) {
+      this.setupObjectAndChildren(root, child);
+    }
+  };
+
   private setupLightMaterials = (obj: Object3D) => {
-    const setupMaterial = (material: Material) => {
-      if (
-        ThreeUtils.isShaderMaterial(material) ||
-        material.userData.lightEffectSetup ||
-        material.userData.heldObjectLighting === true ||
-        isSelfIlluminated(material)
-      )
-        return;
-
-      const lightUniform = { value: new Color(1, 1, 1) };
-      const oldOnBeforeCompile = material.onBeforeCompile;
-      material.onBeforeCompile = (shader, renderer) => {
-        if (oldOnBeforeCompile) {
-          oldOnBeforeCompile(shader, renderer);
-        }
-
-        shader.uniforms.lightEffect = lightUniform;
-        shader.vertexShader = shader.vertexShader.replace(
-          "void main() {",
-          `
-          uniform vec3 lightEffect;
-          void main() {
-          `,
-        );
-        shader.fragmentShader = shader.fragmentShader.replace(
-          "void main() {",
-          `
-          uniform vec3 lightEffect;
-          void main() {
-          `,
-        );
-        shader.fragmentShader = shader.fragmentShader.replace(
-          "#include <color_fragment>",
-          `
-          #include <color_fragment>
-          diffuseColor.rgb *= lightEffect;
-          `,
-        );
-      };
-      material.needsUpdate = true;
-      if (!obj.userData.lightUniforms) {
-        obj.userData.lightUniforms = [];
-      }
-      obj.userData.lightUniforms.push(lightUniform);
-      material.userData.lightEffectSetup = true;
-    };
-
-    const isMesh = (object: Object3D): object is Mesh => {
-      return object instanceof Mesh;
-    };
-
-    const setupObjectAndChildren = (object: Object3D) => {
-      if (isMesh(object)) {
-        if (Array.isArray(object.material)) {
-          object.material.forEach(setupMaterial);
-        } else {
-          setupMaterial(object.material);
-        }
-      }
-      object.children.forEach(setupObjectAndChildren);
-    };
-
     // Setup initial materials
-    setupObjectAndChildren(obj);
+    this.setupObjectAndChildren(obj, obj);
 
-    // Setup proxies to detect changes
-    const setupProxies = (object: Object3D) => {
-      if (isMesh(object)) {
-        object.material = new Proxy(object.material, {
-          set: (target, prop, value) => {
-            target[prop] = value;
-            if (prop === "needsUpdate" && value === true) {
-              setupObjectAndChildren(object);
-            }
-            return true;
-          },
-        });
-        obj.userData.justChanged = true;
-      }
+    if (this.options.useProxyChangeDetection) {
+      this.setupProxies(obj, obj);
+      return;
+    }
 
-      object.children = new Proxy(object.children, {
+    if (this.hookSubtree(obj, obj)) {
+      obj.userData.justChanged = true;
+    }
+  };
+
+  /**
+   * Listen on every node of a shined subtree for children added later
+   * (equipment, hats, bubbles), so their materials are set up before their
+   * first draw. One shared listener pair for every node; returns whether
+   * the subtree holds a mesh, which is when the first update snaps the
+   * light instead of easing into it.
+   */
+  private hookSubtree = (root: Object3D, object: Object3D): boolean => {
+    let hasMesh = false;
+    object.traverse((node) => {
+      if (isMesh(node)) hasMesh = true;
+      // A node another shined root already hooks keeps that owner: its
+      // new children's lights ride with the root that registered first.
+      if (this.owners.has(node)) return;
+      this.owners.set(node, root);
+      node.addEventListener("childadded", this.onChildAdded);
+      node.addEventListener("childremoved", this.onChildRemoved);
+    });
+    return hasMesh;
+  };
+
+  private unhookSubtree = (root: Object3D, object: Object3D) => {
+    object.traverse((node) => {
+      if (this.owners.get(node) !== root) return;
+      this.owners.delete(node);
+      node.removeEventListener("childadded", this.onChildAdded);
+      node.removeEventListener("childremoved", this.onChildRemoved);
+    });
+  };
+
+  private onChildAdded = (event: { child: Object3D; target: Object3D }) => {
+    const root = this.owners.get(event.target);
+    if (!root) return;
+    this.setupObjectAndChildren(root, event.child);
+    if (this.hookSubtree(root, event.child)) {
+      root.userData.justChanged = true;
+    }
+  };
+
+  private onChildRemoved = (event: { child: Object3D; target: Object3D }) => {
+    const root = this.owners.get(event.target);
+    if (!root) return;
+    this.unhookSubtree(root, event.child);
+  };
+
+  /** The old change detection; see `useProxyChangeDetection`. */
+  private setupProxies = (obj: Object3D, object: Object3D) => {
+    if (isMesh(object)) {
+      object.material = new Proxy(object.material, {
         set: (target, prop, value) => {
           target[prop] = value;
-          if (typeof prop === "string" && !isNaN(Number(prop))) {
-            setupObjectAndChildren(value);
-            setupProxies(value);
+          if (prop === "needsUpdate" && value === true) {
+            this.setupObjectAndChildren(obj, object);
           }
           return true;
         },
       });
+      obj.userData.justChanged = true;
+    }
 
-      object.children.forEach(setupProxies);
-    };
+    object.children = new Proxy(object.children, {
+      set: (target, prop, value) => {
+        target[prop as unknown as number] = value;
+        if (typeof prop === "string" && !isNaN(Number(prop))) {
+          this.setupObjectAndChildren(obj, value);
+          this.setupProxies(obj, value);
+        }
+        return true;
+      },
+    });
 
-    setupProxies(obj);
+    object.children.forEach((child) => this.setupProxies(obj, child));
   };
 
   private updateObject = (obj: Object3D, color: Color) => {
@@ -316,6 +608,7 @@ export class LightShined {
 
   private recursiveUpdate = (obj: Object3D, color: Color | null = null) => {
     if (!obj.parent) return;
+    if (this.options.skipDetached && !isUnderScene(obj)) return;
 
     for (const type of this.ignored) {
       if (obj instanceof type) return;
@@ -370,75 +663,89 @@ export class LightShined {
     return sample.color;
   };
 
+  /**
+   * The light an object standing at `position` is shaded with, composed
+   * the way the chunk shader lights the block there (capped at
+   * `maxBrightness`). The returned colour is reused: copy it to keep it.
+   * Instanced entities light their instances from this.
+   */
+  lightAt = (position: Vector3): Color => {
+    return this.computeShaderBasedLight(position);
+  };
+
+  /**
+   * Gather the chunk shader's inputs at a point — flood light, sun
+   * exposure and shadow, the water column, the analytic lights in the cell
+   * and their flood-ownership claim — and compose them exactly the way the
+   * fragment program does (`composeEntityLight`), so the object and the
+   * block it stands on agree on brightness under any sky.
+   */
   private computeShaderBasedLight(pos: Vector3): Color {
-    const { sunlightIntensity } = this.world.chunkRenderer.uniforms;
+    const { sunlightIntensity, minLightLevel, baseAmbient } =
+      this.world.chunkRenderer.uniforms;
     const { sunColor, ambientColor } =
       this.world.chunkRenderer.shaderLightingUniforms;
     const maxLightLevel = this.world.options.maxLightLevel;
 
-    const shadowFactor = this.computeShadowFactor(pos);
-
     const voxel = ChunkUtils.mapWorldToVoxel(pos.toArray());
     const lightValues = this.world.getLightValuesAt(...voxel);
 
-    const sunExposure = lightValues ? lightValues.sunlight / maxLightLevel : 0;
-    const sunVisibility = Math.min(Math.max(sunExposure, 0), 1);
-    const ambientFloor = Math.max(
-      this.world.chunkRenderer.uniforms.minLightLevel.value +
-        this.world.chunkRenderer.uniforms.baseAmbient.value,
+    lightSample.sunExposure = lightValues
+      ? lightValues.sunlight / maxLightLevel
+      : 0;
+    lightSample.floodR = lightValues ? lightValues.red / maxLightLevel : 0;
+    lightSample.floodG = lightValues ? lightValues.green / maxLightLevel : 0;
+    lightSample.floodB = lightValues ? lightValues.blue / maxLightLevel : 0;
+    lightSample.shadowFactor = this.computeShadowFactor(pos);
+    lightSample.sunlightIntensity = sunlightIntensity.value;
+    lightSample.sunColor.copy(sunColor.value);
+    lightSample.ambientColor.copy(ambientColor.value);
+    lightSample.ambientFloor = Math.max(
+      minLightLevel.value + baseAmbient.value,
       0,
     );
-    const tunnelDarkening = ambientFloor + (1 - ambientFloor) * sunVisibility;
 
-    const column = measureWaterColumn(this.isFluidAt, pos.x, pos.y, pos.z);
+    // The water column above the point attenuates every sun-path term and
+    // adds the surface's scattered fill, as `downTransmit` and
+    // `underwaterFill` do for a submerged fragment.
+    const column = this.world.measureWaterColumnAt(pos.x, pos.y, pos.z);
     getDownwellingTransmittance(column?.depth ?? 0, waterTransmittance);
-    const spectralR = waterTransmittance.r;
-    const spectralG = waterTransmittance.g;
-    const spectralB = waterTransmittance.b;
     const fillStrength = column
       ? WATER_OPTICS.scatterFillSunStrength * sunlightIntensity.value +
         WATER_OPTICS.scatterFillBase
       : 0;
-    const fillR = WATER_SURFACE_SCATTER_COLOR.r * fillStrength * spectralR;
-    const fillG = WATER_SURFACE_SCATTER_COLOR.g * fillStrength * spectralG;
-    const fillB = WATER_SURFACE_SCATTER_COLOR.b * fillStrength * spectralB;
-
-    const avgNdotL = 0.5;
-    const sunContrib =
-      sunlightIntensity.value * avgNdotL * shadowFactor * sunExposure;
-
-    let cpuTorchR = 0,
-      cpuTorchG = 0,
-      cpuTorchB = 0;
-    if (lightValues) {
-      cpuTorchR = (lightValues.red / maxLightLevel) ** 2;
-      cpuTorchG = (lightValues.green / maxLightLevel) ** 2;
-      cpuTorchB = (lightValues.blue / maxLightLevel) ** 2;
-    }
+    underwaterFill
+      .copy(WATER_SURFACE_SCATTER_COLOR)
+      .multiplyScalar(fillStrength)
+      .multiply(waterTransmittance);
 
     // Clustered local lights (held torches, projectiles, analytic block
     // emitters) shine on entities the same way they shine on the world —
     // including the flood-mask occlusion term, so a character behind a wall
     // stops picking up the tint of the torch the wall blocks.
-    let floodMask = 1;
-    if (lightValues) {
-      const floodLevel =
-        Math.max(lightValues.red, lightValues.green, lightValues.blue) /
-        maxLightLevel;
-      const knee = this.world.localLights.options.maskKnee;
-      const t = Math.min(Math.max(floodLevel / Math.max(knee, 1e-4), 0), 1);
-      floodMask = t * t * (3 - 2 * t);
-    }
+    const floodLevel = Math.max(
+      lightSample.floodR,
+      lightSample.floodG,
+      lightSample.floodB,
+    );
+    const knee = this.world.localLights.options.maskKnee;
+    const t = Math.min(Math.max(floodLevel / Math.max(knee, 1e-4), 0), 1);
     localLightSample.color[0] = 0;
     localLightSample.color[1] = 0;
     localLightSample.color[2] = 0;
-    localLightQueryOptions.floodMask = floodMask;
+    localLightSample.claim = 0;
+    localLightSample.windowFade = 1;
+    localLightQueryOptions.floodMask = t * t * (3 - 2 * t);
     localLightQueryOptions.timeMs = performance.now();
     this.world.localLights.queryLocalLights(
       pos,
       localLightSample,
       localLightQueryOptions,
     );
+    lightSample.clusterR = localLightSample.color[0];
+    lightSample.clusterG = localLightSample.color[1];
+    lightSample.clusterB = localLightSample.color[2];
+
     // Ownership blend, mirroring the chunk shader: where selected analytic
     // lights claim this entity, the baked flood tint yields in proportion
     // so the entity is never lit by both models; beyond their reach (or
@@ -448,53 +755,15 @@ export class LightShined {
     // much flood survives.
     floodRemainderArgs.scaledClaim =
       localLightSample.claim * this.world.localLights.blockLightOwnership;
-    floodRemainderArgs.floodLevel = lightValues
-      ? Math.max(lightValues.red, lightValues.green, lightValues.blue) /
-        maxLightLevel
-      : 0;
+    floodRemainderArgs.floodLevel = floodLevel;
     floodRemainderArgs.windowFade = localLightSample.windowFade;
-    const floodRemainder = blockLightFloodRemainder(floodRemainderArgs);
-    cpuTorchR = cpuTorchR * floodRemainder + localLightSample.color[0];
-    cpuTorchG = cpuTorchG * floodRemainder + localLightSample.color[1];
-    cpuTorchB = cpuTorchB * floodRemainder + localLightSample.color[2];
+    lightSample.floodRemainder = blockLightFloodRemainder(floodRemainderArgs);
 
-    const globalAmbientR =
-      (0.025 * sunVisibility + ambientColor.value.r * ambientFloor) * spectralR;
-    const globalAmbientG =
-      (0.03 * sunVisibility + ambientColor.value.g * ambientFloor) * spectralG;
-    const globalAmbientB =
-      (0.04 * sunVisibility + ambientColor.value.b * ambientFloor) * spectralB;
-
-    const skyAmbientR = ambientColor.value.r * tunnelDarkening * spectralR;
-    const skyAmbientG = ambientColor.value.g * tunnelDarkening * spectralG;
-    const skyAmbientB = ambientColor.value.b * tunnelDarkening * spectralB;
-
-    const sunBasedLight = skyAmbientR + sunColor.value.r * sunContrib;
-    const torchAttenuation = 1.0 - Math.min(sunBasedLight, 1.0) * 0.8;
-
-    const totalR =
-      globalAmbientR +
-      skyAmbientR +
-      sunColor.value.r * sunContrib * spectralR +
-      fillR +
-      cpuTorchR * torchAttenuation;
-    const totalG =
-      globalAmbientG +
-      skyAmbientG +
-      sunColor.value.g * sunContrib * spectralG +
-      fillG +
-      cpuTorchG * torchAttenuation;
-    const totalB =
-      globalAmbientB +
-      skyAmbientB +
-      sunColor.value.b * sunContrib * spectralB +
-      fillB +
-      cpuTorchB * torchAttenuation;
-
+    composeEntityLight(lightSample, tempColor);
     return tempColor.setRGB(
-      Math.min(totalR, this.options.maxBrightness),
-      Math.min(totalG, this.options.maxBrightness),
-      Math.min(totalB, this.options.maxBrightness),
+      Math.min(tempColor.r, this.options.maxBrightness),
+      Math.min(tempColor.g, this.options.maxBrightness),
+      Math.min(tempColor.b, this.options.maxBrightness),
     );
   }
 

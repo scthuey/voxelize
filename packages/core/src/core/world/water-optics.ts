@@ -1,7 +1,5 @@
 import { Color, IUniform, MathUtils } from "three";
 
-import { LightUtils } from "../../utils/light-utils";
-
 /**
  * Per-channel coefficients for Beer-Lambert water extinction, expressed per
  * block (~meter) of water. All water rendering derives from this one table.
@@ -22,17 +20,28 @@ export type WaterChannelCoefficients = {
 export const WATER_OPTICS = Object.freeze({
   /**
    * Beer-Lambert downwelling extinction per channel, per block of depth.
-   * Tuned slightly steeper than clear-ocean measurements so the full spectral
-   * curve unfolds within the game's ~40-block ocean depths: red dies within
-   * ~8 blocks, green by ~30, and blue carries past 60 before fading to black.
+   * A clear-water exploration profile: shallow reef colors remain legible,
+   * red fades first through the shelf, and blue still dies away in the abyss.
+   * These are authored game coefficients, not measured optical properties.
    */
-  downwellingExtinction: { red: 0.38, green: 0.1, blue: 0.048 },
+  downwellingExtinction: { red: 0.14, green: 0.055, blue: 0.038 },
 
   /**
    * Scale from downwelling extinction to extinction along the camera's view
    * ray, which drives the exponential in-scattering fog while submerged.
+   * 0.22 lets shallow daylight water carry about 1.6 times as far as the
+   * earlier 0.35 did (read as murk); depth, night and caves still close in
+   * through the scatter colour the fog fades toward.
    */
-  viewExtinctionScale: 0.85,
+  viewExtinctionScale: 0.22,
+
+  /**
+   * Fraction of downwelling extinction applied to the in-scattered color for
+   * above-surface views. Full endpoint extinction makes a deep column collapse
+   * into an oil-dark patch because much of the visible scatter came from
+   * shallower points along the ray; this approximates that integrated path.
+   */
+  aboveSurfaceScatterDepthScale: 0.3,
 
   /**
    * In-scattered water color just below the surface under full sun (SRGB).
@@ -79,14 +88,72 @@ export const WATER_OPTICS = Object.freeze({
   /** Grazing-angle opacity added by the water's Fresnel reflection. */
   fresnelAlphaStrength: 0.65,
 
-  /** Reflected-sun alignment where the cheap analytic glint begins. */
-  sunGlintStartCos: 0.985,
+  /**
+   * The reflected sun. Up close the surface normal carries the full ripple
+   * field, so a tight disc around the mirror direction breaks into the
+   * glitter of a real sun path: every facet tilted onto the sun is one
+   * spark. Alignment cosines bound the disc; strength is its peak.
+   */
+  sunGlintStartCos: 0.996,
+  sunGlintFullCos: 0.9998,
+  sunGlintStrength: 0.9,
 
-  /** Reflected-sun alignment where the analytic glint reaches full strength. */
-  sunGlintFullCos: 0.9995,
+  /**
+   * The same glint on far water, blended in across the ripple fade band.
+   * Out there the slope map's mips have averaged the ripples flat, and the
+   * tight disc would focus back into one hard blob; a wider, dimmer disc
+   * reads as the soft sun path a calm distance shows instead.
+   */
+  sunGlintFarStartCos: 0.95,
+  sunGlintFarStrength: 0.3,
 
-  /** Peak intensity of the analytic sun glint. */
-  sunGlintStrength: 0.8,
+  /**
+   * The two Blinn-Phong lobes under the glint: a broad one (power 32) that
+   * is the sun's halo smeared across the ripples, and a medium one (power
+   * 96) between it and the disc. Strengths are the peak added on a facet
+   * aligned to the sun; the broad lobe takes its full strength on top faces
+   * and the base on walls. Low, because the disc carries the brightness —
+   * with strong lobes the whole sun path saturated into one white patch.
+   */
+  specularBroadBaseStrength: 0.04,
+  specularBroadTopStrength: 0.06,
+  specularMediumStrength: 0.12,
+
+  /**
+   * How much of the sky a water surface sees, read off the voxel sunlight
+   * on it (the light grid's level over 15). Water passes sunlight through
+   * unchanged, so a surface under open sky carries the full level and a
+   * pool sealed in rock carries none. The sky reflection, the sun's lobes
+   * and glint, and the sunlit in-scatter of deep water ramp in across this
+   * band (a smoothstep): none at or below `skyExposureNone`, all of it at or
+   * above `skyExposureFull`. Open water is exactly as it was, and shore
+   * water under a canopy or a short overhang (level 10 and up) keeps
+   * nearly all of it; a cave pool stops mirroring a sky it cannot see. The
+   * band spans the levels sunlight loses spreading in from a shaft or a
+   * cave mouth, so the reflection fades over several blocks of water there
+   * instead of along a line.
+   */
+  skyExposureNone: 2 / 15,
+  skyExposureFull: 11 / 15,
+
+  /**
+   * What a surface that sees no sky mirrors instead: the rock around it,
+   * lit by whatever lights the surface itself (lamps, the ambient floor),
+   * at this reflectance. Dark in an unlit cave, warm beside a lamp.
+   */
+  enclosedReflectance: 0.25,
+
+  /**
+   * What keeps water that sees no sky reading as water when nothing lights
+   * it. Its tint takes the light the surface stands in, but never less
+   * than `enclosedTintFloor` of it: unlit, the tint glowed one flat sheet
+   * across a dark cave pool; fully lit-only, the pool went as black as a
+   * hole. Its mirror also carries a faint sheen of that floor's tint at
+   * `enclosedSheenStrength`, which the Fresnel and its ripple steps shape:
+   * dark and see-through below the eye, ripples catching it toward grazing.
+   */
+  enclosedTintFloor: 0.25,
+  enclosedSheenStrength: 0.5,
 
   /**
    * View-incidence cosine (geometric surface normal vs. view direction)
@@ -114,28 +181,20 @@ export const WATER_OPTICS = Object.freeze({
    * Drawing-buffer pixel count above which the refraction capture turns
    * itself off. The capture is a mid-render-pass framebuffer copy, which on
    * tile-based GPUs splits the pass and pays a full store + reload of the
-   * framebuffer. The desktop renderer is capped just below this line, so
-   * ordinary high-resolution play keeps refraction against a bounded buffer;
-   * uncapped capture sessions skip the copy once it would scale with output.
+   * framebuffer. Measured: fine at 7.5M pixels, 33ms frames at 14.7M. The
+   * line sits just above a native Retina laptop (1728x1080 at 2x = 7.5M) so
+   * ordinary high-density play keeps its refraction; 4K-at-2x and capture
+   * sessions skip the copy once it would scale with output. Evaluated
+   * against the live buffer every frame, so a render scale that steps a
+   * huge display down far enough brings the capture back.
    */
-  refractionMaxDrawingBufferPixels: 3_800_000,
+  refractionMaxDrawingBufferPixels: 8_000_000,
 
   /**
-   * Distance band (blocks) over which the medium wave octave of the water
-   * surface fades out. Beyond the end of the band its ~0.7-block wavelength
-   * is subpixel at typical resolutions, so evaluating it only costs ALU and
-   * reads as specular shimmer.
-   */
-  mediumWaveFadeStartBlocks: 64,
-  mediumWaveFadeEndBlocks: 128,
-
-  /**
-   * Distance band (blocks) over which the large wave octave (~3-block
-   * wavelength) fades out — the same subpixel argument as the other bands,
-   * one octave up. The low-frequency swell (20-block wavelength) is spared:
-   * it stays resolvable to the horizon, and without any normal variation
-   * distant water collapses into a flat mirror of the sky — a bright sheet
-   * that reads as an artifact behind shoreline foliage.
+   * Distance band (blocks) over which the largest ripple layer's share of
+   * the grazing reflectivity hands over to the statistical factor below.
+   * The slope map's mips flatten the normal on their own out here; what
+   * they cannot supply is the reflectivity a wavy surface has in aggregate.
    */
   baseWaveFadeStartBlocks: 144,
   baseWaveFadeEndBlocks: 256,
@@ -143,56 +202,449 @@ export const WATER_OPTICS = Object.freeze({
   /**
    * What grazing-angle fresnel decays toward across the base-wave fade
    * band. A wavy surface tilts half its normals toward the viewer, so its
-   * aggregate reflectivity sits well below a flat mirror's; once the large
-   * octave no longer supplies that variation per-fragment, this factor
-   * supplies it statistically, keeping far water the same tint-dominant
-   * shade it had when the octave was evaluated.
+   * aggregate reflectivity sits well below a flat mirror's; once the mips
+   * no longer supply that variation per-fragment, this factor supplies it
+   * statistically, keeping far water the same tint-dominant shade it had
+   * when the ripples were resolved.
    */
   distantFresnelFactor: 0.55,
 
   /**
-   * Distance band (blocks) over which the surface ripple/sparkle octaves
-   * fade out, for the same subpixel reason as the medium wave band.
+   * Distance band (blocks) over which the near-water treatments fade: crest
+   * highlights, caustics, the flow crests, and the tight sun glint. Beyond
+   * it the fine ripples are subpixel and those cues would only shimmer.
    */
   rippleFadeStartBlocks: 48,
   rippleFadeEndBlocks: 96,
 
   /**
-   * Analytic directional slopes for the surface normal. Keeping these in
-   * data makes water style tunable without restoring the former per-pixel
-   * finite-difference simplex stack (eleven 3D noise evaluations).
+   * The tileable slope map the surface normal is read from, baked once per
+   * world (`water-normal-texture.ts`). Ridged noise: every octave folds
+   * about zero so its zero crossings become sharp crests between smooth
+   * troughs — the silhouette wind ripples actually have. The former sum of
+   * four sinusoids had no creases anywhere, and a surface without them
+   * reads as gel: one smooth bulge of sun, one smooth wobble of floor.
+   * Texture lookups also replace the per-pixel trigonometry, and the mip
+   * chain calms far water for free where the old octaves had to be faded
+   * by hand.
    */
-  surfaceNormalWaves: [
-    { direction: [0.8, 0.6], frequency: 0.32, speed: 0.25, slope: 0.11 },
-    { direction: [-0.6, 0.8], frequency: 0.58, speed: -0.18, slope: 0.07 },
-    { direction: [0.7, -0.7], frequency: 1.4, speed: 0.45, slope: 0.045 },
-  ],
-  surfaceRippleWaves: [
-    { direction: [1.0, 0.35], frequency: 1.8, speed: 0.9 },
-    { direction: [-0.4, 1.0], frequency: 4.8, speed: -1.2 },
+  surfaceNormalTexture: {
+    size: 256,
+    latticePeriod: 4,
+    // Two octaves, not a fractal stack: each layer should be glassy facets
+    // with crests at one dominant scale, and the three layers between them
+    // cover the range. Crests at every octave in every layer read as grain.
+    octaves: 2,
+    gain: 0.5,
+    ridgeSharpness: 1.3,
+    seed: 1337,
+    // 4, not the device maximum: at grazing incidence the bump already
+    // fades toward flat, so the extra taps 8x or 16x would spend on the
+    // horizon band sharpen ripples the shader is suppressing anyway. Each
+    // level doubles the worst-case taps of every layer on every far pixel.
+    anisotropy: 4,
+  },
+
+  /**
+   * The slope map sampled at three world scales and summed into the
+   * surface normal, the way every shader-pack water does it: a swell, the
+   * ripples riding it, and the capillary texture riding those. `tileBlocks`
+   * is the world size of one repeat; `drift` is the pattern's velocity in
+   * blocks per second, each layer on its own heading so the sheet never
+   * reads as one texture sliding; `rotation` turns the tile so the three
+   * scales do not line up; `stretch` scales the tile along its rotated
+   * axes, so a layer's ridges run long across one direction the way wind
+   * ripples run across the wind instead of forming isotropic cells; `bump`
+   * is the slope the tile's steepest facet contributes, so the sum bounds
+   * the surface tilt. Most of the bump sits in the fine layer: that is the
+   * glitter, while a coarse layer with the same bump reads as marble veins.
+   */
+  surfaceNormalLayers: [
+    {
+      tileBlocks: 40,
+      drift: [0.5, 0.3],
+      rotation: 0.0,
+      stretch: [1.0, 1.0],
+      bump: 0.05,
+    },
+    {
+      tileBlocks: 10,
+      drift: [-0.25, 0.45],
+      rotation: 1.1,
+      stretch: [1.0, 1.8],
+      bump: 0.08,
+    },
+    {
+      tileBlocks: 2.8,
+      drift: [-0.3, -0.25],
+      rotation: 2.3,
+      stretch: [1.0, 1.6],
+      bump: 0.11,
+    },
   ],
 
   /**
-   * Vertical water faces seen from air (tank walls, the side of a column)
-   * are not a lake surface. Fluids draw DoubleSide and do not write depth,
-   * so the near face, its back, and the far wall of a volume otherwise
-   * stack into a milky pane. These scales fade that lake treatment at
-   * head-on incidence; grazing angles keep more of it so a waterfall edge
-   * still reads as water. Underwater viewing is untouched (`airSideFace`
-   * is 0 while submerged).
+   * The fine layer's bump is modulated by the swell layer's height, so the
+   * capillary ripples come in patches — calm water between gusts, a
+   * roughened patch where one is passing, drifting with the swell. Below
+   * the floor share of its bump the fine layer never drops; without the
+   * modulation the whole surface carried the same grain everywhere and
+   * read as frosted glass.
+   */
+  ripplePatchFloor: 0.3,
+
+  /**
+   * Share of the ripple bump kept at grazing incidence (on the geometric
+   * normal). Near the horizon the ripples are subpixel and the slope map
+   * would only add noise to what should be a mirror of the sky.
+   */
+  grazingBumpKeep: 0.3,
+
+  /**
+   * A rippled normal can reflect the view ray back down into the water.
+   * Such a facet is pulled toward flat by up to this share, growing with
+   * the power below as the reflected ray dips toward the surface plane, so
+   * the reflection never samples the sky from under the horizon.
+   */
+  reflectionFoldbackStrength: 0.5,
+  reflectionFoldbackExponent: 8,
+
+  /**
+   * Crests of the medium and fine ripple layers (the slope map's height
+   * channel) catch the sky. Height is 0..1 across the tile; the band maps
+   * it onto the highlight's strength. Read off the same field the normal
+   * comes from, so a highlight sits on the ridge it belongs to.
+   */
+  crestHighlightStart: 0.62,
+  crestHighlightFull: 0.95,
+
+  /**
+   * Screen-space refraction displacement per unit of surface slope, before
+   * `uWaterRefractionStrength`. The floor bends where the surface tilts —
+   * the same ripples the reflection shows — instead of under a separate
+   * slow swell that wobbled the whole bed like a set gel.
+   */
+  refractionSlopeScale: 2.0,
+
+  /**
+   * Standing water over ground, as seen from above through its surface.
+   * The refraction sample is the floor of the column, so it takes the
+   * floor's optics rather than reading as the dry ground it was a moment
+   * before the water arrived:
+   *
+   * - Beer-Lambert absorption over the down-and-back light path, as
+   *   `floorAbsorptionPathScale` blocks of extinction per block of water,
+   *   using the same per-channel table as everything else. Depth is capped
+   *   at `floorAbsorptionMaxDepth`: past that the deep-surface haze below
+   *   carries the deep look, and stacking both went black.
+   * - A flat wet-surface darkening (`wetFloorDarken`) so the shoreline
+   *   reads even under a film too thin to absorb anything — wet stone is
+   *   darker than dry stone, and that boundary is the strongest cue that
+   *   there is water here at all.
+   * - The water's own in-scatter growing with thickness, at
+   *   `shallowScatterDensity` per block up to `shallowScatterMaxMix` of the
+   *   surface color, so a two-block pool is visibly more water than a
+   *   spreading edge a tenth of a block deep.
+   */
+  floorAbsorptionPathScale: 1.6,
+  floorAbsorptionMaxDepth: 4,
+  /** Local-column haze above water, including elevated lakes. Shores retain
+   * their existing clarity; deep beds fade even without refraction capture. */
+  deepSurfaceClearDepth: 3,
+  deepSurfaceExtinction: 0.08,
+  /** Surface-return light is weaker than the ambient seen while submerged.
+   * Filtering it separately avoids a milky cyan sheet over deep oceans. */
+  deepSurfaceScatterScale: { red: 0.35, green: 0.42, blue: 0.62 },
+
+  wetFloorDarken: 0.8,
+  shallowScatterDensity: 0.5,
+  shallowScatterMaxMix: 0.35,
+
+  /**
+   * An air-side wall — a waterfall's face, the front of a spread, a column
+   * pouring off a step — is looked at through water too: a fluid face only
+   * exists where its voxel holds fluid, so at least that voxel of water
+   * stands behind it. The wall's refraction sample takes this many blocks
+   * of the floor absorption and in-scatter above. Without it the wall
+   * composited the scene behind it untouched, at a depth of zero, and read
+   * as a hole: a cascade down a staircase drew as floating sheets with
+   * every riser missing. Panes keep their window treatment.
+   */
+  wallPathBlocks: 1.0,
+  /**
+   * Share of the surface's opacity floor a wall keeps while the camera is
+   * under water. Seen from inside, a wall is the way out — near normal
+   * incidence it transmits almost everything — so it stays lighter than the
+   * surface; raising it with the air-side walls veiled the view out of a
+   * tank. The blend follows the smoothed submersion, so the wall's opacity
+   * crosses over with everything else as the camera breaks the surface.
+   */
+  submergedWallAlphaScale: 0.55,
+
+  /**
+   * Caustics on the floor: bright where the surface is locally flat and
+   * acts as a lens, read off the same analytic slope field that shapes the
+   * normal so the light moves with the ripples it belongs to. A slope of
+   * `causticLensSlope` or more is fully dark. They fade with depth as real
+   * caustics blur (`causticDepthFalloff` per block), with sun and shadow,
+   * and with the ripple distance band.
+   */
+  causticStrength: 0.35,
+  causticLensSlope: 0.1,
+  causticDepthFalloff: 0.7,
+
+  /**
+   * The same light seen from below: while the camera is submerged, sunlit
+   * submerged faces carry a slow caustic net projected down the sun
+   * direction, brightening the lit colour by up to `bedCausticStrength`.
+   * Gated by the direct sun on the face, so it vanishes in shadow, at night
+   * and in the deep (`bedCausticDepthFalloff` per block).
+   */
+  bedCausticStrength: 2.4,
+  bedCausticDepthFalloff: 0.08,
+
+  /**
+   * The older per-texel underside (`surfaceUndersideScale` 2, A/B only).
+   * Inside Snell's window (the cone overhead whose rays refract out to the
+   * sky) it shows the sky and the sun; outside it, total internal reflection
+   * mirrors the water body. The same caustic web as the bed rides on top,
+   * so the surface reads as a moving ceiling of light.
+   * `undersideWindowSoftness` widens the window's rim (in sin units), the
+   * opacities keep the dry world from showing through unrefracted.
+   * `refractiveIndex` is shared by every style.
+   */
+  refractiveIndex: 1.333,
+  undersideWindowSoftness: 0.12,
+  undersideWebStrength: 0.55,
+  undersideWindowOpacity: 0.93,
+  undersideMirrorOpacity: 0.95,
+
+  /**
+   * The soft Snell window (`surfaceUndersideScale` 3, A/B only; the
+   * default is style 1 below). Inside the window the surface shows the
+   * frame captured before water drew — the sky, the sun, the shore above —
+   * shifted by the ripples, so it reads as looking up
+   * through clear water. Outside it, total internal reflection is a calm
+   * mirror of the water's own scatter colour. Nothing is snapped to texels
+   * and the caustic web stays on the bed, leaving the ceiling a faint
+   * shimmer at most; the view-path fog dims all of it with depth and the
+   * scatter colour carries the night.
+   *
+   * `undersideRippleKeep` is the share of the ripple normal the window and
+   * the shift see (calmer than the top side; styles 3 and 4),
+   * `undersideDistortion` scales the refraction slope for the shift (every
+   * style that samples the capture, the default included),
+   * `undersideCleanSoftness` widens the window's rim in sin units,
+   * `undersideMirrorScale` sets the mirror
+   * against the scatter the fog fades toward (just above it, so the
+   * ceiling reads without going grey), and `undersideShimmerStrength` is
+   * the web's peak on the window.
+   */
+  undersideRippleKeep: 0.45,
+  undersideDistortion: 0.55,
+  undersideCleanSoftness: 0.22,
+  undersideMirrorScale: 1.15,
+  undersideShimmerStrength: 0.05,
+
+  /**
+   * The continuous ceiling (`surfaceUndersideScale` 4, A/B only). No
+   * window: the whole underside is one lit film, `undersideFilmScale` times
+   * the scatter colour the fog fades toward (a little lighter, so the
+   * ceiling reads as the bright side of the water without going grey). The
+   * scene above shows through it as `undersideTransmitOverhead` times the
+   * cosine to straight up raised to `undersideTransmitFalloff` — brightest
+   * above and nothing at grazing (where a real surface mirrors the water,
+   * and where the shore above would otherwise hang in the water as dark
+   * ghosts), with no edge anywhere for a disc to form on. `undersideRippleShade` is the ripples'
+   * light and shade on the film. Live-tunable through the
+   * `surfaceUndersideTuning` uniform.
+   */
+  undersideFilmScale: 1.3,
+  undersideTransmitOverhead: 0.55,
+  undersideTransmitFalloff: 2,
+  undersideRippleShade: 0.08,
+
+  /**
+   * The Snell window (`surfaceUndersideScale` 1, the default; the film
+   * above is style 4). Seen from below, the surface transmits only within
+   * the critical angle of straight up (48.6 degrees for water); beyond it,
+   * it reflects everything. The underside is evaluated per 1/16-block
+   * texel: each texel's ray meets the ripple-tilted surface, and whether
+   * it is inside the window is decided per texel, so the window's rim is a
+   * ragged, pixel-stepped edge the ripples keep moving rather than a soft
+   * halo. Inside, the frame drawn before water shows (the sky dome maps the
+   * whole sky into the window by refraction, sky.ts), scaled by
+   * `undersideWindowGain` and by the Fresnel transmission, so the window is
+   * the brightest thing in view; it falls off toward the rim, where the
+   * surface turns into a mirror. Outside, the surface mirrors the water
+   * below: the in-scatter looking down, lifted toward the lit bed in
+   * shallow water (`undersideReflectionScale`, `undersideShallowBedLift`
+   * over `undersideShallowBedDepth` blocks), and broken by the sun's
+   * glitter where a ripple facet turns a texel's ray onto it.
+   *
+   * `undersideWindowRippleKeep` is the share of the ripple normal the
+   * window test sees (most of it: the rim should shiver),
+   * `undersideReflectionRipple` the ripples' flat light-and-shade steps on
+   * the mirror (so the band past the rim moves instead of sitting flat),
+   * `undersideGlitterCos` the cosine to the sun inside which a texel
+   * glints, and `undersideGlitterStrength` its peak against the sun
+   * colour.
+   */
+  undersideWindowRippleKeep: 0.8,
+  undersideWindowGain: 1.25,
+  undersideReflectionScale: 1.35,
+  undersideReflectionRipple: 0.14,
+  undersideShallowBedLift: 0.55,
+  undersideShallowBedDepth: 4,
+  undersideGlitterCos: 0.9985,
+  undersideGlitterStrength: 1.6,
+
+  /**
+   * The dry world through the surface. Past the window a real surface
+   * mirrors the water, and that hid everything above it: a shore read as a
+   * teal wall from below, with no beach, tree or house in sight. The frame
+   * drawn before water shows through the whole underside instead,
+   * `undersideSceneTransmit` of it at the window's rim, falling to
+   * `undersideSceneGrazingShare` of that at grazing. The window blends on
+   * top, so the share is continuous across the rim and the window stays the
+   * brightest thing overhead; the view-path fog already in that frame fades
+   * a far shore into the water.
+   */
+  undersideSceneTransmit: 0.85,
+  undersideSceneGrazingShare: 0.6,
+
+  /**
+   * The underwater fog's in-scatter brightens looking up and darkens
+   * looking down: the light arrives from the surface, so a ray toward it
+   * scatters more of it into the eye than a ray into the depths. The
+   * target is the scatter colour times `1 + underwaterInScatterTilt * y`
+   * for the ray's unit direction y: unchanged looking level.
+   */
+  underwaterInScatterTilt: 0.35,
+
+  /**
+   * Flow. Water runs downhill along its own surface, and a fluid's top face
+   * is a bilinear patch through the mesher's corner heights, which step
+   * down one stage per block away from the source. That rest height is a
+   * potential for the flow: neighbouring faces share their corner heights,
+   * so it is continuous across the whole sheet, and it falls away from the
+   * source. Its contour lines are therefore the crests of a flow running
+   * downstream — smooth across every face by construction, spaced
+   * `flowCrestSpacingBlocks` apart where the sheet falls a full stage per
+   * block, wider where the fall is gentler, and absent on still water,
+   * whose surface is flat. Drawing crests off a per-face direction instead
+   * left a phase seam at every voxel edge.
+   *
+   * The crests tilt the normal downhill (`flowSlopeAmplitude`, so
+   * reflection, refraction and caustics travel with them) and catch a
+   * highlight on their tops (`flowStreakStrength`). Downhill is the flow
+   * the mesher packs at every surface vertex — the slope of the rendered
+   * surface at that corner, the same value for every face meeting there —
+   * interpolated across the face, so the direction field is continuous
+   * and the cue fades out across a face whose far corners sit on still
+   * water. (A slope read per face from screen derivatives left a visible
+   * seam wherever two faces disagreed on direction.) `flowBandSpeed` is in
+   * the shader's wave-time units, which advance 0.5/s: on a full-stage
+   * slope the crests run 6.5 × 0.5 / (2π / (0.1 × 1.5)) / 0.1 ≈ 0.8 blocks
+   * per second.
+   */
+  flowCrestSpacingBlocks: 1.5,
+  flowBandSpeed: 6.5,
+  flowSlopeAmplitude: 0.09,
+  flowStreakStrength: 0.4,
+
+  /**
+   * Opacity floor of a water face, top or air-side wall alike. With the
+   * refraction capture live the shader composites the floor itself, so
+   * whatever alpha leaves to the blend only shows the dry ground through
+   * the water again and dilutes every cue above. Without the capture the
+   * surface is a plain tinted layer and keeps more of the ground visible
+   * through it. Walls used to take about half of this, which is the other
+   * half of why a spread's leading edge and a waterfall's face vanished.
+   */
+  surfaceAlphaFloor: 0.58,
+  refractedSurfaceAlphaFloor: 0.8,
+
+  /**
+   * A vertical water face pressed against a see-through solid (a Barrier or
+   * glass tank wall) is a window pane, not a lake surface. Fluids draw
+   * DoubleSide and do not write depth, so the near pane, its back, and the
+   * far wall of a tank otherwise stack into a milky sheet; in air only the
+   * outward face draws, which leaves one layer. These scales fade the lake
+   * treatment on that layer at head-on incidence — no sky gloss, the color
+   * pulled toward the water tint, thinner — so a tank window is a tinted
+   * sheet of water you look through, at every angle; grazing angles keep
+   * more of the lake shading. A pane is never dropped for being looked at
+   * straight on: that read as a dry room with fish floating in it, and the
+   * per-pixel head-on test that did the dropping was a cone through the
+   * pane, which drew as a circle. The mesher marks panes (`FLUID_PANE_BIT`);
+   * a vertical face against open air — the front of a spreading flow, a
+   * waterfall, a leak's edge — is the water's own surface and never takes
+   * this treatment. Underwater viewing is untouched (`airSideFace` is 0
+   * while submerged).
    */
   airSideFaceAlphaScale: 0.42,
   airSideFaceGlossScale: 0.0,
   airSideFaceTintMix: 0.85,
   /**
-   * Head-on cosine above which an air-side vertical face is not drawn at
-   * all. A Barrier tank window is a wall you look straight at; a waterfall
-   * edge is seen at a graze and stays below this cutoff.
+   * How much of the flat water colour a window lays over the refracted view
+   * behind it, relative to the lake surface's tint amount. The run's own fog
+   * already colours what lies behind the glass; the flat layer on top only
+   * frosted the pane.
    */
-  airSideFaceCullCos: 0.7,
+  airSideFaceRefractionTintScale: 0.3,
+
+  /**
+   * What a tank window shows is the water behind it. The eye's ray crosses
+   * the pane and runs through the tank to the first thing in it — a fish,
+   * the floor, the back wall — or out of the water through the surface or
+   * the far wall; along that run the water absorbs and in-scatters as the
+   * fog does around a diver. Without it a tank of any size read as a dry
+   * room with fish hanging in the air: the pane was a thin tinted sheet and
+   * the floor through it looked like the floor through a door.
+   *
+   * Extinction per block along that run, per channel, relative to the
+   * downwelling extinction. Stronger than the diver's view fog
+   * (`viewExtinctionScale`), whose clarity is tuned for swimming through
+   * open water: from outside, a tank has to read as water at a glance,
+   * with the far wall gone blue and a fish near the glass still crisp.
+   * Kept light enough that a small tank still reads as clear glass with
+   * water behind it, not a blue haze: at 0.7 a three-block tank went flat
+   * and matte (18 Oct).
+   */
+  paneViewExtinctionScale: 0.28,
+  /**
+   * The run assumed where the frame has nothing to measure it with (no
+   * glass in view to draw the water's exit for — a Barrier tank — or no
+   * scene depth on this target): a fixed few blocks of water.
+   */
+  paneFallbackPathBlocks: 3,
+  /** Longest run a pane fogs over; past it the water is all scatter. */
+  paneMaxPathBlocks: 48,
 
   /** Max blocks scanned upward when measuring a water column's surface. */
   maxSurfaceScanBlocks: 96,
+
+  /**
+   * Bounds of the walk that finds the open surface of the water a roofed
+   * column belongs to (`findWaterBodySurface`): voxels visited, and blocks
+   * it strays sideways from the column. A shelf or an arch in open sea
+   * costs a few dozen visits; a sealed cave spends the budget and keeps
+   * its highest roof.
+   */
+  bodySurfaceSearchVoxels: 4096,
+  bodySurfaceSearchRadius: 32,
+
+  /**
+   * A column whose top meets air under a roof this close above it (an air
+   * bell, a pocket under a sunken ceiling) may be a bubble trapped inside
+   * deeper water, so its open surface is looked for too. The walk from a
+   * pocket never descends and stops after this many voxels: the way out to
+   * the higher water is at the pocket's edge, and a pond under a canopy
+   * should cost next to nothing.
+   */
+  pocketRoofScanBlocks: 16,
+  pocketSurfaceSearchVoxels: 512,
 
   /**
    * Height of a resting fluid surface within its voxel. Mirrors
@@ -200,7 +652,106 @@ export const WATER_OPTICS = Object.freeze({
    * rendered surface.
    */
   fluidSurfaceHeight: 0.875,
+
+  /**
+   * How far a flowing fluid's surface drops per stage of spread. Mirrors
+   * FLUID_STAGE_DROPOFF in the mesher; sets the crest spacing of the flow
+   * cue in blocks rather than in height.
+   */
+  fluidStageDropoff: 0.1,
 });
+
+/**
+ * Radians of flow-crest phase per block of rest height: one full crest every
+ * {@link WATER_OPTICS.flowCrestSpacingBlocks} blocks on a sheet falling a
+ * full stage per block.
+ */
+export const FLOW_CREST_PHASE_PER_HEIGHT =
+  (2 * Math.PI) /
+  (WATER_OPTICS.fluidStageDropoff * WATER_OPTICS.flowCrestSpacingBlocks);
+
+/**
+ * Rest height within its voxel above which a fluid surface vertex is a spill
+ * corner — one the mesher raised to the full block because fluid stands on
+ * a voxel sharing it, so the sheet meets the wall of the block pouring onto
+ * it. A resting surface sits at {@link WATER_OPTICS.fluidSurfaceHeight} and
+ * every flow stage only lowers it, so nothing else reaches past this
+ * midpoint. The vertex stage leaves these corners out of the wave: the wall
+ * edge they are welded to sits on its voxel floor and cannot move with them.
+ */
+export const FLUID_SPILL_CORNER_MIN_HEIGHT =
+  (WATER_OPTICS.fluidSurfaceHeight + 1) / 2;
+
+/**
+ * Samples every {@link WATER_OPTICS.surfaceNormalLayers} entry of the slope
+ * map at `waterRippleXZ` (declared by the caller: the fragment's `wPos.xz`,
+ * or its 1/16-block texel centre) for `waterSeconds`, accumulating the
+ * decoded, bump-weighted slopes into `waterSlopeSum` (declared by the
+ * caller). Each layer's texel stays in scope as `waterTexel<i>` so the
+ * height channel can be read for crest highlights without a second lookup;
+ * the first layer's height also gates the last layer's bump into patches
+ * ({@link WATER_OPTICS.ripplePatchFloor}). The red and green channels
+ * decode `rg * 2 - 1` to -1..1, the tile's steepest facet at ±1 (see
+ * `water-normal-texture.ts`).
+ */
+/**
+ * A tileable caustic web (after Dave Hoskins' water caustic): bright where
+ * an iterated warp's focus lines meet, repeating every three blocks. Shared
+ * by the seabed caustics, the surface underside and the client's light
+ * shafts, so all three show one pattern on one clock. Returns 0..1.
+ */
+export const WATER_CAUSTIC_WEB_GLSL = `
+float waterCausticWeb(vec2 cwPos, float cwSeconds) {
+  vec2 cwP = mod(cwPos * (6.28318 / 3.0), 6.28318) - 250.0;
+  vec2 cwI = cwP;
+  float cwSum = 1.0;
+  for (int cwN = 0; cwN < 4; cwN++) {
+    float cwT = cwSeconds * 0.45 * (1.0 - 3.5 / float(cwN + 1));
+    cwI = cwP + vec2(
+      cos(cwT - cwI.x) + sin(cwT + cwI.y),
+      sin(cwT - cwI.y) + cos(cwT + cwI.x)
+    );
+    cwSum += 1.0 / length(vec2(
+      cwP.x / (sin(cwI.x + cwT) / 0.005),
+      cwP.y / (cos(cwI.y + cwT) / 0.005)
+    ));
+  }
+  cwSum = 1.17 - pow(cwSum / 4.0, 1.4);
+  return clamp(pow(abs(cwSum), 8.0), 0.0, 1.0);
+}
+`;
+
+export const WATER_SURFACE_NORMAL_LAYERS_GLSL = WATER_OPTICS.surfaceNormalLayers
+  .map((layer, index, layers) => {
+    const cos = Math.cos(layer.rotation).toFixed(6);
+    const sin = Math.sin(layer.rotation).toFixed(6);
+    const negSin = (-Math.sin(layer.rotation)).toFixed(6);
+    const [driftX, driftZ] = layer.drift;
+    // Tile size and stretch fold into one per-axis scale on the rotated
+    // position: the axis with the larger factor repeats sooner, so the
+    // ridges come out long along the other one.
+    const scaleX = (layer.stretch[0] / layer.tileBlocks).toFixed(6);
+    const scaleY = (layer.stretch[1] / layer.tileBlocks).toFixed(6);
+    const isSwell = index === 0;
+    const isFinest = index === layers.length - 1;
+    const patchGate = isFinest && !isSwell ? " * ripplePatch" : "";
+    const patchDefinition = isSwell
+      ? `
+  float ripplePatch = mix(
+    ${WATER_OPTICS.ripplePatchFloor.toFixed(4)},
+    1.0,
+    waterTexel0.b
+  );`
+      : "";
+    return `
+  vec2 waterUv${index} = mat2(${cos}, ${sin}, ${negSin}, ${cos})
+    * (waterRippleXZ + vec2(${driftX.toFixed(4)}, ${driftZ.toFixed(4)}) * waterSeconds)
+    * vec2(${scaleX}, ${scaleY});
+  vec4 waterTexel${index} = texture2D(uWaterNormalMap, waterUv${index});${patchDefinition}
+  waterSlopeSum += (waterTexel${index}.rg * 2.0 - 1.0)
+    * ${layer.bump.toFixed(4)}${patchGate};`;
+  })
+  .join("");
 
 export const WATER_SURFACE_SCATTER_COLOR = new Color(
   WATER_OPTICS.surfaceScatterColor,
@@ -221,6 +772,13 @@ export const WATER_VIEW_EXTINCTION: WaterChannelCoefficients =
   scaleCoefficients(
     WATER_OPTICS.downwellingExtinction,
     WATER_OPTICS.viewExtinctionScale,
+  );
+
+/** Extinction along the run of water seen through a tank window. */
+export const WATER_PANE_EXTINCTION: WaterChannelCoefficients =
+  scaleCoefficients(
+    WATER_OPTICS.downwellingExtinction,
+    WATER_OPTICS.paneViewExtinctionScale,
   );
 
 function coefficientsToGlslVec3(
@@ -245,25 +803,19 @@ export const WATER_VIEW_EXTINCTION_GLSL = coefficientsToGlslVec3(
   WATER_VIEW_EXTINCTION,
 );
 
-export const WATER_SURFACE_SCATTER_GLSL = colorToGlslVec3(
-  WATER_SURFACE_SCATTER_COLOR,
+export const WATER_PANE_EXTINCTION_GLSL = coefficientsToGlslVec3(
+  WATER_PANE_EXTINCTION,
 );
 
-/**
- * Extinction of the voxel sunlight encoding per water block, matching the
- * Beer-Lambert transmittance used by the light engine. The chunk shader uses
- * it to tell genuinely submerged fragments apart from dry ground that merely
- * sits below the nominal water level.
- */
-export const VOXEL_SUNLIGHT_EXTINCTION_PER_WATER_BLOCK = -Math.log(
-  LightUtils.BEER_LAMBERT_TRANSMITTANCE_NUM /
-    LightUtils.BEER_LAMBERT_TRANSMITTANCE_DEN,
+export const WATER_SURFACE_SCATTER_GLSL = colorToGlslVec3(
+  WATER_SURFACE_SCATTER_COLOR,
 );
 
 export const UNDERWATER_FOG_UNIFORM_DECLARATIONS = `
 uniform float uCameraSubmersion;
 uniform float uCameraWaterPlaneY;
 uniform vec3 uUnderwaterAmbient;
+uniform float uUnderwaterViewScale;
 `;
 
 /**
@@ -272,7 +824,8 @@ uniform vec3 uUnderwaterAmbient;
  * in scope. The path is clamped at the waterline plane so geometry above the
  * surface only receives fog for the submerged segment of the ray.
  */
-export const UNDERWATER_FOG_FRAGMENT = `
+/** Emission loses light along the ray but does not add ambient water light. */
+export const createUnderwaterFogFragment = (isEmission = false) => `
 if (uCameraSubmersion > 0.001) {
   vec3 uwRay = vWorldPosition.xyz - cameraPosition;
   float uwDist = max(length(uwRay), 1e-4);
@@ -281,45 +834,80 @@ if (uCameraSubmersion > 0.001) {
     float uwToPlane = (uCameraWaterPlaneY - cameraPosition.y) * uwDist / uwRay.y;
     uwPath = min(uwPath, max(uwToPlane, 0.0));
   }
-  vec3 uwTransmit = exp(-${WATER_VIEW_EXTINCTION_GLSL} * uwPath);
-  vec3 uwColor = gl_FragColor.rgb * uwTransmit + uUnderwaterAmbient * (1.0 - uwTransmit);
+  // A material that never set the A/B scale reads 0: the baked extinction.
+  float uwScale = uUnderwaterViewScale > 0.0 ? uUnderwaterViewScale : 1.0;
+  vec3 uwTransmit = exp(-${WATER_VIEW_EXTINCTION_GLSL} * uwPath * uwScale);
+  // In-scatter from the surface side: brighter looking up, darker down.
+  vec3 uwInScatter = uUnderwaterAmbient
+    * (1.0 + ${WATER_OPTICS.underwaterInScatterTilt.toFixed(4)} * uwRay.y / uwDist);
+  vec3 uwColor = gl_FragColor.rgb * uwTransmit${isEmission ? "" : " + uwInScatter * (1.0 - uwTransmit)"};
   gl_FragColor.rgb = mix(gl_FragColor.rgb, uwColor, uCameraSubmersion);
 }
 `;
 
+export const UNDERWATER_FOG_FRAGMENT = createUnderwaterFogFragment();
+
 /**
- * The above-surface counterpart of {@link UNDERWATER_FOG_FRAGMENT}: the same
- * Beer-Lambert in-scattering fog, but for water-exposed terrain seen from
- * outside the surface. It fades a submerged fragment toward the water's own
- * in-scattered color along the sub-surface segment of the view ray, so deep
- * or steeply-viewed bottoms go murky while shallow water stays readable —
- * reusing {@link WATER_VIEW_EXTINCTION} and `uUnderwaterAmbient` so the view
- * from above matches the view from below.
- *
- * Expects `outgoingLight`, `uCameraSubmersion`, `uUnderwaterAmbient`,
- * `vWaterExposed`, and vertex-interpolated `vAboveSurfaceWaterTransmit` in
- * scope. The vertex stage computes the expensive ray length and exponential;
- * transmission varies smoothly enough across a voxel face to interpolate.
- * Runs before sky/height fog so nearer air fog layers on top.
+ * The underwater in-scatter's brightness, against the scatter colour, for
+ * a ray whose unit direction has vertical component `dirY` (mirrors the
+ * fog fragment and the sky dome's reflection band).
  */
-export const ABOVE_SURFACE_WATER_FOG_FRAGMENT = `
-if (vWaterExposed > 0.5 && uCameraSubmersion < 1.0 && cameraPosition.y > uWaterLevel) {
-  vec3 aswColor = outgoingLight.rgb * vAboveSurfaceWaterTransmit
-    + uUnderwaterAmbient * (1.0 - vAboveSurfaceWaterTransmit);
-  outgoingLight.rgb = mix(outgoingLight.rgb, aswColor, 1.0 - uCameraSubmersion);
+export function underwaterInScatterScale(dirY: number): number {
+  const y = Math.min(1, Math.max(-1, dirY));
+  return 1 + WATER_OPTICS.underwaterInScatterTilt * y;
 }
-`;
+
+/**
+ * The share of light the surface passes from above to a ray meeting it
+ * from below at `cosIncidence` to its normal (mirrors the Snell-window
+ * underside): none beyond the critical angle, where the surface reflects
+ * everything, and Schlick's Fresnel on the air-side angle inside it.
+ */
+export function undersideTransmission(cosIncidence: number): number {
+  const cosI = Math.min(1, Math.max(0, cosIncidence));
+  const n = WATER_OPTICS.refractiveIndex;
+  const sinT2 = n * n * (1 - cosI * cosI);
+  if (sinT2 >= 1) return 0;
+  const cosT = Math.sqrt(1 - sinT2);
+  return 1 - (0.02 + 0.98 * Math.pow(1 - cosT, 5));
+}
+
+/** Cosine of the critical angle, from straight up, seen from below. */
+export const UNDERSIDE_CRITICAL_COS = Math.sqrt(
+  1 - 1 / (WATER_OPTICS.refractiveIndex * WATER_OPTICS.refractiveIndex),
+);
+
+/**
+ * The share of the scene above in the underside's colour at `cosIncidence`
+ * (mirrors the Snell-window GLSL): the window's Fresnel transmission over
+ * the dry world showing through the rest of the surface.
+ */
+export function undersideSceneShare(cosIncidence: number): number {
+  const cosI = Math.min(1, Math.max(0, cosIncidence));
+  const leak =
+    WATER_OPTICS.undersideSceneTransmit *
+    MathUtils.lerp(
+      WATER_OPTICS.undersideSceneGrazingShare,
+      1,
+      Math.min(cosI / UNDERSIDE_CRITICAL_COS, 1),
+    );
+  const window = undersideTransmission(cosI);
+  return window + (1 - window) * leak;
+}
 
 export interface UnderwaterFogUniforms {
   uCameraSubmersion: IUniform<number>;
   uCameraWaterPlaneY: IUniform<number>;
   uUnderwaterAmbient: IUniform<Color>;
+  /** A/B scale on the view extinction; 0 or absent means the baked one. */
+  uUnderwaterViewScale?: IUniform<number>;
 }
 
 export interface UnderwaterFogSource {
   submersion: number;
   waterPlaneY: number;
   ambientColor: Color;
+  viewExtinctionScale?: number;
 }
 
 export function createUnderwaterFogUniforms(): UnderwaterFogUniforms {
@@ -327,6 +915,7 @@ export function createUnderwaterFogUniforms(): UnderwaterFogUniforms {
     uCameraSubmersion: { value: 0 },
     uCameraWaterPlaneY: { value: 0 },
     uUnderwaterAmbient: { value: new Color(0, 0, 0) },
+    uUnderwaterViewScale: { value: 1 },
   };
 }
 
@@ -337,6 +926,9 @@ export function updateUnderwaterFogUniforms(
   target.uCameraSubmersion.value = source.submersion;
   target.uCameraWaterPlaneY.value = source.waterPlaneY;
   target.uUnderwaterAmbient.value.copy(source.ambientColor);
+  if (target.uUnderwaterViewScale) {
+    target.uUnderwaterViewScale.value = source.viewExtinctionScale ?? 1;
+  }
 }
 
 export function getDownwellingTransmittance(depth: number, out: Color): Color {
@@ -371,13 +963,23 @@ export type FluidQuery = (vx: number, vy: number, vz: number) => boolean;
 export type WaterColumnSample = {
   depth: number;
   surfaceY: number;
+  /** The column ends at a roof: `surfaceY` is its underside. */
+  roofed?: boolean;
 };
 
+/**
+ * The water column over a point. `isSealedAt` says whether a fluid voxel is
+ * still water sealed under a roof: the mesher fills such a voxel to its top
+ * and draws no surface (`is_sealed_under_ceiling` in the mesher), so its
+ * waterline is the roof rather than the resting height, and a diver pressed
+ * against a flooded cave roof stays under.
+ */
 export function measureWaterColumn(
   isFluidAt: FluidQuery,
   x: number,
   y: number,
   z: number,
+  isSealedAt?: FluidQuery,
 ): WaterColumnSample | null {
   const vx = Math.floor(x);
   const vz = Math.floor(z);
@@ -392,13 +994,98 @@ export function measureWaterColumn(
     vy += 1;
   }
 
-  const surfaceY = vy + WATER_OPTICS.fluidSurfaceHeight;
+  const roofed = isSealedAt?.(vx, vy, vz) ?? false;
+  const surfaceY = vy + (roofed ? 1 : WATER_OPTICS.fluidSurfaceHeight);
   const depth = surfaceY - y;
   if (depth <= 0) {
     return null;
   }
 
-  return { depth, surfaceY };
+  return roofed ? { depth, surfaceY, roofed } : { depth, surfaceY };
+}
+
+/**
+ * The open surface of the water a roofed column belongs to. Under a shelf
+ * or an arch in open sea the column's own top is the rock's underside, and
+ * a waterline there cut the water beside it in two: everything above the
+ * rock lost its fog and its depth, a hard line across the view that jumped
+ * as the diver swam in and out from under the overhang.
+ *
+ * Walks the connected fluid from the column's top voxel `(vx, vy, vz)`,
+ * highest voxel first, so wherever the water rises it climbs straight to
+ * the top and a shelf costs only the walk to its edge. The first column
+ * top that is not sealed is the surface. A cave sealed all round keeps its
+ * highest roof the walk reaches, so a low roof never cuts its own higher
+ * dome out of the water either.
+ *
+ * `fromPocket` starts from a column whose top is open to air trapped under
+ * a roof: an air bell in a sunken hall. That top is the fallback, and only
+ * a surface higher than it counts, so a diver under the bell sees the sea
+ * the bell sits in rather than the bubble's floor as the waterline.
+ */
+export function findWaterBodySurface(
+  isFluidAt: FluidQuery,
+  isSealedAt: FluidQuery,
+  vx: number,
+  vy: number,
+  vz: number,
+  fromPocket = false,
+): number {
+  const radius = WATER_OPTICS.bodySurfaceSearchRadius;
+  const span = radius * 2 + 1;
+  const minY = fromPocket ? vy : vy - radius;
+  const maxY = vy + WATER_OPTICS.maxSurfaceScanBlocks;
+  const levels: number[][] = [];
+  const seen = new Set<number>();
+  let top = -1;
+
+  const push = (x: number, y: number, z: number) => {
+    const dx = x - vx + radius;
+    const dz = z - vz + radius;
+    if (dx < 0 || dx >= span || dz < 0 || dz >= span) return;
+    if (y < minY || y > maxY) return;
+    const level = y - minY;
+    const key = (level * span + dx) * span + dz;
+    if (seen.has(key) || !isFluidAt(x, y, z)) return;
+    seen.add(key);
+    (levels[level] ??= []).push(dx * span + dz);
+    if (level > top) top = level;
+  };
+
+  let highestRoof = vy + (fromPocket ? WATER_OPTICS.fluidSurfaceHeight : 1);
+  const budget = fromPocket
+    ? WATER_OPTICS.pocketSurfaceSearchVoxels
+    : WATER_OPTICS.bodySurfaceSearchVoxels;
+  let visits = 0;
+  push(vx, vy, vz);
+  while (top >= 0 && visits < budget) {
+    const level = levels[top];
+    if (!level || level.length === 0) {
+      top -= 1;
+      continue;
+    }
+    const packed = level.pop() as number;
+    const x = vx + Math.floor(packed / span) - radius;
+    const z = vz + (packed % span) - radius;
+    const y = top + minY;
+    visits += 1;
+
+    if (!isFluidAt(x, y + 1, z)) {
+      if (!isSealedAt(x, y, z)) {
+        if (!fromPocket || y > vy) return y + WATER_OPTICS.fluidSurfaceHeight;
+      } else {
+        highestRoof = Math.max(highestRoof, y + 1);
+      }
+    }
+    push(x, y + 1, z);
+    push(x + 1, y, z);
+    push(x - 1, y, z);
+    push(x, y, z + 1);
+    push(x, y, z - 1);
+    push(x, y - 1, z);
+  }
+
+  return highestRoof;
 }
 
 function expSmooth(
@@ -412,10 +1099,12 @@ function expSmooth(
 }
 
 export type WaterOpticsFrameInput = {
-  isFluidAt: FluidQuery;
-  cameraX: number;
-  cameraY: number;
-  cameraZ: number;
+  /**
+   * The water column over the camera this frame (`null` in air), measured
+   * by the caller — `World.measureWaterColumnAt` resolves the chunk once
+   * and walks it directly, which is why the query is not taken here.
+   */
+  column: WaterColumnSample | null;
   sunStrength: number;
   deltaSeconds: number;
 };
@@ -434,6 +1123,13 @@ export class WaterOptics {
 
   public skyFade = 0;
 
+  /**
+   * A/B knob on the underwater view extinction, relative to the baked
+   * `viewExtinctionScale`: 1 is the shipped clarity, 0.35 / 0.22 the
+   * earlier, murkier water.
+   */
+  public viewExtinctionScale = 1;
+
   public readonly ambientColor = new Color(0, 0, 0);
 
   public readonly lightFilter = new Color(1, 1, 1);
@@ -441,11 +1137,9 @@ export class WaterOptics {
   private readonly transmittanceScratch = new Color();
 
   update(input: WaterOpticsFrameInput): void {
-    const { isFluidAt, cameraX, cameraY, cameraZ, sunStrength, deltaSeconds } =
-      input;
+    const { column, sunStrength, deltaSeconds } = input;
     const delta = MathUtils.clamp(deltaSeconds, 0, 0.1);
 
-    const column = measureWaterColumn(isFluidAt, cameraX, cameraY, cameraZ);
     const targetSubmersion = column
       ? MathUtils.clamp(column.depth / WATER_OPTICS.waterlineFadeDepth, 0, 1)
       : 0;

@@ -7,14 +7,16 @@ use serde_json::Value;
 use crate::{perf, GetInfo, GetWorldStats, SyncWorld, WorldStatsResponse};
 
 use super::health::{build_health_value, tick_stall_threshold_ms};
-use super::{Server, WsSender};
+use super::{Server, SessionIdentity, WsSender};
 use crate::Message;
 
 /// New chat session is created. Returns (client_id, connection_token).
 #[derive(ActixMessage)]
 #[rtype(result = "(String, String)")]
 pub struct Connect {
-    pub id: Option<String>,
+    /// Who the socket was authenticated as. `identity.id == None` asks the
+    /// server to mint a fresh client id.
+    pub identity: SessionIdentity,
     pub is_transport: bool,
     pub sender: WsSender,
     /// Optional application-authorized world for this socket. `None` preserves
@@ -30,6 +32,16 @@ pub struct Disconnect {
     /// The connection token assigned when this session was created.
     /// Used to distinguish stale disconnects from kicked sessions.
     pub token: String,
+}
+
+/// The socket (sender and connection token) a WebRTC data channel for
+/// `id` attaches to: its session in `world`, or with no world, its only
+/// session. `None` when there is no such session.
+#[derive(ActixMessage)]
+#[rtype(result = "Option<(WsSender, String)>")]
+pub struct ResolveRtcSession {
+    pub id: String,
+    pub world: Option<String>,
 }
 
 #[derive(ActixMessage)]
@@ -58,9 +70,9 @@ pub struct ClientMessage {
     /// Protobuf message
     pub data: Message,
 
-    /// Connection token of the socket that produced this message. `None` for
-    /// secondary channels (WebRTC data channel) riding on a validated
-    /// session. When set, messages from superseded sockets are rejected.
+    /// Connection token of the socket that produced this message (a WebRTC
+    /// data channel carries its socket's). Messages from superseded sockets
+    /// are rejected. `None` resolves only while `id` holds a single session.
     pub session_token: Option<String>,
 
     pub received_monotonic_ms: Option<f64>,
@@ -93,7 +105,7 @@ impl Handler<Connect> for Server {
 
     fn handle(&mut self, msg: Connect, ctx: &mut Context<Self>) -> Self::Result {
         let result = self.register_session_with_world(
-            msg.id,
+            msg.identity,
             msg.is_transport,
             msg.sender,
             msg.allowed_world,
@@ -113,6 +125,14 @@ impl Handler<Disconnect> for Server {
     fn handle(&mut self, msg: Disconnect, ctx: &mut Context<Self>) {
         self.unregister_session(&msg.id, &msg.token);
         self.reconcile_gc(ctx);
+    }
+}
+
+impl Handler<ResolveRtcSession> for Server {
+    type Result = MessageResult<ResolveRtcSession>;
+
+    fn handle(&mut self, msg: ResolveRtcSession, _: &mut Context<Self>) -> Self::Result {
+        MessageResult(self.world_session(&msg.id, msg.world.as_deref()))
     }
 }
 

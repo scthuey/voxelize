@@ -1,9 +1,33 @@
 #!/usr/bin/env node
+import { writeSync } from "node:fs";
 import { parseArgs } from "node:util";
 
 import { Agent } from "../src/agent";
-import { IDLE_TTL_EXIT_CODE, resolveIdleTtlMs } from "../src/browser-lifecycle";
+import { AuthUrlError } from "../src/auth-url";
+import {
+  AUTH_FAILED_EXIT_CODE,
+  IDLE_TTL_EXIT_CODE,
+  MOUNT_FAILED_EXIT_CODE,
+  PAGE_UNAVAILABLE_EXIT_CODE,
+  agentPidFile,
+  killOwnAgentBrowserSync,
+  resolveIdleTtlMs,
+  resolveMountTimeoutMs,
+} from "../src/browser-lifecycle";
 import { AgentDaemon } from "../src/daemon";
+import {
+  DEFAULT_NAVIGATION_RETRY_MS,
+  PageUnavailableError,
+  resolveNavigationRetryMs,
+} from "../src/page-availability";
+import {
+  SESSION_META_ENV,
+  SESSION_ORIGIN_ENV,
+  applySessionMetaPatch,
+  parseSessionMetaAssignments,
+  parseSessionMetaEnv,
+  parseSessionOriginEnv,
+} from "../src/session-meta";
 
 const IDLE_CHECK_MIN_MS = 250;
 const IDLE_CHECK_MAX_MS = 30_000;
@@ -19,6 +43,7 @@ async function main(): Promise<void> {
       headed: { type: "boolean" },
       "idle-ttl-ms": { type: "string" },
       "lease-minutes": { type: "string" },
+      meta: { type: "string", multiple: true },
       help: { type: "boolean", short: "h" },
     },
   });
@@ -40,14 +65,53 @@ async function main(): Promise<void> {
     values["lease-minutes"],
     process.env,
   );
+  const navigationRetryMs = resolveNavigationRetryMs(process.env);
+  // Labels and provenance are validated here too, before a browser exists:
+  // a malformed note is a launcher bug worth a loud exit, not a session that
+  // boots with half of what it was told.
+  const meta = applySessionMetaPatch(
+    parseSessionMetaEnv(process.env[SESSION_META_ENV]),
+    { set: parseSessionMetaAssignments(values.meta ?? []) },
+  );
+  const origin = parseSessionOriginEnv(process.env[SESSION_ORIGIN_ENV]);
 
   console.log(
-    `[voxelize-agent] launching agent world=${world} url=${url} port=${port} headless=${isHeadless} ${
+    `[voxelize-agent] launching agent world=${world} name=${name} url=${url} port=${port} headless=${isHeadless} ${
       idleTtlMs === 0
         ? "idle-ttl=disabled"
         : `idle-ttl=${Math.round(idleTtlMs / 1000)}s`
-    }${leaseMinutes > 0 ? ` lease=${leaseMinutes}m` : ""}`,
+    }${leaseMinutes > 0 ? ` lease=${leaseMinutes}m` : ""}${
+      Object.keys(meta).length > 0 ? ` meta=${JSON.stringify(meta)}` : ""
+    }${origin?.cursor?.conversationId ? ` cursor=${origin.cursor.conversationId}` : ""}`,
   );
+
+  // A stop that lands while Agent.launch still runs (its browser starting,
+  // or its first page loading) comes before anything here could close the
+  // browser gracefully, and puppeteer's own handler for it reads to the
+  // launch as a failure: a starting browser was relaunched at default
+  // priority, a loading page reported unavailable. So it exits at once, and
+  // takes the browser first: the one this process recorded is killed here,
+  // and one still launching by puppeteer's exit hook. Neither outlives the
+  // daemon, nor the `session stop` waiting on it.
+  const pidFile = agentPidFile(port);
+  let shutdown: (reason: string, exitCode: number) => void | Promise<void> = (
+    reason,
+    exitCode,
+  ) => {
+    const pid = killOwnAgentBrowserSync(pidFile, port);
+    writeSync(
+      process.stdout.fd,
+      `[voxelize-agent] ${reason} while booting: ${
+        pid === null
+          ? "no browser recorded yet (one still launching dies with this process)"
+          : `killed browser pid=${pid}`
+      }; exiting before the daemon starts\n`,
+    );
+    process.exit(exitCode);
+  };
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+    process.on(signal, () => void shutdown(signal, 0));
+  }
 
   const agent = await Agent.launch({
     url,
@@ -56,16 +120,46 @@ async function main(): Promise<void> {
     isHeadless,
     port,
     authUrl: values.authUrl,
+    navigationRetryMs,
+  }).catch((error: unknown) => {
+    if (error instanceof AuthUrlError) {
+      return exitAfterLogging(
+        `[voxelize-agent] ${error.message}; exiting with code ${AUTH_FAILED_EXIT_CODE}`,
+        AUTH_FAILED_EXIT_CODE,
+      );
+    }
+    // The launch already closed its browser. Exit before the HTTP listener
+    // exists: a page that cannot load never mounts, and waiting out the
+    // bridge or mount deadline would only hold the browser and its slot.
+    if (error instanceof PageUnavailableError) {
+      return exitAfterLogging(
+        `[voxelize-agent] ${error.message}\n` +
+          `[voxelize-agent] exiting with code ${PAGE_UNAVAILABLE_EXIT_CODE}, ${
+            Math.round(process.uptime() * 10) / 10
+          }s after the daemon started: a page that cannot load never mounts, and relaunching cannot fix it`,
+        PAGE_UNAVAILABLE_EXIT_CODE,
+      );
+    }
+    throw error;
   });
 
   process.on("exit", () => {
     agent.killBrowserSync();
   });
 
-  const daemon = new AgentDaemon({ agent, port, idleTtlMs, leaseMinutes });
+  const daemon = new AgentDaemon({
+    agent,
+    port,
+    idleTtlMs,
+    leaseMinutes,
+    meta,
+    origin,
+    mountTimeoutMs: resolveMountTimeoutMs(process.env),
+    onMountFailed: (reason) => void shutdown(reason, MOUNT_FAILED_EXIT_CODE),
+  });
 
   let isShuttingDown = false;
-  const shutdown = async (reason: string, exitCode: number) => {
+  shutdown = async (reason: string, exitCode: number) => {
     if (isShuttingDown) return;
     isShuttingDown = true;
     console.log(`[voxelize-agent] shutting down (${reason})...`);
@@ -82,9 +176,6 @@ async function main(): Promise<void> {
     process.exit(exitCode);
   };
 
-  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
-    process.on(signal, () => void shutdown(signal, 0));
-  }
   process.on("uncaughtException", (err) => {
     console.error("[voxelize-agent] uncaught exception:", err);
     void shutdown("uncaughtException", 1);
@@ -148,6 +239,14 @@ async function main(): Promise<void> {
   console.log("[voxelize-agent] agent ready");
 }
 
+// process.exit() can drop a write still queued on a pipe, and this line is
+// the session's only account of why it stopped.
+function exitAfterLogging(line: string, exitCode: number): Promise<never> {
+  return new Promise(() => {
+    process.stderr.write(`${line}\n`, () => process.exit(exitCode));
+  });
+}
+
 function resolveLeaseMinutes(
   flagValue: string | undefined,
   env: Record<string, string | undefined>,
@@ -178,7 +277,10 @@ Options:
   -w, --world <name>     World to join (default: test)
   -p, --port <port>      HTTP daemon port (default: 4099)
   -n, --name <name>      Agent display name (default: agent)
-      --authUrl <url>    Visit this URL first to pick up session cookies
+      --authUrl <url>    Visit this URL first to pick up session cookies. An
+                         answer other than 2xx (or 304) stops the daemon
+                         before the page loads, naming the status and body.
+                         Exits code ${AUTH_FAILED_EXIT_CODE}.
       --headed           Launch a visible browser window (default: headless)
       --idle-ttl-ms <n>  Shut down after n ms without commands (default: 30m;
                          0 disables; env AGENT_IDLE_TTL_MS). Exits code ${IDLE_TTL_EXIT_CODE}.
@@ -186,11 +288,24 @@ Options:
                          (env AGENT_LEASE_MINUTES). Reported in /status;
                          defers idle retirement while unexpired, and an
                          expired lease is reap evidence.
+      --meta <key=value> Session note (repeatable): label=, purpose=, owner=,
+                         tags=, or any key. Shown in /status and /meta;
+                         patchable later via PATCH /meta.
   -h, --help             Show this help
 
 Environment:
   AGENT_IDLE_TTL_MS        Same as --idle-ttl-ms (flag wins).
   AGENT_LEASE_MINUTES      Same as --lease-minutes (flag wins).
+  AGENT_NAVIGATION_RETRY_MS
+                           How long a client page answering 5xx (or a refused
+                           connection) is retried, default ${DEFAULT_NAVIGATION_RETRY_MS}ms;
+                           0 never retries. A 404 or other 4xx gives up at once.
+                           Either way the daemon exits ${PAGE_UNAVAILABLE_EXIT_CODE} instead of waiting
+                           for a bridge the page will never install.
+  ${SESSION_META_ENV}       JSON object of initial session notes (--meta merges over it).
+  ${SESSION_ORIGIN_ENV}     JSON provenance captured by the launcher (cwd, user,
+                           terminal, parent processes, Cursor conversation);
+                           read-only once the daemon is up.
   AGENT_BROWSER_WATCHDOG   Set to 0 to skip the detached watchdog that kills
                            the browser if this process dies uncleanly. Only
                            for tests; disabling it re-enables orphan browsers.

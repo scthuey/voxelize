@@ -68,7 +68,7 @@ When showing code blocks, prefer referencing real code from the codebase when po
 
 1. **Point to tutorial source code** - If there's a working example in `examples/` or the tutorial project, reference the file path so readers can see full context
 2. **Include "Full Implementation" sections** - After step-by-step breakdowns, show the complete, runnable code
-3. **Link to town project patterns** - When a pattern exists in `client/src/` or `server/src/`, mention it as a real-world reference
+3. **Link to host-game patterns** - When these docs are authored from inside a game that embeds Voxelize and a pattern exists in its client or server source, mention it as a real-world reference (never as the only source: the engine's own `examples/` must stand alone)
 
 Example reference style:
 
@@ -123,21 +123,21 @@ Server-side Rust uses standard Voxelize crate imports.
 
 When documenting a class or feature:
 
-1. **Check the town project first** - Real-world usage in `client/src/core/` and `client/src/components/`
+1. **Check a host game first, when there is one** - Real-world usage in the embedding game's client source, if these docs are being written from inside one
 2. **Check the packages source** - Implementation details in `voxelize/packages/core/src/`
 3. **Check existing wiki pages** - Patterns and conventions in `voxelize/docs/docs/wiki/`
 
 ### Key Source Locations
 
-| Feature    | Town Usage                      | Source Code                             |
-| ---------- | ------------------------------- | --------------------------------------- |
-| Characters | `client/src/core/peers.ts`      | `packages/core/src/libs/character.ts`   |
-| Entities   | `client/src/core/entities/*.ts` | `packages/core/src/libs/entities.ts`    |
-| Peers      | `client/src/core/peers.ts`      | `packages/core/src/libs/peers.ts`       |
-| World      | N/A                             | `packages/core/src/core/world/index.ts` |
-| Blocks     | `client/src/core/blocks.ts`     | `packages/core/src/core/world/`         |
-| Events     | Used in components              | `packages/core/src/libs/events.ts`      |
-| Methods    | Used in components              | `packages/core/src/libs/method.ts`      |
+| Feature    | Where a host game uses it           | Source Code                             |
+| ---------- | ----------------------------------- | --------------------------------------- |
+| Characters | its peer and player setup           | `packages/core/src/libs/character.ts`   |
+| Entities   | one class per entity type           | `packages/core/src/core/entities.ts`    |
+| Peers      | its peer and player setup           | `packages/core/src/core/peers.ts`       |
+| World      | N/A                                 | `packages/core/src/core/world/index.ts` |
+| Blocks     | its block texture registration      | `packages/core/src/core/world/`         |
+| Events     | UI and gameplay components          | `packages/core/src/core/events.ts`      |
+| Methods    | UI and gameplay components          | `packages/core/src/core/method.ts`      |
 
 ## Updating Documentation
 
@@ -146,7 +146,7 @@ When documenting a class or feature:
 The API reference is auto-generated but often lacks good examples. To improve:
 
 1. Read the source in `packages/core/src/`
-2. Find real usage in `client/src/core/` or `client/src/components/`
+2. Find real usage in a host game's client, if you are writing from inside one
 3. Add a practical example to the class's JSDoc in the source file
 4. The TypeDoc plugin will include it in the generated docs
 
@@ -211,7 +211,7 @@ Tutorials walk through building something real. They should read like you're sit
 
 Tone: "Now add the network setup:" not "Next, we will add the network setup to our application."
 
-## Common Patterns from Town Project
+## Common Patterns from Production Games
 
 ### Custom Peer with Extended Functionality
 
@@ -223,7 +223,7 @@ export class Peer extends VOXELIZE.Character {
   constructor(id?: string) {
     super({
       nameTagOptions: {
-        fontFace: "ConnectionSerif-d20X",
+        fontFace: "monospace",
         yOffset: 0.5,
       },
     });

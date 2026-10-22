@@ -6,10 +6,13 @@ mod noise;
 mod pathfinding;
 mod pipeline;
 mod spline;
+#[cfg(test)]
+mod tall_world_tests;
 mod terrain;
 mod trees;
 
 pub use self::noise::*;
+pub use gen_profiler::record as record_profile;
 pub use lights::{beer_lambert_transmit, LightNode, Lights};
 pub use lsystem::*;
 pub use mesher::Mesher;

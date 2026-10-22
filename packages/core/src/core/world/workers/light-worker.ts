@@ -1,11 +1,12 @@
-import { Coords3 } from "../../../types";
+import { Coords2, Coords3 } from "../../../types";
 import { BlockUtils } from "../../../utils/block-utils";
 import { ChunkUtils } from "../../../utils/chunk-utils";
 import { LightColor, LightUtils } from "../../../utils/light-utils";
 import { Block, BlockRotation } from "../block";
-import type { LightNode, VoxelDelta, WorldOptions } from "../index";
+import type { LightNode, WorldOptions } from "../index";
 import { RawChunk } from "../raw-chunk";
 import { Registry } from "../registry";
+import { applyVoxelDelta, type VoxelDelta } from "../voxel-delta";
 
 let registry: Registry;
 
@@ -38,6 +39,7 @@ const VOXEL_NEIGHBORS = [
 const ALL_TRANSPARENT = [true, true, true, true, true, true];
 
 interface VoxelAccess {
+  hasChunkAt(vx: number, vz: number): boolean;
   getVoxelAt(vx: number, vy: number, vz: number): number;
   getVoxelRotationAt(vx: number, vy: number, vz: number): BlockRotation;
   getVoxelStageAt(vx: number, vy: number, vz: number): number;
@@ -64,9 +66,38 @@ type ModifiedChunk = {
   maxY: number;
 };
 
+/**
+ * A chunk whose light data this job did not touch but whose mesh reads a
+ * voxel it did: the light in a border column belongs to one chunk while the
+ * faces it shades can belong to the chunk next door (a wall's face is lit by
+ * the air in front of it). Only the coordinates and the y-range travel back;
+ * there are no lights to merge, the neighbour just needs remeshing.
+ */
+type BorderNeighbor = {
+  coords: Coords2;
+  minY: number;
+  maxY: number;
+};
+
+/**
+ * Exact map keys for chunk and voxel coordinates. These caches used to key
+ * on a 32-bit XOR hash, and distinct cells share one: chunk (-1,-1) and
+ * (1,1) hash alike, so a job around the origin wrote one chunk's light into
+ * the other, and voxel collisions handed a flood the wrong block (stone
+ * read as air). Unique while |cz| < 2^21 and |vx| < 2^19, far past any
+ * world's extent, and y < 4096.
+ */
+function chunkKey(cx: number, cz: number): number {
+  return cx * 4194304 + cz;
+}
+
+function voxelKey(vx: number, vy: number, vz: number): number {
+  return (vx * 4194304 + vz) * 4096 + vy;
+}
+
 class BoundedSpace implements VoxelAccess {
-  private chunkCache = new Map<number, RawChunk | null>();
   private modifiedChunks = new Map<number, ModifiedChunk>();
+  private borderNeighbors = new Map<number, BorderNeighbor>();
 
   constructor(
     private chunkGrid: (RawChunk | null)[][],
@@ -76,10 +107,6 @@ class BoundedSpace implements VoxelAccess {
     private gridOffsetZ: number,
     private chunkSize: number,
   ) {}
-
-  private hashChunkCoords(cx: number, cz: number): number {
-    return ((cx * 73856093) ^ (cz * 83492791)) >>> 0;
-  }
 
   private getChunkByCoords(cx: number, cz: number): RawChunk | null {
     const localX = cx - this.gridOffsetX;
@@ -97,54 +124,93 @@ class BoundedSpace implements VoxelAccess {
     return this.chunkGrid[localX][localZ];
   }
 
-  private getCachedChunk(cx: number, cz: number): RawChunk | null {
-    const key = this.hashChunkCoords(cx, cz);
-    let chunk = this.chunkCache.get(key);
-    if (chunk === undefined) {
-      chunk = this.getChunkByCoords(cx, cz);
-      this.chunkCache.set(key, chunk);
-    }
-    return chunk;
+  /**
+   * Whether the chunk holding this column was sent with the job. A chunk
+   * that is not loaded or not ready arrives as null and reads as air with
+   * no light; a flood must stop at it rather than pass through that phantom
+   * air and come back into a loaded chunk where real terrain would have
+   * blocked it. The chunk brings its own light when it arrives.
+   */
+  hasChunkAt(vx: number, vz: number): boolean {
+    return (
+      this.getChunkByCoords(
+        Math.floor(vx / this.chunkSize),
+        Math.floor(vz / this.chunkSize),
+      ) !== null
+    );
   }
 
-  private recordModifiedChunk(cx: number, cz: number, vy: number): void {
-    const chunk = this.getCachedChunk(cx, cz);
+  private recordModifiedChunk(
+    cx: number,
+    cz: number,
+    vx: number,
+    vy: number,
+    vz: number,
+  ): void {
+    const chunk = this.getChunkByCoords(cx, cz);
     if (!chunk) {
       return;
     }
 
-    const key = this.hashChunkCoords(cx, cz);
+    const key = chunkKey(cx, cz);
     const existing = this.modifiedChunks.get(key);
     if (!existing) {
       this.modifiedChunks.set(key, { chunk, minY: vy, maxY: vy });
-      return;
+    } else {
+      existing.minY = Math.min(existing.minY, vy);
+      existing.maxY = Math.max(existing.maxY, vy);
     }
 
+    // A border voxel shades faces in the adjacent chunk (and, through
+    // vertex light averaging, the diagonal one at a corner). Those meshes
+    // must rebuild even though no light value of theirs moved — the classic
+    // symptom is a torch lighting the floor of its own chunk while the wall
+    // next door, one chunk over, stays black until a reload.
+    const lx = vx - cx * this.chunkSize;
+    const lz = vz - cz * this.chunkSize;
+    const dxs = lx === 0 ? [-1] : lx === this.chunkSize - 1 ? [1] : [];
+    const dzs = lz === 0 ? [-1] : lz === this.chunkSize - 1 ? [1] : [];
+    if (dxs.length === 0 && dzs.length === 0) return;
+    for (const dx of [...dxs, 0]) {
+      for (const dz of [...dzs, 0]) {
+        if (dx === 0 && dz === 0) continue;
+        this.recordBorderNeighbor(cx + dx, cz + dz, vy);
+      }
+    }
+  }
+
+  private recordBorderNeighbor(cx: number, cz: number, vy: number): void {
+    const key = chunkKey(cx, cz);
+    const existing = this.borderNeighbors.get(key);
+    if (!existing) {
+      this.borderNeighbors.set(key, { coords: [cx, cz], minY: vy, maxY: vy });
+      return;
+    }
     existing.minY = Math.min(existing.minY, vy);
     existing.maxY = Math.max(existing.maxY, vy);
   }
 
   getVoxelAt(vx: number, vy: number, vz: number): number {
     const [cx, cz] = ChunkUtils.mapVoxelToChunk([vx, vy, vz], this.chunkSize);
-    const chunk = this.getCachedChunk(cx, cz);
+    const chunk = this.getChunkByCoords(cx, cz);
     return chunk?.getVoxel(vx, vy, vz) ?? 0;
   }
 
   getVoxelRotationAt(vx: number, vy: number, vz: number): BlockRotation {
     const [cx, cz] = ChunkUtils.mapVoxelToChunk([vx, vy, vz], this.chunkSize);
-    const chunk = this.getCachedChunk(cx, cz);
+    const chunk = this.getChunkByCoords(cx, cz);
     return chunk?.getVoxelRotation(vx, vy, vz) ?? new BlockRotation();
   }
 
   getVoxelStageAt(vx: number, vy: number, vz: number): number {
     const [cx, cz] = ChunkUtils.mapVoxelToChunk([vx, vy, vz], this.chunkSize);
-    const chunk = this.getCachedChunk(cx, cz);
+    const chunk = this.getChunkByCoords(cx, cz);
     return chunk?.getVoxelStage(vx, vy, vz) ?? 0;
   }
 
   getSunlightAt(vx: number, vy: number, vz: number): number {
     const [cx, cz] = ChunkUtils.mapVoxelToChunk([vx, vy, vz], this.chunkSize);
-    const chunk = this.getCachedChunk(cx, cz);
+    const chunk = this.getChunkByCoords(cx, cz);
     return chunk?.getSunlight(vx, vy, vz) ?? 0;
   }
 
@@ -155,16 +221,16 @@ class BoundedSpace implements VoxelAccess {
     color: LightColor,
   ): number {
     const [cx, cz] = ChunkUtils.mapVoxelToChunk([vx, vy, vz], this.chunkSize);
-    const chunk = this.getCachedChunk(cx, cz);
+    const chunk = this.getChunkByCoords(cx, cz);
     return chunk?.getTorchLight(vx, vy, vz, color) ?? 0;
   }
 
   setSunlightAt(vx: number, vy: number, vz: number, level: number): void {
     const [cx, cz] = ChunkUtils.mapVoxelToChunk([vx, vy, vz], this.chunkSize);
-    const chunk = this.getCachedChunk(cx, cz);
+    const chunk = this.getChunkByCoords(cx, cz);
     if (chunk) {
       chunk.setSunlight(vx, vy, vz, level);
-      this.recordModifiedChunk(cx, cz, vy);
+      this.recordModifiedChunk(cx, cz, vx, vy, vz);
     }
   }
 
@@ -176,15 +242,22 @@ class BoundedSpace implements VoxelAccess {
     color: LightColor,
   ): void {
     const [cx, cz] = ChunkUtils.mapVoxelToChunk([vx, vy, vz], this.chunkSize);
-    const chunk = this.getCachedChunk(cx, cz);
+    const chunk = this.getChunkByCoords(cx, cz);
     if (chunk) {
       chunk.setTorchLight(vx, vy, vz, level, color);
-      this.recordModifiedChunk(cx, cz, vy);
+      this.recordModifiedChunk(cx, cz, vx, vy, vz);
     }
   }
 
   getModifiedChunks(): ModifiedChunk[] {
     return Array.from(this.modifiedChunks.values());
+  }
+
+  /** Border-adjacent chunks to remesh, minus those already modified. */
+  getBorderNeighbors(): BorderNeighbor[] {
+    return Array.from(this.borderNeighbors.entries())
+      .filter(([key]) => !this.modifiedChunks.has(key))
+      .map(([, neighbor]) => neighbor);
   }
 }
 
@@ -213,6 +286,16 @@ function nodeBudgetFor(min: Coords3 | undefined, max: Coords3 | undefined) {
   return volume * MAX_NODES_PER_VOLUME;
 }
 
+/**
+ * Floods light outward from `queue` up to `nodeBudgetFor(min, max)` visits.
+ * A healthy flood always drains its queue; a pathological one (e.g. a long
+ * open sunlight shaft under a floating island) can exceed the budget before
+ * draining it. Returns the still-unvisited tail of the queue in that case —
+ * every node in it already has its OWN light value committed to `space`
+ * (see the `setSunlightAt`/`setTorchLightAt` calls below, which run before
+ * a node is pushed), so the caller can resume the BFS from exactly this
+ * frontier in a follow-up job instead of leaving it half-lit forever.
+ */
 function floodLight(
   space: VoxelAccess,
   queue: LightNode[],
@@ -220,7 +303,7 @@ function floodLight(
   min: Coords3 | undefined,
   max: Coords3 | undefined,
   options: WorldOptions,
-) {
+): LightNode[] {
   const { maxHeight, minChunk, maxChunk, maxLightLevel, chunkSize } = options;
 
   const [startCX, startCZ] = minChunk;
@@ -231,12 +314,8 @@ function floodLight(
   const blockCache = new Map<number, Block | null>();
   const rotationCache = new Map<number, BlockRotation>();
 
-  const hashCoords = (vx: number, vy: number, vz: number): number => {
-    return ((vx * 73856093) ^ (vy * 19349663) ^ (vz * 83492791)) >>> 0;
-  };
-
   const getCachedBlock = (vx: number, vy: number, vz: number): Block | null => {
-    const key = hashCoords(vx, vy, vz);
+    const key = voxelKey(vx, vy, vz);
     let block = blockCache.get(key);
     if (block === undefined) {
       const id = space.getVoxelAt(vx, vy, vz);
@@ -252,7 +331,7 @@ function floodLight(
     vy: number,
     vz: number,
   ): BlockRotation => {
-    const key = hashCoords(vx, vy, vz);
+    const key = voxelKey(vx, vy, vz);
     let rotation = rotationCache.get(key);
     if (!rotation) {
       rotation = space.getVoxelRotationAt(vx, vy, vz);
@@ -266,15 +345,14 @@ function floodLight(
   let processedNodes = 0;
 
   let head = 0;
+  let budgetExceeded = false;
   while (head < queue.length) {
     if (head >= QUEUE_COMPACT_INTERVAL) {
       queue.splice(0, head);
       head = 0;
     }
     if (++processedNodes > nodeBudget) {
-      console.warn(
-        `[light-worker] flood exceeded node budget (${nodeBudget}); bailing with partial light`,
-      );
+      budgetExceeded = true;
       break;
     }
     const { voxel, level } = queue[head++];
@@ -322,6 +400,10 @@ function floodLight(
         continue;
       }
 
+      if (!space.hasChunkAt(nvx, nvz)) {
+        continue;
+      }
+
       const nextVoxel: Coords3 = [nvx, nvy, nvz];
       const nBlock = getCachedBlock(nvx, nvy, nvz);
       if (!nBlock) {
@@ -362,8 +444,28 @@ function floodLight(
       queue.push({ voxel: nextVoxel, level: nextLevel });
     }
   }
+
+  if (!budgetExceeded) {
+    return [];
+  }
+
+  const pending = queue.slice(head);
+  console.warn(
+    `[light-worker] flood exceeded node budget (${nodeBudget}); deferring ` +
+      `${pending.length} unvisited node(s) to a follow-up job instead of ` +
+      `leaving them unlit`,
+  );
+  return pending;
 }
 
+/**
+ * Removes light from `voxels` (or resumes an in-progress removal seeded by
+ * `continuation`, see `floodLight`'s doc comment for why a resumed node
+ * needs no re-zeroing) and returns the boundary `fill` nodes that must be
+ * re-flooded, plus any removal-BFS nodes still unvisited when the node
+ * budget was hit — the caller resumes those in a follow-up job rather than
+ * dropping them, which would leave stale light behind.
+ */
 function removeLightsBatch(
   space: VoxelAccess,
   voxels: Coords3[],
@@ -371,13 +473,16 @@ function removeLightsBatch(
   min: Coords3 | undefined,
   max: Coords3 | undefined,
   options: WorldOptions,
-): LightNode[] {
-  if (!voxels.length) return [];
+  continuation: LightNode[] = [],
+): { fill: LightNode[]; pendingRemovals: LightNode[] } {
+  if (!voxels.length && !continuation.length)
+    return { fill: [], pendingRemovals: [] };
 
   const { maxHeight, maxLightLevel } = options;
 
   const fill: LightNode[] = [];
-  const queue: LightNode[] = [];
+  const emitters: LightNode[] = [];
+  const queue: LightNode[] = [...continuation];
 
   const isSunlight = color === "SUNLIGHT";
 
@@ -399,15 +504,14 @@ function removeLightsBatch(
   let processedNodes = 0;
 
   let head = 0;
+  let budgetExceeded = false;
   while (head < queue.length) {
     if (head >= QUEUE_COMPACT_INTERVAL) {
       queue.splice(0, head);
       head = 0;
     }
     if (++processedNodes > nodeBudget) {
-      console.warn(
-        `[light-worker] removal exceeded node budget (${nodeBudget}); bailing with partial light`,
-      );
+      budgetExceeded = true;
       break;
     }
     const { voxel, level } = queue[head++];
@@ -452,6 +556,14 @@ function removeLightsBatch(
 
       if (nl === 0) continue;
 
+      // A remaining emitter the front crosses shines again at its own level,
+      // whichever branch it lands in below: one lit brighter by the removed
+      // light (a dim lamp beside a bright one) is zeroed like any cell, and
+      // the liveness filter cannot keep it as fill once its value is gone.
+      if (!isSunlight && dynamicTorchLightLevel > 0) {
+        emitters.push({ voxel: nVoxel, level: dynamicTorchLightLevel });
+      }
+
       if (
         nl < level ||
         (isSunlight &&
@@ -466,25 +578,12 @@ function removeLightsBatch(
           space.setTorchLightAt(nvx, nvy, nvz, 0, color);
         }
       } else if (isSunlight && oy === -1 ? nl > level : nl >= level) {
-        if (isSunlight) {
-          fill.push({ voxel: [nvx, nvy, nvz], level: nl });
-          continue;
-        }
-
-        const emissionLevel = dynamicTorchLightLevel;
-        if (typeof emissionLevel !== "number" || emissionLevel <= 0) {
-          queue.push({ voxel: [nvx, nvy, nvz], level: nl });
-          space.setTorchLightAt(nvx, nvy, nvz, 0, color);
-          continue;
-        }
-
-        if (nl === emissionLevel) {
-          fill.push({ voxel: [nvx, nvy, nvz], level: emissionLevel });
-          continue;
-        }
-
-        queue.push({ voxel: [nvx, nvy, nvz], level: nl });
-        space.setTorchLightAt(nvx, nvy, nvz, 0, color);
+        // Light at or above the front came from somewhere else: it is the
+        // boundary to reflood from, never something to zero. Zeroing it too
+        // chased every connected field of this colour back to its emitters,
+        // far past the job box the result is merged through, and cut the
+        // surviving light off in a straight line on the box edge.
+        fill.push({ voxel: [nvx, nvy, nvz], level: nl });
       }
     }
   }
@@ -493,9 +592,18 @@ function removeLightsBatch(
     isSunlight
       ? space.getSunlightAt(vx, vy, vz)
       : space.getTorchLightAt(vx, vy, vz, color),
-  );
+  ).concat(emitters);
 
-  return LightUtils.dedupeFillQueue(liveFill);
+  const pendingRemovals = budgetExceeded ? queue.slice(head) : [];
+  if (budgetExceeded) {
+    console.warn(
+      `[light-worker] removal exceeded node budget (${nodeBudget}); deferring ` +
+        `${pendingRemovals.length} unvisited node(s) to a follow-up job instead of ` +
+        `leaving stale light behind`,
+    );
+  }
+
+  return { fill: LightUtils.dedupeFillQueue(liveFill), pendingRemovals };
 }
 
 onmessage = function (e) {
@@ -551,13 +659,8 @@ onmessage = function (e) {
       if (!chunk) return;
 
       (deltas as VoxelDelta[]).forEach((delta) => {
-        const { coords, newVoxel, newRotation, newStage, sequenceId } = delta;
-        chunk.setVoxel(coords[0], coords[1], coords[2], newVoxel);
-        if (newRotation)
-          chunk.setVoxelRotation(coords[0], coords[1], coords[2], newRotation);
-        if (newStage !== undefined)
-          chunk.setVoxelStage(coords[0], coords[1], coords[2], newStage);
-        lastSequenceId = Math.max(lastSequenceId, sequenceId);
+        applyVoxelDelta(chunk, delta);
+        lastSequenceId = Math.max(lastSequenceId, delta.sequenceId);
       });
     });
 
@@ -577,15 +680,28 @@ onmessage = function (e) {
       min[2] + shape[2],
     ];
 
-    if (lightOps.removals.length > 0) {
-      const fillQueue = removeLightsBatch(
-        space,
-        lightOps.removals,
-        color,
-        min,
-        maxCoords,
-        options,
-      );
+    // Nodes a prior job on this same box couldn't finish before hitting its
+    // node budget. Gathered here and sent back again (as `pendingFloods` /
+    // `pendingRemovals`) if this job bails too, so a pathological region
+    // (e.g. a long open sunlight shaft under a floating island) converges
+    // over a few follow-up jobs instead of shipping with a permanently
+    // half-lit hole.
+    const pendingFloods: LightNode[] = [];
+    let pendingRemovals: LightNode[] = [];
+
+    if (lightOps.removals.length > 0 || lightOps.pendingRemovals?.length) {
+      const { fill: fillQueue, pendingRemovals: stillPendingRemovals } =
+        removeLightsBatch(
+          space,
+          lightOps.removals,
+          color,
+          min,
+          maxCoords,
+          options,
+          lightOps.pendingRemovals ?? [],
+        );
+      pendingRemovals = stillPendingRemovals;
+
       if (fillQueue.length > 0) {
         for (const node of fillQueue) {
           const [vx, vy, vz] = node.voxel;
@@ -596,21 +712,43 @@ onmessage = function (e) {
           }
         }
 
-        floodLight(space, fillQueue, color, min, maxCoords, options);
+        pendingFloods.push(
+          ...floodLight(space, fillQueue, color, min, maxCoords, options),
+        );
       }
     }
 
-    if (lightOps.floods.length > 0) {
-      lightOps.floods.forEach((node) => {
+    // A deferred seed names an opened cell and asks for its neighbours' light
+    // as it stands in this snapshot — which already carries every earlier
+    // batch's result, unlike the main thread at analysis time. A leftover
+    // flood node from a prior bailed-out job is already fully resolved (a
+    // concrete level, not a deferred lookup), so it passes through as-is.
+    const floods: LightNode[] = LightUtils.resolveDeferredSeeds(
+      space,
+      lightOps.floods,
+      color,
+      options.maxHeight,
+    );
+
+    if (floods.length > 0) {
+      // A seed only ever raises its cell. The removal's refill above may
+      // already have brought brighter light back into it — a dim lamp placed
+      // inside a torch's glow — and writing the seed over that left the
+      // lamp's own cell darker than the server's, which keeps the max too.
+      floods.forEach((node) => {
         const [vx, vy, vz] = node.voxel;
         if (color === "SUNLIGHT") {
-          space.setSunlightAt(vx, vy, vz, node.level);
-        } else {
+          if (space.getSunlightAt(vx, vy, vz) < node.level) {
+            space.setSunlightAt(vx, vy, vz, node.level);
+          }
+        } else if (space.getTorchLightAt(vx, vy, vz, color) < node.level) {
           space.setTorchLightAt(vx, vy, vz, node.level, color);
         }
       });
 
-      floodLight(space, lightOps.floods, color, min, maxCoords, options);
+      pendingFloods.push(
+        ...floodLight(space, floods, color, min, maxCoords, options),
+      );
     }
 
     const modifiedChunks = space.getModifiedChunks();
@@ -628,7 +766,11 @@ onmessage = function (e) {
           minY: chunk.minY,
           maxY: chunk.maxY,
         })),
+        borderNeighbors: space.getBorderNeighbors(),
         appliedDeltas: { lastSequenceId },
+        pendingFloods: pendingFloods.length > 0 ? pendingFloods : undefined,
+        pendingRemovals:
+          pendingRemovals.length > 0 ? pendingRemovals : undefined,
       },
       {
         transfer: transferBuffers,

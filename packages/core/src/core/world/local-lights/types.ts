@@ -108,6 +108,45 @@ export interface LocalLightsOptions {
   maxSectionScansPerFrame: number;
   /** Multiplier a light's score gets while selected, against churn. */
   selectionHysteresis: number;
+  /**
+   * Temporal stability of the clustered layer (default on): cells keep the
+   * lights that matter most to them rather than the ones nearest the
+   * camera, every change of a cell's lights fades over `slotFadeMs`, the
+   * window rim fades continuously, and invalidated shadow faces keep
+   * sampling their last map until the re-render lands. Off is the legacy
+   * frame, kept only for A/B captures.
+   */
+  temporalStability: boolean;
+  /** How long a light takes to fade into or out of a cell, in ms. */
+  slotFadeMs: number;
+  /** How long a light's shadow takes to fade in or out, in ms. */
+  shadowFadeMs: number;
+  /**
+   * Data rows kept free for lights fading out of the selection, so the
+   * selection never has to cut one off mid-fade.
+   */
+  fadingRowReserve: number;
+  /** Width of the window-rim fade, in blocks. */
+  windowFadeBlocks: number;
+  /**
+   * Drawing-buffer pixels at and above which a cell keeps at most
+   * `highResolutionLightsPerCell` steady lights: the per-fragment loop is
+   * paid per pixel, so large buffers can trade light count for frame time.
+   * The default cap is every slot (`MAX_LIGHTS_PER_CELL`), so a tier keeps
+   * its own per-cell count at any resolution. A cell that drops a lamp
+   * hands it back to its flood, which is dimmer and flat, so a lower cap
+   * draws a straight line along the cell edge wherever three lamps share a
+   * cell: at 2, every retina screen saw it on "high" (16 Oct). Frame time
+   * at 2560x1440 over a three-lamp floor: 6.0 ms at 2, 6.1 ms at 4.
+   */
+  highResolutionPixels: number;
+  highResolutionLightsPerCell: number;
+  /**
+   * Fractional band around `highResolutionPixels` the gate must cross to
+   * flip, so an adaptive render scale hovering at the threshold does not
+   * toggle it every step.
+   */
+  highResolutionHysteresis: number;
   /** Initial quality tier. */
   qualityTier: LightQualityTier;
   /** Strength of local specular on fluids; 0 disables. */
@@ -150,9 +189,17 @@ export const defaultLocalLightsOptions: LocalLightsOptions = {
   gridDims: [24, 12, 24],
   maxSectionScansPerFrame: 16,
   selectionHysteresis: 1.2,
+  temporalStability: true,
+  slotFadeMs: 320,
+  shadowFadeMs: 320,
+  fadingRowReserve: 32,
+  windowFadeBlocks: 16,
+  highResolutionPixels: 2_100_000,
+  highResolutionLightsPerCell: 8,
+  highResolutionHysteresis: 0.15,
   qualityTier: "high",
   fluidSpecularStrength: 1,
-  maskKnee: 2 / 15,
+  maskKnee: 5 / 15,
   maxShadowedLights: 3,
   shadowAtlasSize: 2048,
   shadowSlotSize: 256,
@@ -209,7 +256,10 @@ export const LIGHT_QUALITY_TIERS: Record<
   },
   high: {
     maxClusteredLights: 192,
-    maxLightsPerCell: 4,
+    // Every slot: a cell past its cap drops its weakest lamps to their
+    // flood, a straight line along the cell edge. Measured 16 Oct at
+    // 2560x1440 over 100 lamps: 2 -> 8 per cell cost 0.1-0.2 ms a frame.
+    maxLightsPerCell: 8,
     analyticRadius: 64,
     fluidSpecularStrength: 1,
     blockLightOwnership: 1,
@@ -280,6 +330,12 @@ export interface LocalLightStats {
   scanMsPeak: number;
   sectionsPendingScan: number;
   selectionChurn: number;
+  /** Cell slots mid-fade after the last update. */
+  fadingSlots: number;
+  /** Lights still packed only to finish fading out of the selection. */
+  fadingLights: number;
+  /** 1 while the drawing buffer is past the high-resolution gate. */
+  highResolution: number;
   gridTextureUploads: number;
   dataTextureUploads: number;
   /** Lights currently holding a shadow slot. */
@@ -328,6 +384,14 @@ export interface LocalLightSample {
    * analytic lights is never lit by both models.
    */
   claim: number;
+  /**
+   * Colour of the cell's lights at the point, written when present: each
+   * light's colour by inverse square distance, with no range cutoff. The
+   * flood term borrows it for the channels it has run out of
+   * (`blockLightCurveRGB`'s `fill`), mirroring the chunk shader's
+   * `llLightHue`.
+   */
+  lightHue?: [number, number, number];
   /**
    * Window-rim fade at the point (1 deep inside the grid window, 0 at and
    * beyond its edge) — the crossfade weight between the owned composition

@@ -2,7 +2,412 @@ use super::fluid::WATERLOG_FLUID_INSET;
 use super::*;
 use hashbrown::HashMap;
 
-use voxelize_core::{BlockFace, BlockRotation, CornerData, LightColor, LightUtils, VoxelAccess, AABB, UV};
+use voxelize_core::{
+    BlockFace, BlockRotation, CornerData, LightColor, LightUtils, VoxelAccess, AABB, UV,
+};
+
+#[test]
+fn opaque_lava_does_not_erase_the_stone_wall_above_its_lowered_surface() {
+    let (mut registry, stone, mut lava) = ocean_registry(1, 2);
+    lava.is_opaque = true;
+    lava.is_transparent = [false; 6];
+    lava.is_waterlogging_fluid = false;
+    registry = Registry::new(vec![
+        (0, registry.get_block_by_id(0).unwrap().clone()),
+        (1, stone.clone()),
+        (2, lava),
+    ]);
+    registry.build_cache();
+    for dir in [[1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [0, 1, 0]] {
+        let space = SparseSpace::new(&[
+            ((0, 0, 0), (1, 0)),
+            ((dir[0], dir[1], dir[2]), (2, 0)),
+        ]);
+        let meshes = mesh_space_greedy(&[0, 0, 0], &[1, 1, 1], &space, &registry);
+        assert_eq!(meshes.iter().map(|g| g.indices.len()).sum::<usize>(), 36,
+            "lava must not cull stone at {dir:?}");
+        // The real failure occurs below an overhanging lip: every other
+        // neighbour is solid, so the whole-voxel shortcut also needs to
+        // recognize the air strip above the fluid surface.
+        let mut cells = vec![((0, 0, 0), (1, 0))];
+        for side in [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]] {
+            cells.push(((side[0], side[1], side[2]), (if side == dir { 2 } else { 1 }, 0)));
+        }
+        let enclosed = SparseSpace::new(&cells);
+        let meshes = mesh_space_greedy(&[0, 0, 0], &[1, 1, 1], &enclosed, &registry);
+        assert_eq!(meshes.iter().map(|g| g.indices.len()).sum::<usize>(), 6,
+            "buried bank still needs its exposed face at {dir:?}");
+    }
+}
+
+#[test]
+fn opaque_lava_shows_through_water_and_glass() {
+    let (registry, stone, water) = ocean_registry(1, 2);
+    let lava = Block {
+        is_fluid: true,
+        is_see_through: true,
+        is_opaque: true,
+        faces: six_faces(),
+        ..plain_block(3, "Lava")
+    };
+    let glass = Block {
+        is_see_through: true,
+        is_transparent: [true; 6],
+        faces: six_faces(),
+        ..plain_block(4, "Glass")
+    };
+    let mut registry = Registry::new(vec![
+        (0, registry.get_block_by_id(0).unwrap().clone()),
+        (1, stone),
+        (2, water),
+        (3, lava),
+        (4, glass),
+    ]);
+    registry.build_cache();
+
+    // Lava on the floor of a pond: its top, at the lava's own lowered
+    // surface, is what a swimmer looks down at.
+    let under_water = SparseSpace::new(&[((0, 0, 0), (3, 0)), ((0, 1, 0), (2, 0))]);
+    let lava_tops = mesh_space_greedy(&[-2, -1, -2], &[3, 3, 3], &under_water, &registry)
+        .iter()
+        .filter(|geometry| geometry.voxel == 3)
+        .flat_map(|geometry| {
+            geometry
+                .indices
+                .chunks_exact(6)
+                .filter(|quad| {
+                    let ys: Vec<f32> = quad
+                        .iter()
+                        .map(|&i| geometry.positions[i as usize * 3 + 1] - 1.0)
+                        .collect();
+                    ys.iter().all(|y| *y > 0.01 && (*y - ys[0]).abs() < 0.001)
+                })
+                .map(|_| ())
+                .collect::<Vec<_>>()
+        })
+        .count();
+    assert_eq!(lava_tops, 1, "lava under water lost its surface");
+
+    for (neighbor, name) in [(2, "water"), (4, "glass")] {
+        let beside = SparseSpace::new(&[((0, 0, 0), (3, 0)), ((1, 0, 0), (neighbor, 0))]);
+        assert_eq!(
+            quads_on_plane(&beside, &registry, 3, 0, 1.0),
+            1,
+            "lava beside {name} lost its side face"
+        );
+    }
+
+    // Lava still culls against itself and against stone.
+    let pooled = SparseSpace::new(&[((0, 0, 0), (3, 0)), ((1, 0, 0), (3, 0))]);
+    assert_eq!(quads_on_plane(&pooled, &registry, 3, 0, 1.0), 0);
+    let banked = SparseSpace::new(&[((0, 0, 0), (3, 0)), ((1, 0, 0), (1, 0))]);
+    assert_eq!(quads_on_plane(&banked, &registry, 3, 0, 1.0), 0);
+}
+
+#[test]
+fn rotated_solid_keeps_exposed_faces_and_culls_only_its_actual_neighbors() {
+    let mut solid = plain_block(1, "Rotating block");
+    solid.is_opaque = true;
+    solid.y_rotatable = true;
+    solid.faces = six_faces();
+    let air = Block {
+        is_empty: true,
+        aabbs: vec![],
+        ..plain_block(0, "Air")
+    };
+    let mut registry = Registry::new(vec![(0, air), (1, solid)]);
+    registry.build_cache();
+    for quarter in 0..4 {
+        let rotation = BlockRotation::PY(quarter as f32 * std::f32::consts::FRAC_PI_2);
+        let mut space = SparseSpace::new(&[((0, 0, 0), (1, 0))]);
+        space.rotation = rotation.clone();
+        let meshes = mesh_space_greedy(&[0, 0, 0], &[1, 1, 1], &space, &registry);
+        assert_eq!(meshes.iter().map(|g| g.indices.len()).sum::<usize>(), 36,
+            "quarter turn {quarter} must retain all six exposed faces");
+        // Only one neighbor is air. A translated normal can point at self
+        // or a diagonal, either erasing that face or leaking a buried one.
+        for opening in [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]] {
+            let mut cells = vec![((0, 0, 0), (1, 0))];
+            for side in [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]] {
+                if side != opening {
+                    cells.push(((side[0], side[1], side[2]), (1, 0)));
+                }
+            }
+            let mut space = SparseSpace::new(&cells);
+            space.rotation = rotation.clone();
+            let meshes = mesh_space_greedy(&[0, 0, 0], &[1, 1, 1], &space, &registry);
+            assert_eq!(meshes.iter().map(|g| g.indices.len()).sum::<usize>(), 6,
+                "quarter turn {quarter} must leave only its {opening:?} face exposed");
+        }
+    }
+}
+
+#[test]
+fn an_unknown_decoration_does_not_erase_the_ground_under_it() {
+    let mut ground = plain_block(1, "Ground");
+    ground.is_opaque = true;
+    ground.faces = six_faces();
+    let air = Block {
+        is_empty: true,
+        aabbs: vec![],
+        ..plain_block(0, "Air")
+    };
+    let mut registry = Registry::new(vec![(0, air), (1, ground.clone())]);
+    registry.build_cache();
+    let space = SparseSpace::new(&[((0, 0, 0), (1, 0)), ((0, 1, 0), (34204, 0))]);
+    assert!(should_render_face(
+        0,
+        0,
+        0,
+        1,
+        [0, 1, 0],
+        &ground,
+        &space,
+        &registry,
+        false,
+        false
+    ));
+    let meshes = mesh_space_greedy(&[0, 0, 0], &[1, 1, 1], &space, &registry);
+    assert_eq!(meshes.iter().map(|g| g.indices.len()).sum::<usize>(), 36);
+}
+
+#[test]
+fn standalone_faces_between_same_blocks_stop_at_their_depth() {
+    let air = Block {
+        is_empty: true,
+        aabbs: vec![],
+        ..plain_block(0, "Air")
+    };
+    let leaf_line = |depth: u32| {
+        let mut leaf = plain_block(1, "Leaf");
+        leaf.is_see_through = true;
+        leaf.transparent_standalone = true;
+        leaf.standalone_face_depth = depth;
+        leaf.faces = six_faces();
+        let mut registry = Registry::new(vec![(0, air.clone()), (1, leaf.clone())]);
+        registry.build_cache();
+        let cells: Vec<_> = (-2..=2).map(|x| ((x, 0, 0), (1, 0))).collect();
+        (leaf, registry, SparseSpace::new(&cells))
+    };
+    let renders = |leaf: &Block, registry: &Registry, space: &SparseSpace, x: i32, dir: i32| {
+        should_render_face(x, 0, 0, 1, [dir, 0, 0], leaf, space, registry, true, false)
+    };
+
+    // Five leaves along x, depth 1: only faces with one leaf before either
+    // end of the line are meshed, from both sides of each plane.
+    let (leaf, registry, space) = leaf_line(1);
+    let toward_px: Vec<_> = (-2..=1).filter(|&x| renders(&leaf, &registry, &space, x, 1)).collect();
+    let toward_nx: Vec<_> = (-1..=2).filter(|&x| renders(&leaf, &registry, &space, x, -1)).collect();
+    assert_eq!(toward_px, vec![-2, 1]);
+    assert_eq!(toward_nx, vec![-1, 2]);
+    // The ends of the line still face the air.
+    assert!(renders(&leaf, &registry, &space, 2, 1));
+    assert!(renders(&leaf, &registry, &space, -2, -1));
+
+    // Depth 0 meshes every layer.
+    let (leaf, registry, space) = leaf_line(0);
+    assert!((-2..=1).all(|x| renders(&leaf, &registry, &space, x, 1)));
+    assert!((-1..=2).all(|x| renders(&leaf, &registry, &space, x, -1)));
+}
+
+#[test]
+fn a_cutout_mass_lays_inward_copies_of_its_surface() {
+    let air = Block {
+        is_empty: true,
+        aabbs: vec![],
+        ..plain_block(0, "Air")
+    };
+    let mesh_lone_leaf = |depth: u32| {
+        let mut leaf = plain_block(1, "Leaf");
+        leaf.is_see_through = true;
+        leaf.transparent_standalone = true;
+        leaf.standalone_face_depth = depth;
+        leaf.faces = six_faces();
+        let mut registry = Registry::new(vec![(0, air.clone()), (1, leaf)]);
+        registry.build_cache();
+        let space = SparseSpace::new(&[((0, 0, 0), (1, 0))]);
+        mesh_space_greedy(&[0, 0, 0], &[1, 1, 1], &space, &registry)
+    };
+
+    // A single-sided mass shows each of its six faces from inside too: the
+    // copy sits on the same plane, just outside the cube, facing back in.
+    let meshes = mesh_lone_leaf(2);
+    assert_eq!(meshes.iter().map(|g| g.indices.len()).sum::<usize>(), 72);
+    let xs: Vec<f32> = meshes
+        .iter()
+        .flat_map(|g| g.positions.chunks(3).map(|p| p[0]))
+        .collect();
+    assert!(xs.iter().any(|&x| x < 0.0), "the -x copy lies outside the cube");
+    assert!(xs.iter().any(|&x| x > 1.0), "the +x copy lies outside the cube");
+
+    // Without a depth it is a plain standalone cutout: six faces.
+    let meshes = mesh_lone_leaf(0);
+    assert_eq!(meshes.iter().map(|g| g.indices.len()).sum::<usize>(), 36);
+}
+
+/// A see-through cutout cube wearing one tuft quad that reaches a quarter
+/// block past its cell on either side.
+fn tufted_leaf_registry() -> Registry {
+    let air = Block {
+        is_empty: true,
+        aabbs: vec![],
+        ..plain_block(0, "Air")
+    };
+    let mut leaf = plain_block(1, "Leaf");
+    leaf.is_see_through = true;
+    leaf.transparent_standalone = true;
+    leaf.standalone_face_depth = 2;
+    leaf.faces = six_faces();
+    let corner = |pos: [f32; 3], uv: [f32; 2]| CornerData { pos, uv };
+    leaf.tufts = Some(Tufts {
+        faces: vec![BlockFace {
+            name: "tuft".to_string(),
+            dir: [0, 0, 0],
+            corners: [
+                corner([-0.25, 1.25, 0.5], [0.0, 1.0]),
+                corner([-0.25, -0.25, 0.5], [0.0, 0.0]),
+                corner([1.25, 1.25, 0.5], [1.0, 1.0]),
+                corner([1.25, -0.25, 0.5], [1.0, 0.0]),
+            ],
+            ..Default::default()
+        }],
+        stage_faces: vec![],
+        jitter: 0.1,
+        tilt: 0.3,
+    });
+    let mut registry = Registry::new(vec![(0, air), (1, leaf)]);
+    registry.build_cache();
+    registry
+}
+
+/// Vertices a mesh lays more than a tenth of a block outside the cells
+/// `lo..hi` on any axis: only a tuft reaches that far (an inward copy sits a
+/// hair outside).
+fn tuft_vertices(meshes: &[GeometryProtocol], lo: f32, hi: f32) -> usize {
+    meshes
+        .iter()
+        .flat_map(|g| g.positions.chunks(3))
+        .filter(|p| p.iter().any(|&c| c < lo - 0.1 || c > hi + 0.1))
+        .count()
+}
+
+#[test]
+fn a_voxel_wears_its_tufts_only_where_it_meets_the_air() {
+    let registry = tufted_leaf_registry();
+
+    // A lone leaf: one tuft quad, laid once in a geometry of its own that
+    // the client draws from both sides.
+    let lone = SparseSpace::new(&[((0, 0, 0), (1, 0))]);
+    let meshes = mesh_space_greedy(&[0, 0, 0], &[1, 1, 1], &lone, &registry);
+    assert_eq!(tuft_vertices(&meshes, 0.0, 1.0), 4);
+    let tufts: Vec<_> = meshes
+        .iter()
+        .filter(|g| g.face_name.as_deref() == Some(TUFTS_FACE_NAME))
+        .collect();
+    assert_eq!(tufts.len(), 1);
+    assert_eq!(tufts[0].voxel, 1);
+    assert_eq!(tufts[0].indices.len(), 6);
+    assert_eq!(tuft_vertices(&meshes, 0.0, 1.0), tufts[0].positions.len() / 3);
+    // Its cube is meshed as before: six faces and their inward copies.
+    assert_eq!(meshes.iter().map(|g| g.indices.len()).sum::<usize>(), 72 + 6);
+
+    // The centre of a 3x3x3 block of leaves touches no air: it lays nothing
+    // beyond its cell, though its outer neighbours each lay their own.
+    let mut cells = Vec::new();
+    for x in -1..=1 {
+        for y in -1..=1 {
+            for z in -1..=1 {
+                cells.push(((x, y, z), (1, 0)));
+            }
+        }
+    }
+    let solid = SparseSpace::new(&cells);
+    let centre = mesh_space_greedy(&[0, 0, 0], &[1, 1, 1], &solid, &registry);
+    assert_eq!(tuft_vertices(&centre, 0.0, 1.0), 0);
+    // Meshed from the block's corner, positions run from 0 to 3.
+    let whole = mesh_space_greedy(&[-1, -1, -1], &[2, 2, 2], &solid, &registry);
+    assert!(tuft_vertices(&whole, 0.0, 3.0) > 0);
+}
+
+/// The triangles a crown of leaves costs: a ball of radius 4, every voxel
+/// within it a leaf.
+fn crown_triangles(registry: &Registry) -> usize {
+    let mut cells = Vec::new();
+    for x in -4..=4 {
+        for y in -4..=4 {
+            for z in -4..=4 {
+                if x * x + y * y + z * z <= 16 {
+                    cells.push(((x, y, z), (1, 0)));
+                }
+            }
+        }
+    }
+    let crown = SparseSpace::new(&cells);
+    mesh_space_greedy(&[-5, -5, -5], &[6, 6, 6], &crown, registry)
+        .iter()
+        .map(|g| g.indices.len() / 3)
+        .sum()
+}
+
+#[test]
+fn tufts_cost_a_crown_its_surface_not_its_volume() {
+    let registry = tufted_leaf_registry();
+    let mut plain = registry.clone();
+    for (_, block) in plain.blocks_by_id.iter_mut() {
+        block.tufts = None;
+    }
+    let (with, without) = (crown_triangles(&registry), crown_triangles(&plain));
+    // 257 voxels, of which the 134 that touch the air wear one quad; the 123
+    // buried ones cost nothing.
+    assert_eq!(with - without, 134 * 2, "{with} with tufts, {without} without");
+}
+
+#[test]
+fn tufts_leave_the_cube_greedy_and_differ_from_voxel_to_voxel() {
+    let registry = tufted_leaf_registry();
+    let mut plain = registry.clone();
+    for (_, block) in plain.blocks_by_id.iter_mut() {
+        block.tufts = None;
+    }
+
+    // A row of four leaves: the cube faces merge into the same quads with
+    // tufts as without, and the tufts add four quads.
+    let cells: Vec<_> = (0..4).map(|x| ((x, 0, 0), (1, 0))).collect();
+    let row = SparseSpace::new(&cells);
+    let indices = |registry: &Registry| {
+        mesh_space_greedy(&[0, 0, 0], &[4, 1, 1], &row, registry)
+            .iter()
+            .map(|g| g.indices.len())
+            .sum::<usize>()
+    };
+    assert_eq!(indices(&registry), indices(&plain) + 4 * 6);
+
+    // Each voxel turns and nudges its own set: no two tufts lie alike.
+    let meshes = mesh_space_greedy(&[0, 0, 0], &[4, 1, 1], &row, &registry);
+    let mut firsts: Vec<[i32; 3]> = Vec::new();
+    for g in &meshes {
+        let ext: Vec<&[f32]> = g
+            .positions
+            .chunks(3)
+            .filter(|p| p[1] > 1.1 || p[1] < -0.1)
+            .collect();
+        // In voxel order along x; each first corner taken in its own cell.
+        for (x, quad) in ext.chunks(4).enumerate() {
+            let p = quad[0];
+            firsts.push([
+                ((p[0] - x as f32) * 1000.0).round() as i32,
+                (p[1] * 1000.0).round() as i32,
+                (p[2] * 1000.0).round() as i32,
+            ]);
+        }
+    }
+    assert_eq!(firsts.len(), 4);
+    for i in 0..firsts.len() {
+        for j in i + 1..firsts.len() {
+            assert_ne!(firsts[i], firsts[j]);
+        }
+    }
+}
 
 struct SingleVoxelSpace {
     voxel_id: u32,
@@ -83,9 +488,11 @@ fn full_block_diagonal_block() -> Block {
         is_see_through: true,
         is_transparent: [true; 6],
         transparent_standalone: true,
+        standalone_face_depth: 0,
         occludes_fluid: false,
         is_plant: true,
         stack_group: 0,
+        is_animated: false,
         faces: vec![BlockFace::new(
             "one".to_string(),
             false,
@@ -119,6 +526,12 @@ fn full_block_diagonal_block() -> Block {
             max_z: 1.0,
         }],
         dynamic_patterns: None,
+        connected: None,
+        branch: None,
+        branch_shell: false,
+        branch_sockets: vec![],
+        stage_faces: None,
+        tufts: None,
     }
 }
 
@@ -343,8 +756,7 @@ fn self_ao_stair_step_face_bottom_gets_occlusion() {
     let face_bbox_min = [0.0, 0.5, 0.5];
 
     let bottom_of_step = [0.5_f32, 0.5, 0.5];
-    let (s011, s101, s110, s111) =
-        compute_self_ao(bottom_of_step, face_dir, face_bbox_min, &aabbs);
+    let (s011, s101, s110, s111) = compute_self_ao(bottom_of_step, face_dir, face_bbox_min, &aabbs);
 
     assert!(
         s011 || s101 || s110 || s111,
@@ -387,8 +799,7 @@ fn self_ao_stair_step_face_top_no_occlusion() {
     let face_bbox_min = [0.0, 0.5, 0.5];
 
     let top_of_step = [0.5_f32, 1.0, 0.5];
-    let (s011, s101, s110, s111) =
-        compute_self_ao(top_of_step, face_dir, face_bbox_min, &aabbs);
+    let (s011, s101, s110, s111) = compute_self_ao(top_of_step, face_dir, face_bbox_min, &aabbs);
 
     assert!(
         !s011 && !s101 && !s110 && !s111,
@@ -509,12 +920,20 @@ fn upward_stair_face_samples_light_from_opaque_block_above() {
         is_see_through: false,
         is_transparent: [true; 6],
         transparent_standalone: false,
+        standalone_face_depth: 0,
         occludes_fluid: false,
         is_plant: false,
         stack_group: 0,
+        is_animated: false,
         faces: vec![],
         aabbs: stairs_aabbs(),
         dynamic_patterns: None,
+        connected: None,
+        branch: None,
+        branch_shell: false,
+        branch_sockets: vec![],
+        stage_faces: None,
+        tufts: None,
     };
 
     let stone_block = Block {
@@ -531,9 +950,11 @@ fn upward_stair_face_samples_light_from_opaque_block_above() {
         is_see_through: false,
         is_transparent: [false; 6],
         transparent_standalone: false,
+        standalone_face_depth: 0,
         occludes_fluid: false,
         is_plant: false,
         stack_group: 0,
+        is_animated: false,
         faces: vec![],
         aabbs: vec![AABB {
             min_x: 0.0,
@@ -544,6 +965,12 @@ fn upward_stair_face_samples_light_from_opaque_block_above() {
             max_z: 1.0,
         }],
         dynamic_patterns: None,
+        connected: None,
+        branch: None,
+        branch_shell: false,
+        branch_sockets: vec![],
+        stage_faces: None,
+        tufts: None,
     };
 
     let mut registry = Registry::new(vec![(1, stair_block), (2, stone_block)]);
@@ -635,16 +1062,25 @@ fn plain_block(id: u32, name: &str) -> Block {
         is_see_through: false,
         is_transparent: [false; 6],
         transparent_standalone: false,
+        standalone_face_depth: 0,
         occludes_fluid: false,
         is_plant: false,
         stack_group: 0,
+        is_animated: false,
         faces: vec![],
         aabbs: full_cube_aabb(),
         dynamic_patterns: None,
+        connected: None,
+        branch: None,
+        branch_shell: false,
+        branch_sockets: vec![],
+        stage_faces: None,
+        tufts: None,
     }
 }
 
 struct ColumnSpace {
+    tint: u32,
     bottom_id: u32,
     top_id: u32,
     is_bottom_waterlogged: bool,
@@ -668,7 +1104,7 @@ impl VoxelAccess for ColumnSpace {
     }
 
     fn get_voxel_stage(&self, _vx: i32, _vy: i32, _vz: i32) -> u32 {
-        0
+        self.tint
     }
 
     fn get_voxel_waterlogged(&self, vx: i32, vy: i32, vz: i32) -> bool {
@@ -706,15 +1142,48 @@ fn mesh_single_face(
     registry: &Registry,
     space: &impl VoxelAccess,
 ) -> Vec<i32> {
+    mesh_single_face_at_y(0, block, face, registry, space)
+}
+
+fn mesh_single_face_at_y(
+    vy: i32,
+    block: &Block,
+    face: &BlockFace,
+    registry: &Registry,
+    space: &impl VoxelAccess,
+) -> Vec<i32> {
+    mesh_single_face_data_at_y(vy, block, face, registry, space).1
+}
+
+fn mesh_single_face_data_at_y(
+    vy: i32,
+    block: &Block,
+    face: &BlockFace,
+    registry: &Registry,
+    space: &impl VoxelAccess,
+) -> (Vec<f32>, Vec<i32>) {
+    mesh_single_face_data_at([0, vy, 0], block, face, registry, space)
+}
+
+/// Positions come back in world coordinates (the mesh origin is the world
+/// origin), so a corner shared by two voxels reads the same position from
+/// either one's face.
+fn mesh_single_face_data_at(
+    [vx, vy, vz]: [i32; 3],
+    block: &Block,
+    face: &BlockFace,
+    registry: &Registry,
+    space: &impl VoxelAccess,
+) -> (Vec<f32>, Vec<i32>) {
     let mut positions = vec![];
     let mut indices = vec![];
     let mut uvs = vec![];
     let mut lights = vec![];
-    let neighbors = NeighborCache::populate(0, 0, 0, space);
+    let neighbors = NeighborCache::populate(vx, vy, vz, space);
     process_face(
-        0,
-        0,
-        0,
+        vx,
+        vy,
+        vz,
         block.id,
         &BlockRotation::PY(0.0),
         face,
@@ -732,7 +1201,7 @@ fn mesh_single_face(
         &[0, 0, 0],
         false,
     );
-    lights
+    (positions, lights)
 }
 
 #[test]
@@ -781,6 +1250,7 @@ fn water_exposed_bit_marks_faces_touching_fluid_or_waterlogged_blocks() {
     };
 
     let submerged = ColumnSpace {
+        tint: 0,
         bottom_id: 1,
         top_id: 2,
         is_bottom_waterlogged: false,
@@ -795,6 +1265,7 @@ fn water_exposed_bit_marks_faces_touching_fluid_or_waterlogged_blocks() {
     );
 
     let dry = ColumnSpace {
+        tint: 0,
         bottom_id: 1,
         top_id: 0,
         is_bottom_waterlogged: false,
@@ -809,6 +1280,7 @@ fn water_exposed_bit_marks_faces_touching_fluid_or_waterlogged_blocks() {
     );
 
     let planted = ColumnSpace {
+        tint: 0,
         bottom_id: 3,
         top_id: 2,
         is_bottom_waterlogged: true,
@@ -823,6 +1295,7 @@ fn water_exposed_bit_marks_faces_touching_fluid_or_waterlogged_blocks() {
     );
 
     let emerged = ColumnSpace {
+        tint: 0,
         bottom_id: 3,
         top_id: 0,
         is_bottom_waterlogged: false,
@@ -869,18 +1342,59 @@ fn a_vertical_run_is_grouped_by_stack_group_not_block_id() {
     let face = lower.faces[0].clone();
 
     let run_length = |upper: Block, top_id: u32| {
-        let mut registry =
-            Registry::new(vec![(0, air.clone()), (LOWER_ID, lower.clone()), (UPPER_ID, upper)]);
+        let mut registry = Registry::new(vec![
+            (0, air.clone()),
+            (LOWER_ID, lower.clone()),
+            (UPPER_ID, upper.clone()),
+        ]);
         registry.build_cache();
         let space = ColumnSpace {
+            tint: 0,
             bottom_id: LOWER_ID,
             top_id,
             is_bottom_waterlogged: false,
         };
         let lights = mesh_single_face(&lower, &face, &registry, &space);
         let count = ((lights[0] >> STACK_COUNT_SHIFT) & STACK_FIELD_BITS) + 1;
-        let index = (lights[0] >> STACK_INDEX_SHIFT) & STACK_FIELD_BITS;
-        assert_eq!(index, 0, "the bottom of a run is index 0");
+        let indices = lights
+            .iter()
+            .map(|light| (light >> STACK_INDEX_SHIFT) & STACK_FIELD_BITS)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            indices,
+            vec![1, 0, 1, 0],
+            "upper face vertices advance through the run while root vertices stay at zero",
+        );
+        if top_id == UPPER_ID && upper.stack_group == GROUP {
+            let (lower_positions, _) =
+                mesh_single_face_data_at_y(0, &lower, &face, &registry, &space);
+            let (upper_positions, upper_lights) =
+                mesh_single_face_data_at_y(1, &upper, &upper.faces[0], &registry, &space);
+            let upper_indices = upper_lights
+                .iter()
+                .map(|light| (light >> STACK_INDEX_SHIFT) & STACK_FIELD_BITS)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                upper_indices,
+                vec![2, 1, 2, 1],
+                "the upper half must continue from the lower seam to the plant tip",
+            );
+            assert_eq!(
+                [
+                    lower_positions[0],
+                    lower_positions[2],
+                    lower_positions[6],
+                    lower_positions[8],
+                ],
+                [
+                    upper_positions[3],
+                    upper_positions[5],
+                    upper_positions[9],
+                    upper_positions[11],
+                ],
+                "stacked plant halves must share the same horizontal jitter at their seam",
+            );
+        }
         count
     };
 
@@ -894,11 +1408,7 @@ fn a_vertical_run_is_grouped_by_stack_group_not_block_id() {
         1,
         "a different group ends the run",
     );
-    assert_eq!(
-        run_length(upper_same_group, 0),
-        1,
-        "air ends the run",
-    );
+    assert_eq!(run_length(upper_same_group, 0), 1, "air ends the run",);
 }
 
 /// A vertical run of one fluid centred on the origin, with an optional
@@ -974,11 +1484,18 @@ impl VoxelAccess for FluidColumnSpace {
 /// stand above the voxel at the origin. Read off a side face, which is the
 /// one face that meshes at every depth — a submerged voxel's top face is
 /// culled against the water above it.
+/// Decodes the packed column the way the shader does: a waving fluid vertex
+/// sits on the surface, so its count is its index plus one and the count
+/// field carries the flow instead.
 fn fluid_blocks_above(space: &FluidColumnSpace, water: &Block, registry: &Registry) -> i32 {
     let face = water.faces[0].clone();
     let lights = mesh_single_face(water, &face, registry, space);
     let index = (lights[0] >> STACK_INDEX_SHIFT) & STACK_FIELD_BITS;
-    let count = ((lights[0] >> STACK_COUNT_SHIFT) & STACK_FIELD_BITS) + 1;
+    let count = if lights[0] & WAVE_BIT != 0 {
+        index + 1
+    } else {
+        ((lights[0] >> STACK_COUNT_SHIFT) & STACK_FIELD_BITS) + 1
+    };
     count - 1 - index
 }
 
@@ -1037,11 +1554,7 @@ fn a_fluid_run_is_measured_down_from_its_surface() {
         ..plain_block(KELP_ID, "Kelp")
     };
 
-    let mut registry = Registry::new(vec![
-        (0, air),
-        (WATER_ID, water.clone()),
-        (KELP_ID, kelp),
-    ]);
+    let mut registry = Registry::new(vec![(0, air), (WATER_ID, water.clone()), (KELP_ID, kelp)]);
     registry.build_cache();
 
     let column = |above: i32, below: i32, waterlogged_offset: Option<i32>| FluidColumnSpace {
@@ -1094,6 +1607,7 @@ fn an_ungrouped_block_writes_no_stack_bits() {
     registry.build_cache();
 
     let space = ColumnSpace {
+        tint: 0,
         bottom_id: 1,
         top_id: 1,
         is_bottom_waterlogged: false,
@@ -1135,6 +1649,7 @@ fn emissive_faces_pack_the_bit_and_strength_index() {
     registry.build_cache();
 
     let space = ColumnSpace {
+        tint: 0,
         bottom_id: 1,
         top_id: 0,
         is_bottom_waterlogged: false,
@@ -1191,7 +1706,11 @@ fn greedy_quads_carry_emissive_bits() {
     for geometry in &geometries {
         for packed in &geometry.lights {
             packed_lights += 1;
-            assert_ne!(packed & EMISSIVE_BIT, 0, "greedy quad lost the emissive bit");
+            assert_ne!(
+                packed & EMISSIVE_BIT,
+                0,
+                "greedy quad lost the emissive bit"
+            );
             assert_eq!(
                 (packed >> AO_SHIFT) & AO_BITS,
                 2,
@@ -1202,3 +1721,2267 @@ fn greedy_quads_carry_emissive_bits() {
     }
     assert!(packed_lights > 0, "the glowstone meshed nothing");
 }
+
+/// An animated block is meshed one geometry per voxel, each reporting the
+/// voxel it belongs to, so the client can move a single door leaf; the same
+/// shape without the flag still shares one geometry per block. Two leaves of
+/// one block id stacked in a column are what a door is, and what would have
+/// been merged.
+#[test]
+fn an_animated_block_meshes_each_voxel_as_its_own_geometry() {
+    const LEAF_ID: u32 = 7;
+
+    let air = Block {
+        is_empty: true,
+        aabbs: vec![],
+        ..plain_block(0, "Air")
+    };
+    let leaf = Block {
+        is_see_through: true,
+        is_transparent: [true; 6],
+        transparent_standalone: true,
+        standalone_face_depth: 0,
+        faces: six_faces(),
+        aabbs: vec![AABB {
+            min_x: 0.0,
+            min_y: 0.0,
+            min_z: 0.0,
+            max_x: 1.0,
+            max_y: 1.0,
+            max_z: 0.0625,
+        }],
+        ..plain_block(LEAF_ID, "Leaf")
+    };
+    let animated_leaf = Block {
+        is_animated: true,
+        ..leaf.clone()
+    };
+
+    let column = SparseSpace::new(&[((0, 0, 0), (LEAF_ID, 0)), ((0, 1, 0), (LEAF_ID, 0))]);
+    let mesh_with = |leaf: Block| {
+        let mut registry = Registry::new(vec![(0, air.clone()), (LEAF_ID, leaf)]);
+        registry.build_cache();
+        mesh_space_greedy(&[0, 0, 0], &[1, 2, 1], &column, &registry)
+    };
+
+    let shared = mesh_with(leaf);
+    assert_eq!(shared.len(), 1, "an unflagged block shares one geometry");
+    assert_eq!(shared[0].at, None);
+
+    let mut per_voxel = mesh_with(animated_leaf);
+    per_voxel.sort_by_key(|geometry| geometry.at);
+    assert_eq!(per_voxel.len(), 2, "one geometry per animated voxel");
+    assert_eq!(per_voxel[0].at, Some([0, 0, 0]));
+    assert_eq!(per_voxel[1].at, Some([0, 1, 0]));
+    assert!(
+        per_voxel
+            .iter()
+            .all(|geometry| geometry.face_name.is_none()),
+        "a plain face keeps the block's own material: no face name on the geometry",
+    );
+    assert_eq!(
+        per_voxel.iter().map(|g| g.indices.len()).sum::<usize>(),
+        shared[0].indices.len(),
+        "splitting per voxel changes the grouping, not the faces",
+    );
+}
+
+/// A see-through block's face pointing at an opaque neighbour is hidden only
+/// when it lies on the boundary between them. An open door leaf stands a
+/// sixteenth in from its jamb; culling its faces against the jamb drew the
+/// open door as nothing but its edges. A face flat against the wall behind
+/// it is still covered, and still culled.
+#[test]
+fn an_inset_see_through_face_survives_an_opaque_neighbour() {
+    const LEAF_ID: u32 = 7;
+    const WALL_ID: u32 = 8;
+
+    let air = Block {
+        is_empty: true,
+        aabbs: vec![],
+        ..plain_block(0, "Air")
+    };
+    let wall = Block {
+        is_opaque: true,
+        faces: six_faces(),
+        ..plain_block(WALL_ID, "Wall")
+    };
+    let leaf = Block {
+        is_see_through: true,
+        is_transparent: [true; 6],
+        transparent_standalone: true,
+        standalone_face_depth: 0,
+        aabbs: vec![],
+        ..plain_block(LEAF_ID, "Leaf")
+    };
+
+    let quad = |dir: [i32; 3], corners: [[f32; 3]; 4]| {
+        BlockFace::new(
+            "face".to_string(),
+            false,
+            false,
+            dir,
+            corners.map(|pos| CornerData {
+                pos,
+                uv: [0.0, 0.0],
+            }),
+        )
+    };
+    // The open leaf's +x face, two sixteenths in from the +x jamb.
+    let inset_px = quad(
+        [1, 0, 0],
+        [
+            [0.125, 1.0, 1.0],
+            [0.125, 0.0, 1.0],
+            [0.125, 1.0, 0.0],
+            [0.125, 0.0, 0.0],
+        ],
+    );
+    // A closed leaf's -z face, flat against the wall behind it.
+    let flush_nz = quad(
+        [0, 0, -1],
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ],
+    );
+
+    let space = SparseSpace::new(&[
+        ((0, 0, 0), (LEAF_ID, 0)),
+        ((1, 0, 0), (WALL_ID, 0)),
+        ((0, 0, -1), (WALL_ID, 0)),
+    ]);
+    let mut registry = Registry::new(vec![(0, air), (LEAF_ID, leaf.clone()), (WALL_ID, wall)]);
+    registry.build_cache();
+
+    let emitted_indices = |face: &BlockFace| -> usize {
+        let mut positions = vec![];
+        let mut indices = vec![];
+        let mut uvs = vec![];
+        let mut lights = vec![];
+        let neighbors = NeighborCache::populate(0, 0, 0, &space);
+        process_face(
+            0,
+            0,
+            0,
+            LEAF_ID,
+            &BlockRotation::PY(0.0),
+            face,
+            &leaf,
+            &HashMap::new(),
+            &registry,
+            &space,
+            &neighbors,
+            true,
+            false,
+            &mut positions,
+            &mut indices,
+            &mut uvs,
+            &mut lights,
+            &[0, 0, 0],
+            false,
+        );
+        indices.len()
+    };
+
+    assert_eq!(
+        emitted_indices(&inset_px),
+        6,
+        "a face standing in from the jamb is visible beside it and must be drawn",
+    );
+    assert_eq!(
+        emitted_indices(&flush_nz),
+        0,
+        "a face flat against the wall behind it is covered and stays culled",
+    );
+}
+
+/// A vertical fluid face is drawn as a tank window only when it presses
+/// against a see-through solid. Against air it is the water's own surface
+/// and must carry no pane flag, or a spreading flow's edge walls fade and
+/// drop out head-on, leaving its top face floating unconnected. The pane
+/// flag rides the greedy bit, which a fluid face never otherwise sets.
+#[test]
+fn a_fluid_wall_is_a_pane_only_against_a_see_through_solid() {
+    const WATER_ID: u32 = 2;
+    const GLASS_ID: u32 = 3;
+
+    let air = Block {
+        is_empty: true,
+        aabbs: vec![],
+        ..plain_block(0, "Air")
+    };
+    let water = Block {
+        is_fluid: true,
+        is_waterlogging_fluid: true,
+        is_see_through: true,
+        is_transparent: [true; 6],
+        faces: six_faces(),
+        ..plain_block(WATER_ID, "Water")
+    };
+    let glass = Block {
+        is_see_through: true,
+        is_transparent: [true; 6],
+        transparent_standalone: true,
+        standalone_face_depth: 0,
+        faces: six_faces(),
+        ..plain_block(GLASS_ID, "Glass")
+    };
+
+    let mut registry = Registry::new(vec![(0, air), (WATER_ID, water.clone()), (GLASS_ID, glass)]);
+    registry.build_cache();
+
+    // Water at the origin with glass on +x and air everywhere else.
+    let space = SparseSpace::new(&[((0, 0, 0), (WATER_ID, 0)), ((1, 0, 0), (GLASS_ID, 0))]);
+    let faces = create_fluid_faces(0, 0, 0, WATER_ID, &space, &water.faces, &registry);
+    let lights_of = |name: &str| {
+        let face = faces
+            .iter()
+            .find(|face| face.name == name)
+            .unwrap_or_else(|| panic!("fluid meshing emits a {name} face"));
+        mesh_single_face(&water, face, &registry, &space)
+    };
+
+    let against_glass = lights_of("px");
+    assert!(
+        !against_glass.is_empty() && against_glass.iter().all(|l| l & FLUID_PANE_BIT != 0),
+        "the wall against glass is a pane: {against_glass:?}",
+    );
+    for name in ["nx", "pz", "nz"] {
+        let against_air = lights_of(name);
+        assert!(
+            !against_air.is_empty() && against_air.iter().all(|l| l & FLUID_PANE_BIT == 0),
+            "the {name} wall against air is the water's own surface, not a pane: {against_air:?}",
+        );
+    }
+    assert!(
+        lights_of("py").iter().all(|l| l & FLUID_PANE_BIT == 0),
+        "only vertical faces can be panes",
+    );
+}
+
+/// A slab is non-opaque, but it is not a window: it leaves the upper half of
+/// the face it shares with the water open to air, so the water standing
+/// above it draws as the water's own surface. Flagging it a pane had the
+/// shader drop the face head-on, cutting a hole into a flow wherever it ran
+/// beside a slab. The same reading applies to a see-through block that only
+/// partly covers the shared plane; a see-through full cube stays a pane.
+#[test]
+fn a_fluid_wall_beside_a_partial_block_is_the_waters_own_surface() {
+    const WATER_ID: u32 = 2;
+    const SLAB_ID: u32 = 3;
+    const GLASS_SLAB_ID: u32 = 4;
+    const GLASS_ID: u32 = 5;
+
+    let air = Block {
+        is_empty: true,
+        aabbs: vec![],
+        ..plain_block(0, "Air")
+    };
+    let water = Block {
+        is_fluid: true,
+        is_waterlogging_fluid: true,
+        is_see_through: true,
+        is_transparent: [true; 6],
+        faces: six_faces(),
+        ..plain_block(WATER_ID, "Water")
+    };
+    let bottom_half = vec![AABB {
+        min_x: 0.0,
+        min_y: 0.0,
+        min_z: 0.0,
+        max_x: 1.0,
+        max_y: 0.5,
+        max_z: 1.0,
+    }];
+    // Slabs are registered transparent on every side but the one they rest
+    // on, so they are non-opaque without being see-through.
+    let slab = Block {
+        is_transparent: [true, true, true, true, false, true],
+        faces: six_faces(),
+        aabbs: bottom_half.clone(),
+        ..plain_block(SLAB_ID, "Stone Slab Bottom")
+    };
+    let glass_slab = Block {
+        is_see_through: true,
+        is_transparent: [true; 6],
+        faces: six_faces(),
+        aabbs: bottom_half,
+        ..plain_block(GLASS_SLAB_ID, "Glass Slab Bottom")
+    };
+    let glass = Block {
+        is_see_through: true,
+        is_transparent: [true; 6],
+        transparent_standalone: true,
+        standalone_face_depth: 0,
+        faces: six_faces(),
+        ..plain_block(GLASS_ID, "Glass")
+    };
+
+    let mut registry = Registry::new(vec![
+        (0, air),
+        (WATER_ID, water.clone()),
+        (SLAB_ID, slab),
+        (GLASS_SLAB_ID, glass_slab),
+        (GLASS_ID, glass),
+    ]);
+    registry.build_cache();
+
+    // Spreading water (stage 2, so its surface stands above the slab tops)
+    // with a slab on +x, a glass slab on -x, glass on +z and air on -z.
+    let space = SparseSpace::new(&[
+        ((0, 0, 0), (WATER_ID, 2)),
+        ((1, 0, 0), (SLAB_ID, 0)),
+        ((-1, 0, 0), (GLASS_SLAB_ID, 0)),
+        ((0, 0, 1), (GLASS_ID, 0)),
+    ]);
+    let faces = create_fluid_faces(0, 0, 0, WATER_ID, &space, &water.faces, &registry);
+    let lights_of = |name: &str| {
+        let face = faces
+            .iter()
+            .find(|face| face.name == name)
+            .unwrap_or_else(|| panic!("fluid meshing emits a {name} face"));
+        mesh_single_face(&water, face, &registry, &space)
+    };
+
+    let beside_slab = lights_of("px");
+    assert!(
+        !beside_slab.is_empty(),
+        "the wall beside a slab is emitted: the slab covers only its lower half",
+    );
+    assert!(
+        beside_slab.iter().all(|l| l & FLUID_PANE_BIT == 0),
+        "the wall beside a slab is the water's own surface, not a pane: {beside_slab:?}",
+    );
+
+    let beside_glass_slab = lights_of("nx");
+    assert!(
+        !beside_glass_slab.is_empty() && beside_glass_slab.iter().all(|l| l & FLUID_PANE_BIT == 0),
+        "a see-through block covering half the shared face is not a window: {beside_glass_slab:?}",
+    );
+
+    let against_glass = lights_of("pz");
+    assert!(
+        !against_glass.is_empty() && against_glass.iter().all(|l| l & FLUID_PANE_BIT != 0),
+        "a see-through full cube is still a pane: {against_glass:?}",
+    );
+
+    let against_air = lights_of("nz");
+    assert!(
+        !against_air.is_empty() && against_air.iter().all(|l| l & FLUID_PANE_BIT == 0),
+        "the wall against air is unchanged: {against_air:?}",
+    );
+}
+
+/// The flow field a surface vertex carries points downhill along the
+/// rendered surface — away from the source of a spread — is still on a
+/// resting pool, and is read at the shared corner so neighbouring faces
+/// agree. A vertex with fluid above it keeps its column count instead.
+#[test]
+fn a_surface_vertex_carries_the_downhill_flow_of_its_corner() {
+    const WATER_ID: u32 = 2;
+
+    let air = Block {
+        is_empty: true,
+        aabbs: vec![],
+        ..plain_block(0, "Air")
+    };
+    let water = Block {
+        is_fluid: true,
+        is_waterlogging_fluid: true,
+        is_see_through: true,
+        is_transparent: [true; 6],
+        faces: six_faces(),
+        ..plain_block(WATER_ID, "Water")
+    };
+    let mut registry = Registry::new(vec![(0, air), (WATER_ID, water.clone())]);
+    registry.build_cache();
+
+    // The surface vertices of the voxel at the origin, as (x, flow code).
+    let surface_flows = |space: &SparseSpace| -> Vec<(f32, u32)> {
+        let faces = create_fluid_faces(0, 0, 0, WATER_ID, space, &water.faces, &registry);
+        let top = faces.iter().find(|f| f.name == "py").expect("a top face");
+        let (positions, lights) = mesh_single_face_data_at_y(0, &water, top, &registry, space);
+        lights
+            .iter()
+            .enumerate()
+            .map(|(i, light)| {
+                assert_ne!(light & WAVE_BIT, 0, "a top-face vertex waves");
+                (
+                    positions[i * 3],
+                    ((light >> FLOW_SHIFT) & FLOW_FIELD_BITS) as u32,
+                )
+            })
+            .collect()
+    };
+
+    // A spread along x from a source at the origin: stage rises both ways.
+    let spread = SparseSpace::new(&[
+        ((-2, 0, 0), (WATER_ID, 2)),
+        ((-1, 0, 0), (WATER_ID, 1)),
+        ((0, 0, 0), (WATER_ID, 0)),
+        ((1, 0, 0), (WATER_ID, 1)),
+        ((2, 0, 0), (WATER_ID, 2)),
+    ]);
+    for (x, code) in surface_flows(&spread) {
+        let [dx, dz] = flow_direction(code).expect("a spread flows");
+        assert!(
+            dz.abs() < 0.25,
+            "a spread along x has no cross-flow, got ({dx}, {dz}) at x={x}"
+        );
+        if x > 0.5 {
+            assert!(dx > 0.95, "the +x corners run toward +x, got {dx}");
+        } else {
+            assert!(dx < -0.95, "the -x corners run toward -x, got {dx}");
+        }
+    }
+
+    // Neighbouring faces read the same corner: the +x corners of the source
+    // are the -x corners of the voxel beside it.
+    let beside = SparseSpace::new(&[
+        ((-3, 0, 0), (WATER_ID, 2)),
+        ((-2, 0, 0), (WATER_ID, 1)),
+        ((-1, 0, 0), (WATER_ID, 0)),
+        ((0, 0, 0), (WATER_ID, 1)),
+        ((1, 0, 0), (WATER_ID, 2)),
+    ]);
+    let source_px: Vec<u32> = surface_flows(&spread)
+        .into_iter()
+        .filter(|(x, _)| *x > 0.5)
+        .map(|(_, code)| code)
+        .collect();
+    let neighbour_nx: Vec<u32> = surface_flows(&beside)
+        .into_iter()
+        .filter(|(x, _)| *x < 0.5)
+        .map(|(_, code)| code)
+        .collect();
+    assert_eq!(
+        source_px, neighbour_nx,
+        "a shared corner packs one direction"
+    );
+
+    // The middle of a resting pool is still.
+    let mut pool = vec![];
+    for x in -1..=1 {
+        for z in -1..=1 {
+            pool.push(((x, 0, z), (WATER_ID, 0)));
+        }
+    }
+    let pool = SparseSpace::new(&pool);
+    for (x, code) in surface_flows(&pool) {
+        assert_eq!(code, FLOW_STILL, "still water at x={x}");
+    }
+
+    // Under more fluid a vertex does not wave, and the field is its count.
+    let submerged = SparseSpace::new(&[((0, 0, 0), (WATER_ID, 0)), ((0, 1, 0), (WATER_ID, 0))]);
+    let faces = create_fluid_faces(0, 0, 0, WATER_ID, &submerged, &water.faces, &registry);
+    let side = faces.iter().find(|f| f.name == "px").expect("a side face");
+    let lights = mesh_single_face(&water, side, &registry, &submerged);
+    assert!(!lights.is_empty());
+    for light in lights {
+        assert_eq!(light & WAVE_BIT, 0, "nothing waves under the surface");
+        assert_eq!(
+            ((light >> STACK_COUNT_SHIFT) & STACK_FIELD_BITS) + 1,
+            2,
+            "a two-block column reports its count"
+        );
+    }
+}
+
+/// The depth a surface vertex carries is the mean over the columns sharing
+/// its corner, so the floor shading ramps across a step in the bed. A
+/// per-voxel count drew the pit under a pool as a hard-edged rectangle on
+/// the surface — the depth jumped at the face border while the floor it
+/// shaded rippled underneath.
+#[test]
+fn a_surface_vertex_carries_the_mean_depth_of_its_corner() {
+    const WATER_ID: u32 = 2;
+
+    let air = Block {
+        is_empty: true,
+        aabbs: vec![],
+        ..plain_block(0, "Air")
+    };
+    let water = Block {
+        is_fluid: true,
+        is_waterlogging_fluid: true,
+        is_see_through: true,
+        is_transparent: [true; 6],
+        faces: six_faces(),
+        ..plain_block(WATER_ID, "Water")
+    };
+    let mut registry = Registry::new(vec![(0, air), (WATER_ID, water.clone())]);
+    registry.build_cache();
+
+    // A 3x3 pool one block deep at y=1, with a 2x2 pit under its -x/-z
+    // quadrant: the columns at x, z in {-1, 0} hold water at y=0 too.
+    let mut voxels = vec![];
+    for x in -1..=1 {
+        for z in -1..=1 {
+            voxels.push(((x, 1, z), (WATER_ID, 0)));
+            if x <= 0 && z <= 0 {
+                voxels.push(((x, 0, z), (WATER_ID, 0)));
+            }
+        }
+    }
+    let space = SparseSpace::new(&voxels);
+
+    // The origin's top face at y=1: its four corners each touch a different
+    // mix of pit (one block below) and shelf (nothing below) columns.
+    let faces = create_fluid_faces(0, 1, 0, WATER_ID, &space, &water.faces, &registry);
+    let top = faces.iter().find(|f| f.name == "py").expect("a top face");
+    let (positions, lights) = mesh_single_face_data_at_y(1, &water, top, &registry, &space);
+    assert_eq!(lights.len(), 4, "a top face has four vertices");
+
+    let units = SURFACE_DEPTH_UNITS_PER_BLOCK;
+    for (i, light) in lights.iter().enumerate() {
+        assert_ne!(light & WAVE_BIT, 0, "a top-face vertex waves");
+        let corner_x = positions[i * 3].round() as i32;
+        let corner_z = positions[i * 3 + 2].round() as i32;
+        // Columns around the corner point (cx, cz) are x in {cx-1, cx} and
+        // z in {cz-1, cz}; a column is over the pit when x <= 0 and z <= 0.
+        let mut pit_columns = 0;
+        for x in [corner_x - 1, corner_x] {
+            for z in [corner_z - 1, corner_z] {
+                if x <= 0 && z <= 0 {
+                    pit_columns += 1;
+                }
+            }
+        }
+        let expected_blocks = pit_columns as f32 / 4.0;
+        let code = ((light >> STACK_INDEX_SHIFT) & STACK_FIELD_BITS) as f32;
+        assert_eq!(
+            code,
+            (expected_blocks * units).round(),
+            "corner ({corner_x}, {corner_z}) over {pit_columns} pit column(s) carries their mean depth",
+        );
+    }
+
+    // The corner every one of the four pit columns shares reads a full
+    // block; the corner three shelf columns share reads a quarter.
+    let code_at = |cx: i32, cz: i32| -> Option<i32> {
+        lights.iter().enumerate().find_map(|(i, light)| {
+            (positions[i * 3].round() as i32 == cx && positions[i * 3 + 2].round() as i32 == cz)
+                .then(|| (light >> STACK_INDEX_SHIFT) & STACK_FIELD_BITS)
+        })
+    };
+    assert_eq!(code_at(0, 0), Some(units as i32));
+    assert_eq!(code_at(1, 1), Some(1));
+
+    // The same corner from the neighbouring face packs the same depth.
+    let beside = create_fluid_faces(1, 1, 0, WATER_ID, &space, &water.faces, &registry);
+    let beside_top = beside.iter().find(|f| f.name == "py").expect("a top face");
+    let (beside_positions, beside_lights) =
+        mesh_single_face_data_at([1, 1, 0], &water, beside_top, &registry, &space);
+    let beside_code_at = |cx: i32, cz: i32| -> Option<i32> {
+        beside_lights.iter().enumerate().find_map(|(i, light)| {
+            (beside_positions[i * 3].round() as i32 == cx
+                && beside_positions[i * 3 + 2].round() as i32 == cz)
+                .then(|| (light >> STACK_INDEX_SHIFT) & STACK_FIELD_BITS)
+        })
+    };
+    assert_eq!(
+        beside_code_at(1, 0),
+        code_at(1, 0),
+        "a shared corner packs one depth"
+    );
+    assert_eq!(
+        beside_code_at(1, 1),
+        code_at(1, 1),
+        "a shared corner packs one depth"
+    );
+}
+
+/// A dense 32x32 column of sea over a sloping stone bed, one voxel of
+/// margin all round, for timing the mesher on the worst case the surface
+/// walks meet: every top-level voxel is a water surface with four corners
+/// to read, and every column is deep.
+struct OceanSpace {
+    size: i32,
+    height: i32,
+    sea_level: i32,
+    voxels: Vec<u32>,
+    stone_id: u32,
+    water_id: u32,
+}
+
+impl OceanSpace {
+    fn new(size: i32, height: i32, sea_level: i32, stone_id: u32, water_id: u32) -> Self {
+        let span = size + 2;
+        let mut voxels = vec![0u32; (span * height * span) as usize];
+        for x in -1..=size {
+            for z in -1..=size {
+                // Bed falls from one block under the surface at the west edge
+                // to eight blocks under it at the east, in whole steps.
+                let bed = sea_level - 1 - ((x + 1) * 8 / (size + 2)).clamp(0, 7);
+                for y in 0..height {
+                    // `water_id == 0` drains the sea: the same bed under air.
+                    let id = if y <= bed {
+                        stone_id
+                    } else if y <= sea_level {
+                        water_id
+                    } else {
+                        0
+                    };
+                    let i = (((x + 1) * height + y) * span + (z + 1)) as usize;
+                    voxels[i] = id;
+                }
+            }
+        }
+        Self {
+            size,
+            height,
+            sea_level,
+            voxels,
+            stone_id,
+            water_id,
+        }
+    }
+
+    /// Raise the bed to one flat level everywhere, keeping the sea above it.
+    fn with_flat_bed(mut self, bed: i32) -> Self {
+        let span = self.size + 2;
+        for x in -1..=self.size {
+            for z in -1..=self.size {
+                for y in 0..self.height {
+                    let id = if y <= bed {
+                        self.stone_id
+                    } else if y <= self.sea_level {
+                        self.water_id
+                    } else {
+                        0
+                    };
+                    self.voxels[(((x + 1) * self.height + y) * span + (z + 1)) as usize] = id;
+                }
+            }
+        }
+        self
+    }
+}
+
+impl VoxelAccess for OceanSpace {
+    fn get_voxel(&self, vx: i32, vy: i32, vz: i32) -> u32 {
+        if !self.contains(vx, vy, vz) {
+            return 0;
+        }
+        let span = self.size + 2;
+        self.voxels[(((vx + 1) * self.height + vy) * span + (vz + 1)) as usize]
+    }
+
+    fn get_raw_voxel(&self, vx: i32, vy: i32, vz: i32) -> u32 {
+        self.get_voxel(vx, vy, vz)
+    }
+
+    fn get_voxel_rotation(&self, _vx: i32, _vy: i32, _vz: i32) -> BlockRotation {
+        BlockRotation::PY(0.0)
+    }
+
+    fn get_voxel_stage(&self, _vx: i32, _vy: i32, _vz: i32) -> u32 {
+        0
+    }
+
+    fn get_voxel_waterlogged(&self, _vx: i32, _vy: i32, _vz: i32) -> bool {
+        false
+    }
+
+    fn get_voxel_fluid_level(&self, _vx: i32, _vy: i32, _vz: i32) -> u32 {
+        0
+    }
+
+    fn get_sunlight(&self, _vx: i32, vy: i32, _vz: i32) -> u32 {
+        if vy > self.sea_level {
+            15
+        } else {
+            (15 - (self.sea_level - vy)).max(0) as u32
+        }
+    }
+
+    fn get_torch_light(&self, _vx: i32, _vy: i32, _vz: i32, _color: LightColor) -> u32 {
+        0
+    }
+
+    fn get_all_lights(&self, vx: i32, vy: i32, vz: i32) -> (u32, u32, u32, u32) {
+        (self.get_sunlight(vx, vy, vz), 0, 0, 0)
+    }
+
+    fn get_max_height(&self, _vx: i32, _vz: i32) -> u32 {
+        (self.sea_level + 1) as u32
+    }
+
+    fn contains(&self, vx: i32, vy: i32, vz: i32) -> bool {
+        vx >= -1 && vx <= self.size && vz >= -1 && vz <= self.size && vy >= 0 && vy < self.height
+    }
+}
+
+fn ocean_registry(stone_id: u32, water_id: u32) -> (Registry, Block, Block) {
+    let air = Block {
+        is_empty: true,
+        aabbs: vec![],
+        ..plain_block(0, "Air")
+    };
+    let stone = Block {
+        is_opaque: true,
+        faces: six_faces(),
+        ..plain_block(stone_id, "Stone")
+    };
+    let water = Block {
+        is_fluid: true,
+        is_waterlogging_fluid: true,
+        is_see_through: true,
+        is_transparent: [true; 6],
+        faces: six_faces(),
+        ..plain_block(water_id, "Water")
+    };
+    let mut registry = Registry::new(vec![
+        (0, air),
+        (stone_id, stone.clone()),
+        (water_id, water.clone()),
+    ]);
+    registry.build_cache();
+    (registry, stone, water)
+}
+
+/// Timing, not a test: how long a 32x32 sea chunk takes to mesh, and how
+/// the two per-corner surface walks (flow, depth) split that. Run with
+/// `cargo test -p voxelize-mesher --release -- --ignored --nocapture
+/// bench_ocean`. Prints; asserts nothing, because a threshold would fail on
+/// a loaded machine and pass on an idle one without telling anyone anything.
+#[test]
+#[ignore]
+fn bench_ocean_chunk_meshing() {
+    const STONE_ID: u32 = 1;
+    const WATER_ID: u32 = 2;
+    let (registry, _stone, water) = ocean_registry(STONE_ID, WATER_ID);
+    let space = OceanSpace::new(32, 72, 63, STONE_ID, WATER_ID);
+    let min = [0, 0, 0];
+    let max = [32, 72, 32];
+
+    let time_mesh = |label: &str, space: &OceanSpace| {
+        let _ = mesh_space_greedy(&min, &max, space, &registry);
+        let rounds = 20;
+        let started = std::time::Instant::now();
+        let mut faces = 0usize;
+        for _ in 0..rounds {
+            let geometries = mesh_space_greedy(&min, &max, space, &registry);
+            faces += geometries
+                .iter()
+                .map(|g| g.indices.len() / 6)
+                .sum::<usize>();
+        }
+        println!(
+            "{label}: {:?} per mesh, {} faces",
+            started.elapsed() / rounds,
+            faces / rounds as usize
+        );
+    };
+    time_mesh("ocean chunk 32x32, sea up to 8 deep", &space);
+    time_mesh(
+        "same bed drained (air over stone)",
+        &OceanSpace::new(32, 72, 63, STONE_ID, 0),
+    );
+    time_mesh(
+        "sea one block deep over a flat bed",
+        &OceanSpace::new(32, 72, 63, STONE_ID, WATER_ID).with_flat_bed(62),
+    );
+
+    // The corner walks in isolation, over every surface corner in the chunk.
+    let rounds = 20u32;
+    let corners: Vec<(i32, i32)> = (0..=32)
+        .flat_map(|x| (0..=32).map(move |z| (x, z)))
+        .collect();
+    let started = std::time::Instant::now();
+    let mut acc = 0.0f32;
+    for _ in 0..rounds {
+        for &(cx, cz) in &corners {
+            acc += surface_depth_at_corner(cx, 63, cz, WATER_ID, &registry, &space);
+        }
+    }
+    let depth_per_corner = started.elapsed() / (rounds * corners.len() as u32);
+    let started = std::time::Instant::now();
+    let mut flows = 0usize;
+    for _ in 0..rounds {
+        for &(cx, cz) in &corners {
+            flows += surface_flow_at_corner(
+                cx,
+                63,
+                cz,
+                WATER_ID,
+                water.is_waterlogging_fluid,
+                &space,
+                &registry,
+            )
+            .is_some() as usize;
+        }
+    }
+    let flow_per_corner = started.elapsed() / (rounds * corners.len() as u32);
+    println!(
+        "per surface corner: depth {:?}, flow {:?} (checksums {acc:.1} {flows})",
+        depth_per_corner, flow_per_corner
+    );
+    println!(
+        "per chunk of 1024 surface faces x 4 corners: depth {:?}, flow {:?}",
+        depth_per_corner * 4096,
+        flow_per_corner * 4096
+    );
+}
+
+/// A sparse world: any voxel not listed is air.
+struct SparseSpace {
+    voxels: HashMap<(i32, i32, i32), (u32, u32)>,
+    rotation: BlockRotation,
+}
+
+impl SparseSpace {
+    fn new(voxels: &[((i32, i32, i32), (u32, u32))]) -> Self {
+        Self {
+            voxels: voxels.iter().copied().collect(),
+            rotation: BlockRotation::default(),
+        }
+    }
+}
+
+impl VoxelAccess for SparseSpace {
+    fn get_voxel(&self, vx: i32, vy: i32, vz: i32) -> u32 {
+        self.voxels.get(&(vx, vy, vz)).map_or(0, |(id, _)| *id)
+    }
+
+    fn get_raw_voxel(&self, vx: i32, vy: i32, vz: i32) -> u32 {
+        self.get_voxel(vx, vy, vz)
+    }
+
+    fn get_voxel_rotation(&self, _vx: i32, _vy: i32, _vz: i32) -> BlockRotation {
+        self.rotation.clone()
+    }
+
+    fn get_voxel_stage(&self, _vx: i32, _vy: i32, _vz: i32) -> u32 {
+        0
+    }
+
+    fn get_voxel_waterlogged(&self, _vx: i32, _vy: i32, _vz: i32) -> bool {
+        false
+    }
+
+    fn get_voxel_fluid_level(&self, vx: i32, vy: i32, vz: i32) -> u32 {
+        self.voxels
+            .get(&(vx, vy, vz))
+            .map_or(0, |(_, level)| *level)
+    }
+
+    fn get_sunlight(&self, _vx: i32, _vy: i32, _vz: i32) -> u32 {
+        15
+    }
+
+    fn get_torch_light(&self, _vx: i32, _vy: i32, _vz: i32, _color: LightColor) -> u32 {
+        0
+    }
+
+    fn get_all_lights(&self, _vx: i32, _vy: i32, _vz: i32) -> (u32, u32, u32, u32) {
+        (15, 0, 0, 0)
+    }
+
+    fn get_max_height(&self, _vx: i32, _vz: i32) -> u32 {
+        4
+    }
+
+    fn contains(&self, vx: i32, vy: i32, vz: i32) -> bool {
+        vx.abs() <= 2 && vz.abs() <= 2 && (-1..=3).contains(&vy)
+    }
+}
+
+/// The `+x +z` corner of the water surface at the origin, exactly as meshed:
+/// a partial corner sits `FLUID_SURFACE_OFFSET` under its computed height, a
+/// full corner on the voxel boundary unless a ceiling occupies it.
+fn water_pxpz_corner_height(space: &SparseSpace, water: &Block, registry: &Registry) -> f32 {
+    let faces = create_fluid_faces(0, 0, 0, water.id, space, &water.faces, registry);
+    let top = faces
+        .iter()
+        .find(|face| face.name == "py")
+        .expect("fluid meshing emits a top face");
+    let corner = top
+        .corners
+        .iter()
+        .find(|corner| corner.pos[0] == 1.0 && corner.pos[2] == 1.0)
+        .expect("the top face has a +x +z corner");
+    corner.pos[1]
+}
+
+/// A partial corner as meshed: its computed height less the surface offset.
+fn resting(height: f32) -> f32 {
+    height - fluid::FLUID_SURFACE_OFFSET
+}
+
+/// The diagonal voxel across a corner only shares a vertical edge with this
+/// one; the surface reaches it through one of the two side voxels. With
+/// both sides solid the diagonal is walled off, and its water must not be
+/// read through the wall — that dragged a still pond's corner down toward a
+/// lower-stage pool on the far side of two placed planks, and pulled it up
+/// to a full block when a deeper pool stood there.
+#[test]
+fn a_fluid_corner_ignores_the_diagonal_walled_off_by_two_solid_sides() {
+    const WATER_ID: u32 = 2;
+    const PLANKS_ID: u32 = 3;
+
+    let air = Block {
+        is_empty: true,
+        aabbs: vec![],
+        ..plain_block(0, "Air")
+    };
+    let water = Block {
+        is_fluid: true,
+        is_waterlogging_fluid: true,
+        is_see_through: true,
+        is_transparent: [true; 6],
+        faces: six_faces(),
+        ..plain_block(WATER_ID, "Water")
+    };
+    let planks = Block {
+        is_opaque: true,
+        ..plain_block(PLANKS_ID, "Planks")
+    };
+
+    let mut registry = Registry::new(vec![
+        (0, air),
+        (WATER_ID, water.clone()),
+        (PLANKS_ID, planks),
+    ]);
+    registry.build_cache();
+
+    let source = fluid::get_fluid_effective_height(0);
+    let shallow_stage = 3;
+    let shallow = fluid::get_fluid_effective_height(shallow_stage);
+    assert!(
+        shallow < source,
+        "the far pool has to sit lower for the pull to show"
+    );
+
+    let walled_off = SparseSpace::new(&[
+        ((0, 0, 0), (WATER_ID, 0)),
+        ((1, 0, 0), (PLANKS_ID, 0)),
+        ((0, 0, 1), (PLANKS_ID, 0)),
+        ((1, 0, 1), (WATER_ID, shallow_stage)),
+    ]);
+    assert!(
+        (water_pxpz_corner_height(&walled_off, &water, &registry) - resting(source)).abs() < 1e-5,
+        "two solid sides wall the diagonal off: the corner keeps this voxel's own height",
+    );
+
+    let deep_beyond = SparseSpace::new(&[
+        ((0, 0, 0), (WATER_ID, 0)),
+        ((1, 0, 0), (PLANKS_ID, 0)),
+        ((0, 0, 1), (PLANKS_ID, 0)),
+        ((1, 0, 1), (WATER_ID, 0)),
+        ((1, 1, 1), (WATER_ID, 0)),
+    ]);
+    assert!(
+        (water_pxpz_corner_height(&deep_beyond, &water, &registry) - resting(source)).abs() < 1e-5,
+        "a deeper pool past two solid sides must not hoist the corner to a full block",
+    );
+
+    let one_side_open = SparseSpace::new(&[
+        ((0, 0, 0), (WATER_ID, 0)),
+        ((1, 0, 0), (PLANKS_ID, 0)),
+        ((1, 0, 1), (WATER_ID, shallow_stage)),
+    ]);
+    assert!(
+        (water_pxpz_corner_height(&one_side_open, &water, &registry)
+            - resting((source + shallow) / 2.0))
+        .abs()
+            < 1e-5,
+        "with a side open the diagonal is reachable and still averages in",
+    );
+
+    let spill_over_a_side = SparseSpace::new(&[
+        ((0, 0, 0), (WATER_ID, 0)),
+        ((1, 0, 0), (PLANKS_ID, 0)),
+        ((1, 1, 0), (WATER_ID, 0)),
+        ((0, 0, 1), (PLANKS_ID, 0)),
+    ]);
+    assert!(
+        (water_pxpz_corner_height(&spill_over_a_side, &water, &registry) - 1.0).abs() < 1e-5,
+        "water standing on a side neighbour still spills onto the corner",
+    );
+}
+
+/// The wall of a block pouring onto a lower sheet starts on its voxel floor,
+/// and the base of a block stacked on another sits there too. A full corner
+/// is welded to that plane, so it must be meshed exactly on it: lowering it
+/// by the surface offset opened a slit along every riser of a cascade and
+/// every block seam of a falling column. Only a solid ceiling on that plane,
+/// which a coplanar surface would z-fight, keeps the offset.
+#[test]
+fn a_full_corner_meets_the_wall_pouring_onto_it_unless_a_ceiling_takes_the_plane() {
+    const WATER_ID: u32 = 2;
+    const PLANKS_ID: u32 = 3;
+
+    let air = Block {
+        is_empty: true,
+        aabbs: vec![],
+        ..plain_block(0, "Air")
+    };
+    let water = Block {
+        is_fluid: true,
+        is_waterlogging_fluid: true,
+        is_see_through: true,
+        is_transparent: [true; 6],
+        faces: six_faces(),
+        ..plain_block(WATER_ID, "Water")
+    };
+    let planks = Block {
+        is_opaque: true,
+        ..plain_block(PLANKS_ID, "Planks")
+    };
+
+    let mut registry = Registry::new(vec![
+        (0, air),
+        (WATER_ID, water.clone()),
+        (PLANKS_ID, planks),
+    ]);
+    registry.build_cache();
+
+    // A step: the lower sheet at the origin, a riser at +x with water on it.
+    let cascade_step = SparseSpace::new(&[
+        ((0, 0, 0), (WATER_ID, 2)),
+        ((1, 0, 0), (PLANKS_ID, 0)),
+        ((1, 1, 0), (WATER_ID, 1)),
+    ]);
+    let lower_faces = create_fluid_faces(0, 0, 0, WATER_ID, &cascade_step, &water.faces, &registry);
+    let lower_top = lower_faces
+        .iter()
+        .find(|face| face.name == "py")
+        .expect("the lower sheet has a top face");
+    let spill_corners: Vec<f32> = lower_top
+        .corners
+        .iter()
+        .filter(|corner| corner.pos[0] == 1.0)
+        .map(|corner| corner.pos[1])
+        .collect();
+    assert_eq!(
+        spill_corners.len(),
+        2,
+        "the lower sheet has two corners against the riser"
+    );
+    for height in &spill_corners {
+        assert!(
+            (height - 1.0).abs() < 1e-6,
+            "a spill corner under open air sits exactly on the voxel boundary, got {height}"
+        );
+    }
+
+    let upper_faces = create_fluid_faces(1, 1, 0, WATER_ID, &cascade_step, &water.faces, &registry);
+    let upper_wall = upper_faces
+        .iter()
+        .find(|face| face.name == "nx")
+        .expect("the pouring block has a wall toward the lower sheet");
+    // Local to (1, 1, 0): its floor is world y = 1, the lower sheet's boundary.
+    assert_eq!(
+        upper_wall
+            .corners
+            .iter()
+            .filter(|corner| corner.pos[1] == 0.0)
+            .count(),
+        2,
+        "the pouring wall's bottom edge sits on its voxel floor"
+    );
+
+    // The same corner under a ceiling keeps the offset off the ceiling plane.
+    let under_a_ceiling = SparseSpace::new(&[
+        ((0, 0, 0), (WATER_ID, 2)),
+        ((0, 1, 0), (PLANKS_ID, 0)),
+        ((1, 0, 0), (PLANKS_ID, 0)),
+        ((1, 1, 0), (WATER_ID, 1)),
+    ]);
+    assert!(
+        (water_pxpz_corner_height(&under_a_ceiling, &water, &registry) - resting(1.0)).abs() < 1e-6,
+        "a full corner under a solid ceiling stays the surface offset below its plane",
+    );
+
+    // Fluid stacked on fluid: the lower block's walls reach the upper's base.
+    let stacked = SparseSpace::new(&[((0, 0, 0), (WATER_ID, 0)), ((0, 1, 0), (WATER_ID, 0))]);
+    let stacked_faces = create_fluid_faces(0, 0, 0, WATER_ID, &stacked, &water.faces, &registry);
+    let stacked_wall = stacked_faces
+        .iter()
+        .find(|face| face.name == "px")
+        .expect("the stacked block has side walls");
+    for corner in stacked_wall
+        .corners
+        .iter()
+        .filter(|corner| corner.pos[1] > 0.5)
+    {
+        assert!(
+            (corner.pos[1] - 1.0).abs() < 1e-6,
+            "a wall under stacked fluid reaches the voxel boundary, got {}",
+            corner.pos[1]
+        );
+    }
+}
+
+/// Still water pressed against a solid roof fills its voxel: no surface at
+/// the resting height, which drew a slab of air under every flooded cave
+/// roof where the game counts the voxel as water. An open sheet beside it
+/// rises to the roof's edge rather than leaving a slit under it, without
+/// reading that rise as a current. Flowing water under a roof is a shallow
+/// sheet and keeps its surface, and a block that leaves the plane open
+/// seals nothing.
+#[test]
+fn still_water_sealed_under_a_roof_fills_its_voxel() {
+    const STONE_ID: u32 = 1;
+    const WATER_ID: u32 = 2;
+    const SLAB_ID: u32 = 3;
+    let (registry, _stone, water) = ocean_registry(STONE_ID, WATER_ID);
+    let slab = Block {
+        is_opaque: true,
+        faces: six_faces(),
+        aabbs: vec![AABB {
+            min_x: 0.0,
+            min_y: 0.5,
+            min_z: 0.0,
+            max_x: 1.0,
+            max_y: 1.0,
+            max_z: 1.0,
+        }],
+        ..plain_block(SLAB_ID, "Upper Half")
+    };
+    let mut registry = Registry::new(vec![
+        (0, registry.get_block_by_id(0).unwrap().clone()),
+        (STONE_ID, registry.get_block_by_id(STONE_ID).unwrap().clone()),
+        (WATER_ID, water.clone()),
+        (SLAB_ID, slab),
+    ]);
+    registry.build_cache();
+
+    // The water voxel at the origin as the chunk mesher draws it.
+    let water_positions = |space: &SparseSpace| -> Vec<[f32; 3]> {
+        mesh_space_greedy(&[0, 0, 0], &[1, 1, 1], space, &registry)
+            .iter()
+            .filter(|g| g.voxel == WATER_ID)
+            .flat_map(|g| g.positions.chunks(3).map(|p| [p[0], p[1], p[2]]))
+            .collect()
+    };
+    // Every wall and the floor has a corner on the voxel floor (the floor
+    // inset a hair above it); only the surface lies wholly above it.
+    let has_surface = |positions: &[[f32; 3]]| {
+        positions
+            .chunks(4)
+            .any(|quad| quad.iter().all(|p| p[1] > 0.01))
+    };
+
+    let sealed = SparseSpace::new(&[((0, 0, 0), (WATER_ID, 0)), ((0, 1, 0), (STONE_ID, 0))]);
+    let positions = water_positions(&sealed);
+    assert!(!positions.is_empty(), "the sealed voxel still draws its walls");
+    assert!(
+        !has_surface(&positions),
+        "still water under a roof draws no surface: {positions:?}"
+    );
+    let top = positions.iter().map(|p| p[1]).fold(f32::MIN, f32::max);
+    assert!(
+        (top - 1.0).abs() < 1e-6,
+        "its walls reach the roof, got {top}"
+    );
+    let faces = create_fluid_faces(0, 0, 0, WATER_ID, &sealed, &water.faces, &registry);
+    let side = faces.iter().find(|f| f.name == "px").expect("a side face");
+    let lights = mesh_single_face(&water, side, &registry, &sealed);
+    assert!(!lights.is_empty());
+    for light in lights {
+        assert_eq!(light & WAVE_BIT, 0, "nothing waves under a roof");
+    }
+
+    let flowing = SparseSpace::new(&[((0, 0, 0), (WATER_ID, 2)), ((0, 1, 0), (STONE_ID, 0))]);
+    assert!(
+        has_surface(&water_positions(&flowing)),
+        "a flow under a roof keeps its lowered surface"
+    );
+
+    let under_a_top_slab =
+        SparseSpace::new(&[((0, 0, 0), (WATER_ID, 0)), ((0, 1, 0), (SLAB_ID, 0))]);
+    assert!(
+        has_surface(&water_positions(&under_a_top_slab)),
+        "a block that leaves the plane open seals nothing"
+    );
+
+    // An open sheet at the origin, the voxel beside it at +x sealed, both in
+    // a stone channel so no corner spills over an edge.
+    let mut channel = vec![
+        ((0, 0, 0), (WATER_ID, 0)),
+        ((1, 0, 0), (WATER_ID, 0)),
+        ((1, 1, 0), (STONE_ID, 0)),
+        ((-1, 0, 0), (STONE_ID, 0)),
+    ];
+    for x in -1..=2 {
+        channel.push(((x, 0, -1), (STONE_ID, 0)));
+        channel.push(((x, 0, 1), (STONE_ID, 0)));
+    }
+    let beside_a_roof = SparseSpace::new(&channel);
+    let faces = create_fluid_faces(0, 0, 0, WATER_ID, &beside_a_roof, &water.faces, &registry);
+    let top = faces.iter().find(|f| f.name == "py").expect("a top face");
+    for corner in &top.corners {
+        let expected = if corner.pos[0] == 1.0 {
+            1.0
+        } else {
+            resting(fluid::get_fluid_effective_height(0))
+        };
+        assert!(
+            (corner.pos[1] - expected).abs() < 1e-6,
+            "corner at x={} should sit at {expected}, got {}",
+            corner.pos[0],
+            corner.pos[1]
+        );
+    }
+    for cx in 0..=1 {
+        for cz in 0..=1 {
+            assert_eq!(
+                surface_flow_at_corner(cx, 0, cz, WATER_ID, true, &beside_a_roof, &registry),
+                None,
+                "the rise to the roof is no current at ({cx}, {cz})"
+            );
+        }
+    }
+}
+
+/// A voxel whose stage holds its block's stage-face bits wears the stage
+/// faces, on the greedy path and off it: three cubes in a row with the
+/// middle one flowering mesh as three columns of quads, the middle one in
+/// the other slot of the atlas; with no bit (or a bit the mask does not
+/// name) they merge in their own look.
+#[test]
+fn a_voxel_wears_its_stage_faces_where_its_stage_says() {
+    struct StagedSpace([u32; 3]);
+    impl VoxelAccess for StagedSpace {
+        fn get_voxel(&self, x: i32, y: i32, z: i32) -> u32 {
+            u32::from((0..=2).contains(&x) && y == 0 && z == 0)
+        }
+        fn get_raw_voxel(&self, x: i32, y: i32, z: i32) -> u32 {
+            self.get_voxel(x, y, z)
+        }
+        fn get_voxel_rotation(&self, _: i32, _: i32, _: i32) -> BlockRotation {
+            BlockRotation::PY(0.0)
+        }
+        fn get_voxel_stage(&self, x: i32, _: i32, _: i32) -> u32 {
+            self.0[x.clamp(0, 2) as usize]
+        }
+        fn get_voxel_waterlogged(&self, _: i32, _: i32, _: i32) -> bool {
+            false
+        }
+        fn get_voxel_fluid_level(&self, _: i32, _: i32, _: i32) -> u32 {
+            0
+        }
+        fn get_sunlight(&self, _: i32, _: i32, _: i32) -> u32 {
+            15
+        }
+        fn get_torch_light(&self, _: i32, _: i32, _: i32, _: LightColor) -> u32 {
+            0
+        }
+        fn get_all_lights(&self, _: i32, _: i32, _: i32) -> (u32, u32, u32, u32) {
+            (15, 0, 0, 0)
+        }
+        fn get_max_height(&self, _: i32, _: i32) -> u32 {
+            1
+        }
+        fn contains(&self, x: i32, y: i32, z: i32) -> bool {
+            (-1..=3).contains(&x) && (-1..=1).contains(&y) && (-1..=1).contains(&z)
+        }
+    }
+    let slot = |start_u: f32| UV {
+        start_u,
+        end_u: start_u + 0.5,
+        start_v: 0.0,
+        end_v: 0.5,
+    };
+    // The per-voxel path draws a face from its corners, so the top one gets
+    // them; the greedy path draws every face from its direction alone.
+    let top = [
+        ([0.0, 1.0, 1.0], [0.0, 1.0]),
+        ([1.0, 1.0, 1.0], [1.0, 1.0]),
+        ([0.0, 1.0, 0.0], [0.0, 0.0]),
+        ([1.0, 1.0, 0.0], [1.0, 0.0]),
+    ]
+    .map(|(pos, uv)| CornerData { pos, uv });
+    let with_range = |range: UV| {
+        six_faces()
+            .into_iter()
+            .map(|face| BlockFace {
+                range: range.clone(),
+                corners: if face.dir == [0, 1, 0] {
+                    top.clone()
+                } else {
+                    face.corners
+                },
+                ..face
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut cube = plain_block(1, "Flowering cube");
+    cube.is_opaque = true;
+    cube.faces = with_range(slot(0.0));
+    cube.stage_faces = Some(StageFaces {
+        mask: 0b0001,
+        faces: with_range(slot(0.5)),
+    });
+    let air = Block {
+        is_empty: true,
+        aabbs: vec![],
+        ..plain_block(0, "Air")
+    };
+    // Each quad's lowest u, keyed by the voxel it lies over; a face across
+    // x lies between two voxels, so it is keyed -1.
+    let mesh = |registry: &Registry, stages: [u32; 3]| -> Vec<(i32, f32)> {
+        mesh_space_greedy(&[0, 0, 0], &[3, 1, 1], &StagedSpace(stages), registry)
+            .iter()
+            .flat_map(|g| {
+                g.positions
+                    .chunks_exact(12)
+                    .zip(g.uvs.chunks_exact(8))
+                    .map(|(quad, uvs)| {
+                        let xs = (0..4).map(|v| quad[v * 3]);
+                        let (lo, hi) =
+                            xs.fold((f32::MAX, f32::MIN), |(lo, hi), x| (lo.min(x), hi.max(x)));
+                        let u = (0..4).map(|v| uvs[v * 2]).fold(f32::MAX, f32::min);
+                        let over = if hi - lo < 0.5 {
+                            -1
+                        } else {
+                            ((lo + hi) / 2.0).floor() as i32
+                        };
+                        (over, u)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
+    for non_greedy in [false, true] {
+        let mut cube = cube.clone();
+        if non_greedy {
+            // A dynamic block meshes face by face, off the greedy path.
+            cube.is_animated = true;
+        }
+        let mut registry = Registry::new(vec![(0, air.clone()), (1, cube)]);
+        registry.build_cache();
+        let path = if non_greedy { "per voxel" } else { "greedy" };
+
+        let plain = mesh(&registry, [0, 0, 0]);
+        assert!(
+            plain.iter().all(|&(_, u)| u < 0.5),
+            "{path}: unflowered cubes wear their own faces"
+        );
+        assert_eq!(
+            mesh(&registry, [8, 8, 8]).len(),
+            plain.len(),
+            "{path}: a bit the mask does not name changes nothing"
+        );
+        if !non_greedy {
+            assert_eq!(plain.len(), 6, "a plain row merges into one box");
+        }
+
+        let flowering = mesh(&registry, [0, 1, 0]);
+        if !non_greedy {
+            assert_eq!(
+                flowering.len(),
+                14,
+                "the flowering cube splits the row's four long sides in three"
+            );
+        }
+        for &(x, u) in flowering.iter().filter(|(x, _)| *x >= 0) {
+            let wears_stage = u >= 0.5;
+            assert_eq!(
+                wears_stage,
+                x == 1,
+                "{path}: a quad over voxel {x} samples u {u}"
+            );
+        }
+        assert!(
+            flowering.iter().any(|&(x, u)| x == 1 && u >= 0.5),
+            "{path}: the flowering cube shows its stage faces: {flowering:?}"
+        );
+    }
+}
+
+/// A tinted voxel packs its colour-table entry under the pigment code on both mesh paths:
+/// two neighbours in different colours stay two quads, the same colour
+/// merges, and an untinted voxel carries no tag at all.
+#[test]
+fn a_tinted_voxel_packs_its_table_entry_and_never_merges_across_colours() {
+    struct TintedSpace([u32; 2]);
+    impl VoxelAccess for TintedSpace {
+        fn get_voxel(&self, x: i32, y: i32, z: i32) -> u32 {
+            if (0..=1).contains(&x) && y == 0 && z == 0 {
+                1
+            } else {
+                0
+            }
+        }
+        fn get_raw_voxel(&self, x: i32, y: i32, z: i32) -> u32 {
+            self.get_voxel(x, y, z)
+        }
+        fn get_voxel_rotation(&self, _: i32, _: i32, _: i32) -> BlockRotation {
+            BlockRotation::PY(0.0)
+        }
+        fn get_voxel_stage(&self, x: i32, _: i32, _: i32) -> u32 {
+            self.0[x.clamp(0, 1) as usize]
+        }
+        fn get_voxel_waterlogged(&self, _: i32, _: i32, _: i32) -> bool {
+            false
+        }
+        fn get_voxel_fluid_level(&self, _: i32, _: i32, _: i32) -> u32 {
+            0
+        }
+        fn get_sunlight(&self, _: i32, _: i32, _: i32) -> u32 {
+            15
+        }
+        fn get_torch_light(&self, _: i32, _: i32, _: i32, _: LightColor) -> u32 {
+            0
+        }
+        fn get_all_lights(&self, _: i32, _: i32, _: i32) -> (u32, u32, u32, u32) {
+            (15, 0, 0, 0)
+        }
+        fn get_max_height(&self, _: i32, _: i32) -> u32 {
+            1
+        }
+        fn contains(&self, x: i32, y: i32, z: i32) -> bool {
+            (-1..=2).contains(&x) && (-1..=1).contains(&y) && (-1..=1).contains(&z)
+        }
+    }
+    let mut slab = plain_block(1, "Tinted slab");
+    slab.is_opaque = true;
+    slab.faces = six_faces();
+    for face in &mut slab.faces {
+        face.pigment_mask = 15;
+    }
+    let air = Block {
+        is_empty: true,
+        aabbs: vec![],
+        ..plain_block(0, "Air")
+    };
+    let mut registry = Registry::new(vec![(0, air), (1, slab.clone())]);
+    registry.build_cache();
+    // Two cubes side by side: unmerged they show ten quads (the face between
+    // them is culled), merged along x they show six.
+    let quads = |space: &TintedSpace| -> (usize, std::collections::HashSet<Option<u32>>) {
+        let meshes = mesh_space_greedy(&[0, 0, 0], &[2, 1, 1], space, &registry);
+        let pigments = meshes
+            .iter()
+            .flat_map(|g| g.lights.iter())
+            .map(|&bits| pigment_of(bits))
+            .collect();
+        let quads = meshes.iter().map(|m| m.indices.len()).sum::<usize>() / 6;
+        (quads, pigments)
+    };
+
+    let (count, pigments) = quads(&TintedSpace([6, 13]));
+    assert_eq!(count, 10, "two colours must never share a quad");
+    assert_eq!(pigments, std::collections::HashSet::from([Some(6), Some(13)]));
+
+    let (count, pigments) = quads(&TintedSpace([9, 9]));
+    assert_eq!(count, 6, "one colour merges like any other face");
+    assert_eq!(pigments, std::collections::HashSet::from([Some(9)]));
+
+    let (count, pigments) = quads(&TintedSpace([0, 0]));
+    assert_eq!(count, 6);
+    assert_eq!(pigments, std::collections::HashSet::from([None]));
+
+    let top_face = slab.faces.iter().find(|f| f.name == "py").unwrap();
+    for bits in mesh_single_face(&slab, top_face, &registry, &TintedSpace([6, 13])) {
+        assert_eq!(pigment_of(bits), Some(6));
+        assert_eq!((bits >> STACK_COUNT_SHIFT) & 15, PIGMENT_CODE);
+    }
+}
+
+/// Same block/material, two climates. The packed bits survive both mesh
+/// paths and prevent greedy merging across differently colored columns.
+#[test]
+fn stage_palette_preserves_decay_bits_and_greedy_boundaries() {
+    struct TintedSpace;
+    impl VoxelAccess for TintedSpace {
+        fn get_voxel(&self, x: i32, y: i32, z: i32) -> u32 {
+            if (0..=1).contains(&x) && y == 0 && z == 0 {
+                1
+            } else {
+                0
+            }
+        }
+        fn get_raw_voxel(&self, x: i32, y: i32, z: i32) -> u32 {
+            self.get_voxel(x, y, z)
+        }
+        fn get_voxel_rotation(&self, _: i32, _: i32, _: i32) -> BlockRotation {
+            BlockRotation::PY(0.0)
+        }
+        fn get_voxel_stage(&self, x: i32, _: i32, _: i32) -> u32 {
+            if x == 0 {
+                6
+            } else {
+                13
+            }
+        }
+        fn get_voxel_waterlogged(&self, _: i32, _: i32, _: i32) -> bool {
+            false
+        }
+        fn get_voxel_fluid_level(&self, _: i32, _: i32, _: i32) -> u32 {
+            0
+        }
+        fn get_sunlight(&self, _: i32, _: i32, _: i32) -> u32 {
+            15
+        }
+        fn get_torch_light(&self, _: i32, _: i32, _: i32, _: LightColor) -> u32 {
+            0
+        }
+        fn get_all_lights(&self, _: i32, _: i32, _: i32) -> (u32, u32, u32, u32) {
+            (15, 0, 0, 0)
+        }
+        fn get_max_height(&self, _: i32, _: i32) -> u32 {
+            1
+        }
+        fn contains(&self, x: i32, y: i32, z: i32) -> bool {
+            (-1..=2).contains(&x) && (-1..=1).contains(&y) && (-1..=1).contains(&z)
+        }
+    }
+    let mut leaf = plain_block(1, "Tinted leaf");
+    leaf.is_opaque = true;
+    leaf.faces = six_faces();
+    for face in &mut leaf.faces {
+        face.stage_tint_mask = 12;
+    }
+    let air = Block {
+        is_empty: true,
+        aabbs: vec![],
+        ..plain_block(0, "Air")
+    };
+    let mut registry = Registry::new(vec![(0, air), (1, leaf.clone())]);
+    registry.build_cache();
+    let meshes = mesh_space_greedy(&[0, 0, 0], &[2, 1, 1], &TintedSpace, &registry);
+    let codes: std::collections::HashSet<_> = meshes
+        .iter()
+        .flat_map(|g| g.lights.iter())
+        .map(|&bits| {
+            assert!(bits < 0);
+            assert_eq!(bits & LIGHT_MASK, 0xf000);
+            let wire = i32::from_le_bytes(bits.to_le_bytes());
+            assert_eq!(wire, bits);
+            (bits >> STACK_INDEX_SHIFT) & 15
+        })
+        .collect();
+    assert_eq!(codes, std::collections::HashSet::from([4, 12]));
+    let top = leaf.faces.iter().find(|f| f.name == "py").unwrap();
+    for bits in mesh_single_face(&leaf, top, &registry, &TintedSpace) {
+        assert!(bits < 0);
+        assert_eq!((bits >> STACK_INDEX_SHIFT) & 15, 4);
+    }
+}
+
+#[test]
+fn a_non_water_fluid_keeps_its_surface_next_to_waterlogged_decoration() {
+    let air = Block {
+        is_empty: true,
+        aabbs: vec![],
+        ..plain_block(0, "Air")
+    };
+    let hot = Block {
+        is_fluid: true,
+        is_see_through: true,
+        faces: six_faces(),
+        ..plain_block(2, "Hot fluid")
+    };
+    let plant = Block {
+        is_see_through: true,
+        is_transparent: [true; 6],
+        ..plain_block(3, "Wet decoration")
+    };
+    let mut registry = Registry::new(vec![(0, air), (2, hot.clone()), (3, plant)]);
+    registry.build_cache();
+    let space = FluidColumnSpace {
+        fluid_id: 2,
+        plant_id: 3,
+        above: 1,
+        below: 0,
+        waterlogged_offset: Some(1),
+    };
+    assert!(should_render_face(
+        0,
+        0,
+        0,
+        2,
+        [0, 1, 0],
+        &hot,
+        &space,
+        &registry,
+        true,
+        true
+    ));
+    let meshes = mesh_space_greedy(&[0, 0, 0], &[1, 1, 1], &space, &registry);
+    assert!(
+        meshes
+            .iter()
+            .any(|m| m.face_name.as_deref() == Some("py") && m.indices.len() == 6),
+        "hot fluid surface vanished under unrelated waterlogging"
+    );
+}
+
+#[test]
+fn all_fluids_share_the_same_stage_slopes_across_a_chunk_seam() {
+    let air = Block {
+        is_empty: true,
+        aabbs: vec![],
+        ..plain_block(0, "Air")
+    };
+    let water = Block {
+        is_fluid: true,
+        is_waterlogging_fluid: true,
+        is_see_through: true,
+        is_transparent: [true; 6],
+        faces: six_faces(),
+        ..plain_block(2, "Water")
+    };
+    let hot = Block {
+        is_fluid: true,
+        is_see_through: true,
+        faces: six_faces(),
+        ..plain_block(4, "Hot fluid")
+    };
+    let stone = Block {
+        is_opaque: true,
+        ..plain_block(1, "Stone")
+    };
+    let mut registry = Registry::new(vec![
+        (0, air),
+        (1, stone),
+        (2, water.clone()),
+        (4, hot.clone()),
+    ]);
+    registry.build_cache();
+    let mut signatures = Vec::new();
+    for (id, b) in [(2, &water), (4, &hot)] {
+        let space = SparseSpace::new(&[
+            ((15, 3, 0), (id, 0)),
+            ((16, 3, 0), (id, 1)),
+            ((17, 3, 0), (id, 2)),
+            ((15, 2, 0), (1, 0)),
+            ((16, 2, 0), (1, 0)),
+        ]);
+        let mut geometry = Vec::new();
+        let mut shared = Vec::new();
+        for x in [15, 16] {
+            let faces = create_fluid_faces(x, 3, 0, id, &space, &b.faces, &registry);
+            let top = faces.iter().find(|f| f.name == "py").unwrap();
+            let edge: Vec<_> = top
+                .corners
+                .iter()
+                .filter(|c| (x as f32 + c.pos[0] - 16.0).abs() < 1e-5)
+                .map(|c| (c.pos[2], c.pos[1]))
+                .collect();
+            shared.push(edge);
+            geometry.push(top.corners.iter().map(|c| c.pos).collect::<Vec<_>>());
+        }
+        shared[0].sort_by(|a, b| a.0.total_cmp(&b.0));
+        shared[1].sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert_eq!(shared[0], shared[1], "fluid seam does not meet");
+        signatures.push(geometry);
+    }
+    assert_eq!(
+        signatures[0], signatures[1],
+        "fluid material changed its surface geometry"
+    );
+}
+
+#[test]
+fn a_tinted_tall_plant_keeps_its_shared_seam_and_tip() {
+    let mut lower = Block {
+        stack_group: 7,
+        ..full_block_diagonal_block()
+    };
+    for face in &mut lower.faces {
+        face.stage_tint_mask = 12;
+    }
+    let upper = Block {
+        id: 3,
+        ..lower.clone()
+    };
+    let air = Block {
+        is_empty: true,
+        aabbs: vec![],
+        ..plain_block(0, "Air")
+    };
+    let mut registry = Registry::new(vec![(0, air), (1, lower.clone()), (3, upper.clone())]);
+    registry.build_cache();
+    for tint in [4, 8, 12] {
+        let space = ColumnSpace {
+            tint: tint | 3,
+            bottom_id: 1,
+            top_id: 3,
+            is_bottom_waterlogged: false,
+        };
+        let (base_positions, base_lights) =
+            mesh_single_face_data_at_y(0, &lower, &lower.faces[0], &registry, &space);
+        let (tip_positions, tip_lights) =
+            mesh_single_face_data_at_y(1, &upper, &upper.faces[0], &registry, &space);
+        for (lights, expected) in [(&base_lights, [1, 0, 1, 0]), (&tip_lights, [2, 1, 2, 1])] {
+            for (&bits, index) in lights.iter().zip(expected) {
+                assert!(bits < 0);
+                assert_eq!((bits >> STACK_INDEX_SHIFT) & 15, tint as i32);
+                // Count two uses codes 2..4, including the upper tip.
+                assert_eq!((bits >> STACK_COUNT_SHIFT) & 15, 2 + index);
+            }
+        }
+        assert_eq!(
+            [
+                base_positions[0],
+                base_positions[2],
+                base_positions[6],
+                base_positions[8]
+            ],
+            [
+                tip_positions[3],
+                tip_positions[5],
+                tip_positions[9],
+                tip_positions[11]
+            ]
+        );
+    }
+}
+
+/// The client blends each quad's corner light bilinearly, and it finds the
+/// quads from the index buffer (`quad-light.ts` in the core package): four
+/// vertices per quad, emitted quad by quad, indexed `0 1 3 3 2 0` or
+/// `0 1 2 2 1 3` from the quad's first vertex. Every emitting path — the
+/// greedy quads, per-voxel faces, fluid faces, diagonal crosses — must keep
+/// that shape, or its quads silently fall back to per-triangle light.
+#[test]
+fn every_quad_keeps_the_index_shape_the_client_light_blend_reads() {
+    fn assert_quad_shape(scene: &str, geometries: &[GeometryProtocol]) {
+        assert!(
+            geometries.iter().any(|g| !g.indices.is_empty()),
+            "{scene} meshed nothing"
+        );
+        for geometry in geometries {
+            let vertex_count = geometry.positions.len() / 3;
+            assert_eq!(geometry.lights.len(), vertex_count, "{scene}");
+            assert_eq!(vertex_count % 4, 0, "{scene}: loose vertices");
+            assert_eq!(geometry.indices.len(), vertex_count / 4 * 6, "{scene}");
+            for (quad, group) in geometry.indices.chunks_exact(6).enumerate() {
+                let first = (quad * 4) as i32;
+                let shape: Vec<i32> = group.iter().map(|i| i - first).collect();
+                assert!(
+                    shape == [0, 1, 3, 3, 2, 0] || shape == [0, 1, 2, 2, 1, 3],
+                    "{scene}: quad {quad} is indexed {shape:?}"
+                );
+            }
+        }
+    }
+
+    let (registry, _, _) = ocean_registry(1, 2);
+    let mut cells = vec![];
+    for x in 0..4 {
+        for z in 0..4 {
+            cells.push(((x, 0, z), (1, 0)));
+        }
+    }
+    cells.push(((1, 1, 1), (1, 0)));
+    let floor = SparseSpace::new(&cells);
+    assert_quad_shape(
+        "stone floor with a step",
+        &mesh_space_greedy(&[0, 0, 0], &[4, 2, 4], &floor, &registry),
+    );
+
+    cells.retain(|(pos, _)| pos.1 == 0);
+    cells.push(((1, 1, 1), (2, 0)));
+    cells.push(((2, 1, 1), (2, 0)));
+    let pool = SparseSpace::new(&cells);
+    assert_quad_shape(
+        "water on stone",
+        &mesh_space_greedy(&[0, 0, 0], &[4, 2, 4], &pool, &registry),
+    );
+
+    let water = Block {
+        is_fluid: true,
+        is_waterlogging_fluid: true,
+        is_see_through: true,
+        is_transparent: [true; 6],
+        faces: six_faces(),
+        ..plain_block(2, "Water")
+    };
+    let plant = Block {
+        is_waterloggable: true,
+        is_see_through: true,
+        is_transparent: [true; 6],
+        ..full_block_diagonal_block()
+    };
+    let air = Block {
+        is_empty: true,
+        aabbs: vec![],
+        ..plain_block(0, "Air")
+    };
+    let mut plants = Registry::new(vec![(0, air), (1, plant), (2, water)]);
+    plants.build_cache();
+    for (scene, is_waterlogged) in [("diagonal plant", false), ("waterlogged plant", true)] {
+        let space = SingleVoxelSpace {
+            voxel_id: 1,
+            is_waterlogged,
+        };
+        assert_quad_shape(
+            scene,
+            &mesh_space_greedy(&[0, 0, 0], &[1, 1, 1], &space, &plants),
+        );
+    }
+}
+
+/// Six faces of the box `offset..offset + scale`, laid out the way the
+/// server's `six_faces().auto_uv_offset(true)` builds them.
+fn box_faces(offset: [f32; 3], scale: [f32; 3]) -> Vec<BlockFace> {
+    let [x0, y0, z0] = offset;
+    let [x1, y1, z1] = [0, 1, 2].map(|a| offset[a] + scale[a]);
+    let face = |name: &str, dir: [i32; 3], corners: [([f32; 3], [f32; 2]); 4]| BlockFace {
+        name: name.to_string(),
+        name_lower: name.to_string(),
+        dir,
+        corners: corners.map(|(pos, uv)| CornerData { pos, uv }),
+        range: UV {
+            start_u: 0.0,
+            end_u: 1.0,
+            start_v: 0.0,
+            end_v: 1.0,
+        },
+        ..Default::default()
+    };
+    vec![
+        face(
+            "px",
+            [1, 0, 0],
+            [
+                ([x1, y1, z1], [z0, y1]),
+                ([x1, y0, z1], [z0, y0]),
+                ([x1, y1, z0], [z1, y1]),
+                ([x1, y0, z0], [z1, y0]),
+            ],
+        ),
+        face(
+            "py",
+            [0, 1, 0],
+            [
+                ([x0, y1, z1], [x1, z1]),
+                ([x1, y1, z1], [x0, z1]),
+                ([x0, y1, z0], [x1, z0]),
+                ([x1, y1, z0], [x0, z0]),
+            ],
+        ),
+        face(
+            "pz",
+            [0, 0, 1],
+            [
+                ([x0, y0, z1], [x0, y0]),
+                ([x1, y0, z1], [x1, y0]),
+                ([x0, y1, z1], [x0, y1]),
+                ([x1, y1, z1], [x1, y1]),
+            ],
+        ),
+        face(
+            "nx",
+            [-1, 0, 0],
+            [
+                ([x0, y1, z0], [z0, y1]),
+                ([x0, y0, z0], [z0, y0]),
+                ([x0, y1, z1], [z1, y1]),
+                ([x0, y0, z1], [z1, y0]),
+            ],
+        ),
+        face(
+            "ny",
+            [0, -1, 0],
+            [
+                ([x1, y0, z1], [x1, z0]),
+                ([x0, y0, z1], [x0, z0]),
+                ([x1, y0, z0], [x1, z1]),
+                ([x0, y0, z0], [x0, z1]),
+            ],
+        ),
+        face(
+            "nz",
+            [0, 0, -1],
+            [
+                ([x1, y0, z0], [x0, y0]),
+                ([x0, y0, z0], [x1, y0]),
+                ([x1, y1, z0], [x0, y1]),
+                ([x0, y1, z0], [x1, y1]),
+            ],
+        ),
+    ]
+}
+
+const SHEET: u32 = 1;
+const WOOD: u32 = 2;
+const HALF: u32 = 3;
+const PANE: u32 = 4;
+const OTHER_PANE: u32 = 5;
+const MASS: u32 = 6;
+const SWINGING: u32 = 7;
+const LOOSE_PANE: u32 = 8;
+const SWINGING_PANE: u32 = 9;
+
+/// Blocks that press faces together across a cell boundary: a see-through
+/// sheet one sixteenth thick against its cell's -x side, wood and a half
+/// block that are not opaque, see-through cubes drawn from both sides, a
+/// cutout mass drawn from one, and animated blocks of both kinds.
+fn pressed_registry() -> Registry {
+    let air = Block {
+        is_empty: true,
+        aabbs: vec![],
+        ..plain_block(0, "Air")
+    };
+    let see_through = |id: u32, name: &str, faces: Vec<BlockFace>| Block {
+        is_see_through: true,
+        is_transparent: [true; 6],
+        faces,
+        ..plain_block(id, name)
+    };
+    let solid = |id: u32, name: &str, faces: Vec<BlockFace>| Block {
+        is_transparent: [true; 6],
+        faces,
+        ..plain_block(id, name)
+    };
+    let full = || box_faces([0.0; 3], [1.0; 3]);
+    let mut registry = Registry::new(vec![
+        (0, air),
+        (
+            SHEET,
+            Block {
+                transparent_standalone: true,
+                y_rotatable: true,
+                aabbs: vec![AABB {
+                    max_x: 1.0 / 16.0,
+                    ..full_cube_aabb()[0].clone()
+                }],
+                ..see_through(SHEET, "Sheet", box_faces([0.0; 3], [1.0 / 16.0, 1.0, 1.0]))
+            },
+        ),
+        (WOOD, solid(WOOD, "Wood", full())),
+        (
+            HALF,
+            Block {
+                aabbs: vec![AABB {
+                    max_y: 0.5,
+                    ..full_cube_aabb()[0].clone()
+                }],
+                ..solid(HALF, "Half", box_faces([0.0; 3], [1.0, 0.5, 1.0]))
+            },
+        ),
+        (PANE, see_through(PANE, "Pane", full())),
+        (OTHER_PANE, see_through(OTHER_PANE, "Other pane", full())),
+        (
+            MASS,
+            Block {
+                transparent_standalone: true,
+                standalone_face_depth: 1,
+                ..see_through(MASS, "Mass", full())
+            },
+        ),
+        (
+            SWINGING,
+            Block {
+                is_animated: true,
+                ..solid(SWINGING, "Swinging", full())
+            },
+        ),
+        (
+            LOOSE_PANE,
+            Block {
+                transparent_standalone: true,
+                ..see_through(LOOSE_PANE, "Loose pane", full())
+            },
+        ),
+        (
+            SWINGING_PANE,
+            Block {
+                is_animated: true,
+                ..see_through(SWINGING_PANE, "Swinging pane", full())
+            },
+        ),
+    ]);
+    registry.build_cache();
+    registry
+}
+
+/// One quad as drawn: the world-space box its corners span, and the span
+/// of its texture coordinates.
+struct DrawnQuad {
+    lo: [f32; 3],
+    hi: [f32; 3],
+    uv_lo: [f32; 2],
+    uv_hi: [f32; 2],
+}
+
+/// The quads `id` draws flat on the world plane `axis = plane`.
+fn drawn_on_plane(
+    space: &SparseSpace,
+    registry: &Registry,
+    id: u32,
+    axis: usize,
+    plane: f32,
+) -> Vec<DrawnQuad> {
+    let min = [-2, -1, -2];
+    let meshes = mesh_space_greedy(&min, &[3, 3, 3], space, registry);
+    let mut quads = Vec::new();
+    for geometry in meshes.iter().filter(|geometry| geometry.voxel == id) {
+        for quad in geometry.indices.chunks_exact(6) {
+            let mut drawn = DrawnQuad {
+                lo: [f32::MAX; 3],
+                hi: [f32::MIN; 3],
+                uv_lo: [f32::MAX; 2],
+                uv_hi: [f32::MIN; 2],
+            };
+            for &index in quad {
+                let index = index as usize;
+                for a in 0..3 {
+                    let at = geometry.positions[index * 3 + a] + min[a] as f32;
+                    drawn.lo[a] = drawn.lo[a].min(at);
+                    drawn.hi[a] = drawn.hi[a].max(at);
+                }
+                for a in 0..2 {
+                    drawn.uv_lo[a] = drawn.uv_lo[a].min(geometry.uvs[index * 2 + a]);
+                    drawn.uv_hi[a] = drawn.uv_hi[a].max(geometry.uvs[index * 2 + a]);
+                }
+            }
+            if (drawn.lo[axis] - plane).abs() < 0.01 && (drawn.hi[axis] - plane).abs() < 0.01 {
+                quads.push(drawn);
+            }
+        }
+    }
+    quads
+}
+
+/// How many quads `id` draws flat on the world plane `axis = plane`.
+fn quads_on_plane(
+    space: &SparseSpace,
+    registry: &Registry,
+    id: u32,
+    axis: usize,
+    plane: f32,
+) -> usize {
+    drawn_on_plane(space, registry, id, axis, plane).len()
+}
+
+#[test]
+fn a_see_through_face_pressed_to_a_neighbours_whole_face_gives_way() {
+    let registry = pressed_registry();
+    let alone = SparseSpace::new(&[((0, 0, 0), (SHEET, 0))]);
+    assert_eq!(
+        quads_on_plane(&alone, &registry, SHEET, 0, 0.0),
+        1,
+        "a lone sheet shows its back"
+    );
+
+    // Wood that fills its cell but is not opaque draws its face against the
+    // sheet; drawn too, the sheet's back would fight it over one depth.
+    let on_wood = SparseSpace::new(&[((0, 0, 0), (SHEET, 0)), ((-1, 0, 0), (WOOD, 0))]);
+    assert_eq!(quads_on_plane(&on_wood, &registry, SHEET, 0, 0.0), 0);
+    assert_eq!(quads_on_plane(&on_wood, &registry, WOOD, 0, 0.0), 1);
+
+    // A half block covers only the lower half of the back: the upper half
+    // is drawn on its own, showing the upper half of the texture as before.
+    let on_half = SparseSpace::new(&[((0, 0, 0), (SHEET, 0)), ((-1, 0, 0), (HALF, 0))]);
+    let pieces = drawn_on_plane(&on_half, &registry, SHEET, 0, 0.0);
+    assert_eq!(pieces.len(), 1);
+    assert!((pieces[0].lo[1] - 0.5).abs() < 1e-4 && (pieces[0].hi[1] - 1.0).abs() < 1e-4);
+    assert!((pieces[0].lo[2]).abs() < 1e-4 && (pieces[0].hi[2] - 1.0).abs() < 1e-4);
+    assert!((pieces[0].uv_lo[1] - 0.5).abs() < 1e-4 && (pieces[0].uv_hi[1] - 1.0).abs() < 1e-4);
+
+    // A cube meshed greedily is cut the same way.
+    let pane_on_half = SparseSpace::new(&[((0, 0, 0), (PANE, 0)), ((-1, 0, 0), (HALF, 0))]);
+    let pieces = drawn_on_plane(&pane_on_half, &registry, PANE, 0, 0.0);
+    assert_eq!(pieces.len(), 1);
+    assert!((pieces[0].lo[1] - 0.5).abs() < 1e-4 && (pieces[0].hi[1] - 1.0).abs() < 1e-4);
+    assert!((pieces[0].uv_lo[1] - 0.5).abs() < 1e-4 && (pieces[0].uv_hi[1] - 1.0).abs() < 1e-4);
+
+    // A static sheet gives way to an animated neighbour as to any other: the
+    // neighbour's faces swing with it, and the sheet's come back at the remesh.
+    let on_swing = SparseSpace::new(&[((0, 0, 0), (SHEET, 0)), ((-1, 0, 0), (SWINGING, 0))]);
+    assert_eq!(quads_on_plane(&on_swing, &registry, SHEET, 0, 0.0), 0);
+    assert_eq!(quads_on_plane(&on_swing, &registry, SWINGING, 0, 0.0), 1);
+}
+
+#[test]
+fn a_turned_sheet_gives_way_where_its_back_lies() {
+    let registry = pressed_registry();
+    for quarter in 0..4 {
+        let rotation = BlockRotation::PY(quarter as f32 * std::f32::consts::FRAC_PI_2);
+        let mut back = [-1.0, 0.0, 0.0];
+        rotation.rotate_direction(&mut back, true);
+        let back = back.map(|v: f32| v.round() as i32);
+        let axis = if back[0] != 0 { 0 } else { 2 };
+        let (plane, front) = if back[axis] > 0 {
+            (1.0, 1.0 - 1.0 / 16.0)
+        } else {
+            (0.0, 1.0 / 16.0)
+        };
+        let mut alone = SparseSpace::new(&[((0, 0, 0), (SHEET, 0))]);
+        alone.rotation = rotation.clone();
+        let mut on_wood = SparseSpace::new(&[
+            ((0, 0, 0), (SHEET, 0)),
+            ((back[0], back[1], back[2]), (WOOD, 0)),
+        ]);
+        on_wood.rotation = rotation.clone();
+        let context = format!("quarter turn {quarter}, back toward {back:?}");
+        assert_eq!(
+            quads_on_plane(&alone, &registry, SHEET, axis, plane),
+            1,
+            "{context}"
+        );
+        assert_eq!(
+            quads_on_plane(&on_wood, &registry, SHEET, axis, plane),
+            0,
+            "{context}"
+        );
+        assert_eq!(
+            quads_on_plane(&on_wood, &registry, SHEET, axis, front),
+            1,
+            "{context}"
+        );
+    }
+}
+
+#[test]
+fn of_two_see_through_faces_on_one_plane_exactly_one_stays() {
+    let registry = pressed_registry();
+    let on_plane = |left: u32, right: u32| {
+        let space = SparseSpace::new(&[((0, 0, 0), (left, 0)), ((1, 0, 0), (right, 0))]);
+        (
+            quads_on_plane(&space, &registry, left, 0, 1.0),
+            quads_on_plane(&space, &registry, right, 0, 1.0),
+        )
+    };
+    // Different blocks: the lower id keeps its face, whichever side it is on.
+    assert_eq!(on_plane(PANE, OTHER_PANE), (1, 0));
+    assert_eq!(on_plane(OTHER_PANE, PANE), (0, 1));
+    // One block drawing the faces between its own voxels keeps the one
+    // toward positive; a single-sided cutout mass always keeps its own.
+    let space = SparseSpace::new(&[((0, 0, 0), (LOOSE_PANE, 0)), ((1, 0, 0), (LOOSE_PANE, 0))]);
+    assert_eq!(quads_on_plane(&space, &registry, LOOSE_PANE, 0, 1.0), 1);
+    assert_eq!(on_plane(PANE, MASS), (0, 1));
+    assert_eq!(on_plane(MASS, OTHER_PANE), (1, 0));
+    // An animated block keeps its face over a static one, whatever the ids.
+    assert_eq!(on_plane(PANE, SWINGING_PANE), (0, 1));
+    assert_eq!(on_plane(SWINGING_PANE, PANE), (1, 0));
+}
+
+/// A lone opaque cube at the origin in a lit corner: ground under it, a
+/// wall piece at `+x -z`, an overhang at `-x +y +z`, and light that varies
+/// cell to cell. Pins what every face's corners bake (occlusion, packed
+/// light, and which diagonal the quad splits along), so a consumer that
+/// relights a lone cube by hand, rather than remeshing it, can pin the
+/// same numbers against the same corner.
+struct LitCornerSpace;
+
+impl LitCornerSpace {
+    const STONE: u32 = 1;
+    const CUBE: u32 = 2;
+
+    fn id(x: i32, y: i32, z: i32) -> u32 {
+        match (x, y, z) {
+            (0, 0, 0) => Self::CUBE,
+            (_, -1, _) => Self::STONE,
+            (1, 0, -1) | (1, 1, -1) | (-1, 1, 1) => Self::STONE,
+            _ => 0,
+        }
+    }
+
+    fn lights(x: i32, y: i32, z: i32) -> (u32, u32, u32, u32) {
+        if Self::id(x, y, z) != 0 {
+            return (0, 0, 0, 0);
+        }
+        let level = |value: i32| value.clamp(0, 15) as u32;
+        (
+            level(9 + 3 * y - 2 * x),
+            level(6 + 2 * z - y),
+            0,
+            level(3 - x - z),
+        )
+    }
+}
+
+impl VoxelAccess for LitCornerSpace {
+    fn get_voxel(&self, vx: i32, vy: i32, vz: i32) -> u32 {
+        Self::id(vx, vy, vz)
+    }
+
+    fn get_raw_voxel(&self, vx: i32, vy: i32, vz: i32) -> u32 {
+        Self::id(vx, vy, vz)
+    }
+
+    fn get_voxel_rotation(&self, _vx: i32, _vy: i32, _vz: i32) -> BlockRotation {
+        BlockRotation::default()
+    }
+
+    fn get_voxel_stage(&self, _vx: i32, _vy: i32, _vz: i32) -> u32 {
+        0
+    }
+
+    fn get_voxel_waterlogged(&self, _vx: i32, _vy: i32, _vz: i32) -> bool {
+        false
+    }
+
+    fn get_voxel_fluid_level(&self, _vx: i32, _vy: i32, _vz: i32) -> u32 {
+        0
+    }
+
+    fn get_sunlight(&self, vx: i32, vy: i32, vz: i32) -> u32 {
+        Self::lights(vx, vy, vz).0
+    }
+
+    fn get_torch_light(&self, vx: i32, vy: i32, vz: i32, color: LightColor) -> u32 {
+        let (_, red, green, blue) = Self::lights(vx, vy, vz);
+        match color {
+            LightColor::Red => red,
+            LightColor::Green => green,
+            LightColor::Blue => blue,
+            LightColor::Sunlight => Self::lights(vx, vy, vz).0,
+        }
+    }
+
+    fn get_all_lights(&self, vx: i32, vy: i32, vz: i32) -> (u32, u32, u32, u32) {
+        Self::lights(vx, vy, vz)
+    }
+
+    fn get_max_height(&self, _vx: i32, _vz: i32) -> u32 {
+        2
+    }
+
+    fn contains(&self, vx: i32, vy: i32, vz: i32) -> bool {
+        vx.abs() <= 2 && vz.abs() <= 2 && (-1..=2).contains(&vy)
+    }
+}
+
+#[test]
+fn a_lone_cube_in_a_lit_corner_bakes_its_pinned_corners() {
+    let stone = Block {
+        is_opaque: true,
+        ..plain_block(LitCornerSpace::STONE, "Stone")
+    };
+    let cube = Block {
+        is_opaque: true,
+        ..plain_block(LitCornerSpace::CUBE, "Cube")
+    };
+    let mut registry = Registry::new(vec![(LitCornerSpace::STONE, stone), (LitCornerSpace::CUBE, cube)]);
+    registry.build_cache();
+    let neighbors = NeighborCache::populate(0, 0, 0, &LitCornerSpace);
+    let cube = registry.get_block_by_id(LitCornerSpace::CUBE).unwrap();
+
+    let baked: Vec<([i32; 4], [i32; 4], bool)> = [
+        [1, 0, 0],
+        [-1, 0, 0],
+        [0, 1, 0],
+        [0, -1, 0],
+        [0, 0, 1],
+        [0, 0, -1],
+    ]
+    .into_iter()
+    .map(|dir| {
+        let (aos, lights) = compute_face_ao_and_light(dir, cube, &neighbors, &registry);
+        (aos, lights, greedy::quad_flips(&aos, &lights))
+    })
+    .collect();
+    assert_eq!(baked, LIT_CORNER_PINS.to_vec());
+}
+
+const LIT_CORNER_PINS: [([i32; 4], [i32; 4], bool); 6] = [
+    ([3, 1, 1, 0], [34305, 30465, 34050, 30210], true),
+    ([3, 1, 2, 1], [50180, 46340, 50691, 46851], true),
+    ([2, 3, 3, 2], [50435, 46594, 54276, 46083], false),
+    ([0, 0, 0, 0], [0, 0, 0, 0], false),
+    ([1, 1, 2, 3], [43010, 34817, 42754, 38657], true),
+    ([0, 1, 1, 3], [37892, 41988, 41732, 45828], true),
+];

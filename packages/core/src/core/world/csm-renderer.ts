@@ -19,6 +19,11 @@ import {
 } from "three";
 
 import { boundsIntersectSphere } from "./dynamic-caster-bounds";
+import {
+  BorrowedCasterScene,
+  isMarkedNeverCaster,
+  isNonCasterEffect,
+} from "./shadow-casters";
 
 export interface CSMConfig {
   cascades: number;
@@ -40,16 +45,20 @@ export interface CSMConfig {
    */
   shadowStrengthRenderFloor: number;
   /**
-   * Per-frame light-direction delta above which direction changes stop
-   * marking cascades dirty. The day-cycle drift moves the light a few
-   * hundred-thousandths of a radian per frame; the dusk sun-to-moon
-   * handoff swings it thirty times faster, fast enough that shadows
+   * Light-direction speed, in radians per second, above which direction
+   * changes stop marking cascades dirty. The day-cycle drift turns the
+   * light at most 0.005 rad/s on a twenty-minute day; the dusk sun-to-moon
+   * handoff swings it twenty times faster, fast enough that shadows
    * re-rendered mid-swing are stale by the time they are sampled. The
    * skipped motion keeps accumulating against the dirty threshold, so the
    * first calm frame after a swing (or a time-command jump) still
    * refreshes every cascade at the settled direction.
+   *
+   * A speed rather than a per-frame step: the same drift is a bigger step
+   * on a longer frame, and a per-frame cap read it as a swing on every page
+   * below about 52 fps, so the cascades stopped following the sun there.
    */
-  maxLightSwingPerFrame: number;
+  maxLightSwingPerSecond: number;
   /**
    * Player movement (blocks per frame) below which the camera counts as
    * still. Control smoothing approaches its target asymptotically and
@@ -101,12 +110,19 @@ export const ENTITY_SHADOW_DISTANCE = 32;
  */
 const ENTITY_CASTER_BODY_RADIUS = 1.6;
 
+/**
+ * Cascades below this index draw the dynamic casters (entities and
+ * instanced pools). The far cascade redraws too rarely for a moving caster
+ * to leave anything but a stale imprint, so it never draws them.
+ */
+const NEAR_CASTER_CASCADES = 2;
+
 const defaultConfig: CSMConfig = {
   cascades: 3,
   shadowMapSize: 2048,
   farShadowMapSize: 2048,
   shadowStrengthRenderFloor: 0.15,
-  maxLightSwingPerFrame: 0.0001,
+  maxLightSwingPerSecond: 0.01,
   stillCameraPositionEpsilon: 0.0005,
   stillCameraMatrixEpsilon: 0.0005,
   maxShadowDistance: 128,
@@ -158,6 +174,8 @@ export class CSMRenderer {
   private isCameraStill = false;
   private currentShadowStrength = 1;
   private lastFrameLightSwing = 0;
+  private lastLightSwingPerSecond = 0;
+  private lastUpdateAt: number | null = null;
   private lastMainCamera: Camera | null = null;
   private cascadeDirty: boolean[] = [];
   private cascadeNeedsRender: boolean[] = [];
@@ -182,6 +200,38 @@ export class CSMRenderer {
     THREE.Material | THREE.Material[]
   >();
   private originalEntityParents = new Map<Object3D, Object3D | null>();
+
+  /**
+   * Draw each near dynamic caster exactly once per near cascade, from a
+   * borrowed caster list, instead of once in the whole-scene pass and again
+   * through a reparented batch (performance audit fix 3). Off restores the
+   * old path verbatim for A/B timing.
+   */
+  private isSingleCasterPass = true;
+  private casterBatch = new BorrowedCasterScene();
+  private batchCasters: Object3D[] = [];
+  private poolSwapStack: Object3D[] = [];
+  private arePoolDepthMaterialsSwapped = false;
+
+  /**
+   * Objects no whole-scene depth pass may draw: explicit registrations (the
+   * instanced-pool root, whose pools cast only through their own skinned
+   * depth materials) plus scene-level see-through effects found by
+   * {@link isNonCasterEffect}. Hidden once per shadow frame around every
+   * depth consumer, so the sun's maps and the torches' atlas agree.
+   */
+  private shadowExclusions: Object3D[] = [];
+
+  /** Whether a host's {@link hideNonCasters} is in effect right now. */
+  private isHidingNonCasters = false;
+  /**
+   * Objects that are never casters at all, whatever the A/B switch says:
+   * hidden by {@link hideNonCasters} even with the exclusion off. See
+   * {@link addNeverCaster}.
+   */
+  private neverCasters: Object3D[] = [];
+  private isExcludingNonCasters = true;
+  private hiddenNonCasters: Object3D[] = [];
 
   private frustumCenter = new Vector3();
   private frustumUp = new Vector3();
@@ -305,19 +355,37 @@ export class CSMRenderer {
     });
   }
 
+  /**
+   * @param deltaSeconds Time since the previous update. Measured between
+   * calls when omitted; a caller stepping a simulated clock passes its own.
+   */
   update(
     mainCamera: Camera,
     sunDirection: Vector3,
     playerPosition?: Vector3,
     shadowStrength = 1,
+    deltaSeconds?: number,
   ) {
+    const now = performance.now();
+    const elapsedSeconds =
+      deltaSeconds ??
+      (this.lastUpdateAt === null ? 0 : (now - this.lastUpdateAt) / 1000);
+    this.lastUpdateAt = now;
+
     const frameLightSwing = this.tempVec3
       .copy(sunDirection)
       .normalize()
       .sub(this.lightDirection)
       .length();
     this.lastFrameLightSwing = frameLightSwing;
-    const isLightSwinging = frameLightSwing > this.config.maxLightSwingPerFrame;
+    this.lastLightSwingPerSecond =
+      elapsedSeconds > 0
+        ? frameLightSwing / elapsedSeconds
+        : frameLightSwing > 0
+          ? Infinity
+          : 0;
+    const isLightSwinging =
+      frameLightSwing > this.config.maxLightSwingPerSecond * elapsedSeconds;
 
     this.lightDirection.copy(sunDirection).normalize();
     this.currentShadowStrength = shadowStrength;
@@ -470,13 +538,21 @@ export class CSMRenderer {
       .copy(this.lightSpaceCenter)
       .applyMatrix4(this.lightViewMatrixInverse);
 
+    // The caster reach belongs on the sun's side of the cascade: everything
+    // that shades a receiver lies up the light ray from it. With the camera
+    // only radius + margin up-sun (52 blocks for the near cascade), the
+    // ground over a deep shaft fell behind the near plane, drew into no
+    // map, and the shaft's sunlit floor and walls lit up near the player.
+    // The receiver side needs only the cascade's own radius plus margin.
+    // The total depth range is unchanged, so the depth biases keep their
+    // calibration.
     const offset = radius + lightMargin;
     const casterDepth = Math.max(offset, this.config.shadowCasterDistance);
 
     const camera = this.fitCamera;
     camera.position
       .copy(this.frustumCenter)
-      .addScaledVector(this.renderLightDirection, offset);
+      .addScaledVector(this.renderLightDirection, casterDepth);
     camera.up.copy(this.frustumUp);
     camera.lookAt(this.frustumCenter);
     camera.updateMatrixWorld();
@@ -516,6 +592,126 @@ export class CSMRenderer {
     if (idx !== -1) {
       this.skipShadowObjectsCache.splice(idx, 1);
     }
+  }
+
+  /**
+   * A/B switch for the single caster pass (on by default). Off draws near
+   * entities and pools the old way: once in the whole-scene pass with the
+   * generic depth material (instanced pools in their bind pose) and again,
+   * on entity-refresh frames, through a reparented batch.
+   */
+  setSingleCasterPass(isEnabled: boolean) {
+    this.isSingleCasterPass = isEnabled;
+  }
+
+  get singleCasterPass(): boolean {
+    return this.isSingleCasterPass;
+  }
+
+  /**
+   * A/B switch for {@link hideNonCasters} (on by default). Off draws
+   * see-through scene effects and registered exclusions into every depth
+   * pass, as before the audit.
+   */
+  setNonCasterExclusion(isEnabled: boolean) {
+    this.isExcludingNonCasters = isEnabled;
+  }
+
+  get nonCasterExclusion(): boolean {
+    return this.isExcludingNonCasters;
+  }
+
+  /**
+   * Keep `object` (and its subtree) out of every whole-scene depth pass.
+   * Unlike {@link addSkipShadowObject} this needs no material flag, so a
+   * group can be excluded — the instanced-pool root is registered here
+   * because its pools cast only through dedicated passes that render each
+   * pool as its own root.
+   */
+  addShadowExclusion(object: Object3D) {
+    if (!this.shadowExclusions.includes(object)) {
+      this.shadowExclusions.push(object);
+    }
+  }
+
+  removeShadowExclusion(object: Object3D) {
+    const idx = this.shadowExclusions.indexOf(object);
+    if (idx !== -1) {
+      this.shadowExclusions.splice(idx, 1);
+    }
+  }
+
+  /**
+   * Keep `object` (and its subtree) out of every depth pass, always: a
+   * stand-in that only ever draws where real geometry does not, such as the
+   * far-terrain layer. Its own shader discards it under the loaded chunks,
+   * but a depth pass draws it with the shared depth material and no such
+   * test, so it would shade the real ground below it. `castShadow` alone
+   * does not keep it out: the cascades render the whole scene. Holds
+   * whether or not the host brackets its passes in {@link hideNonCasters}.
+   */
+  addNeverCaster(object: Object3D) {
+    if (!this.neverCasters.includes(object)) {
+      this.neverCasters.push(object);
+    }
+  }
+
+  removeNeverCaster(object: Object3D) {
+    const idx = this.neverCasters.indexOf(object);
+    if (idx !== -1) {
+      this.neverCasters.splice(idx, 1);
+    }
+  }
+
+  /**
+   * Hide everything no depth pass may draw, for one shadow frame: the
+   * never-casters (registered, or direct children of `scene` that
+   * {@link isMarkedNeverCaster} marks), the registered exclusions and every
+   * direct child of `scene` that
+   * {@link isNonCasterEffect} identifies. Call once before the frame's
+   * first depth pass (cascades and local lights alike) and pair with
+   * {@link restoreNonCasters}.
+   */
+  hideNonCasters(scene: Scene) {
+    const hidden = this.hiddenNonCasters;
+    if (hidden.length > 0) this.restoreNonCasters();
+    this.isHidingNonCasters = true;
+    for (const object of this.neverCasters) {
+      if (object.visible) {
+        hidden.push(object);
+        object.visible = false;
+      }
+    }
+    const sceneChildren = scene.children;
+    for (let i = 0; i < sceneChildren.length; i++) {
+      const child = sceneChildren[i];
+      if (child.visible && isMarkedNeverCaster(child)) {
+        hidden.push(child);
+        child.visible = false;
+      }
+    }
+    if (!this.isExcludingNonCasters) return;
+    for (const object of this.shadowExclusions) {
+      if (object.visible) {
+        hidden.push(object);
+        object.visible = false;
+      }
+    }
+    const children = scene.children;
+    for (let i = 0; i < children.length; i++) {
+      const child = children[i];
+      if (child.visible && isNonCasterEffect(child)) {
+        hidden.push(child);
+        child.visible = false;
+      }
+    }
+  }
+
+  restoreNonCasters() {
+    const hidden = this.hiddenNonCasters;
+    for (let i = 0; i < hidden.length; i++) hidden[i].visible = true;
+    hidden.length = 0;
+    this.isHidingNonCasters = false;
   }
 
   render(
@@ -590,6 +786,24 @@ export class CSMRenderer {
         object.visible = false;
       }
     }
+    // A host that draws the cascades without bracketing them in
+    // hideNonCasters still keeps every never-caster out.
+    if (!this.isHidingNonCasters) {
+      for (const object of this.neverCasters) {
+        if (object.visible) {
+          hiddenObjects.push({ object, visible: true });
+          object.visible = false;
+        }
+      }
+      const sceneChildren = scene.children;
+      for (let i = 0; i < sceneChildren.length; i++) {
+        const child = sceneChildren[i];
+        if (child.visible && isMarkedNeverCaster(child)) {
+          hiddenObjects.push({ object: child, visible: true });
+          child.visible = false;
+        }
+      }
+    }
 
     if (entities) {
       for (const entity of entities) {
@@ -608,9 +822,15 @@ export class CSMRenderer {
       }
     }
 
+    const isSingleCasterPass = this.isSingleCasterPass;
     const poolOriginalMaterials = this.poolOriginalMaterials;
     poolOriginalMaterials.clear();
-    if (this.shouldRenderEntityShadows && activePools.length > 0) {
+    this.arePoolDepthMaterialsSwapped = false;
+    if (
+      !isSingleCasterPass &&
+      this.shouldRenderEntityShadows &&
+      activePools.length > 0
+    ) {
       for (const pool of activePools) {
         pool.traverse((child) => {
           if (child instanceof THREE.Mesh && child.customDepthMaterial) {
@@ -672,6 +892,24 @@ export class CSMRenderer {
 
       renderer.setRenderTarget(cascade.renderTarget);
       renderer.clear();
+
+      if (isSingleCasterPass) {
+        this.renderCascadeCasters(
+          renderer,
+          scene,
+          cascade.camera,
+          i < NEAR_CASTER_CASCADES,
+          entities,
+          maxEntityShadowDistance,
+          instancePools,
+          activePools,
+        );
+        this.cascadeNeedsRender[i] = false;
+        if (i > 0) {
+          hasRenderedFarCascade = true;
+        }
+        continue;
+      }
 
       const hiddenEntities = this.hiddenEntities;
       hiddenEntities.length = 0;
@@ -742,9 +980,16 @@ export class CSMRenderer {
       }
     }
 
+    const isRestoringOverride = this.arePoolDepthMaterialsSwapped;
     for (const [mesh, originalMaterial] of poolOriginalMaterials) {
-      (mesh as THREE.Mesh).material = originalMaterial;
+      const depthMesh = mesh as THREE.Mesh;
+      if (isRestoringOverride) {
+        (depthMesh.material as THREE.Material).allowOverride = true;
+      }
+      depthMesh.material = originalMaterial;
     }
+    poolOriginalMaterials.clear();
+    this.arePoolDepthMaterialsSwapped = false;
 
     for (const { object, visible } of hiddenObjects) {
       object.visible = visible;
@@ -752,6 +997,110 @@ export class CSMRenderer {
 
     scene.overrideMaterial = originalOverrideMaterial;
     renderer.setRenderTarget(null);
+  }
+
+  /**
+   * One cascade's depth under the single caster pass. The whole-scene pass
+   * draws the static world only: every instanced pool is hidden (the
+   * generic depth material would draw its creatures in their bind pose),
+   * and so is every entity this cascade draws itself. A near cascade then
+   * draws its casters once, from a borrowed list — the pools with a live
+   * instance in reach through their own skinned depth materials, and the
+   * near entities through the shared depth material. The far cascade hides
+   * every dynamic caster, as it always has.
+   *
+   * Entities beyond the entity shadow distance stay in the near cascades'
+   * scene pass exactly as before, so nothing but the duplicate draw and the
+   * bind-pose pool silhouettes changes.
+   */
+  private renderCascadeCasters(
+    renderer: WebGLRenderer,
+    scene: Scene,
+    camera: OrthographicCamera,
+    isNearCascade: boolean,
+    entities: Object3D[] | undefined,
+    maxEntityShadowDistance: number,
+    instancePools: Group[] | undefined,
+    activePools: Group[],
+  ) {
+    const hidden = this.hiddenEntities;
+    hidden.length = 0;
+    const casters = this.batchCasters;
+    casters.length = 0;
+
+    if (isNearCascade) {
+      for (let p = 0; p < activePools.length; p++) {
+        if (activePools[p].visible) casters.push(activePools[p]);
+      }
+    }
+
+    if (entities) {
+      const maxDistSq = maxEntityShadowDistance * maxEntityShadowDistance;
+      for (let e = 0; e < entities.length; e++) {
+        const entity = entities[e];
+        if (!entity.visible) continue;
+        if (isNearCascade && entity.userData.castsShadow !== false) {
+          const isNear =
+            entity.position.distanceToSquared(this.lastCameraPosition) <
+              maxDistSq && this.cascadeFrustum.containsPoint(entity.position);
+          // Out of reach: left to the scene pass, as it always was.
+          if (!isNear) continue;
+          casters.push(entity);
+        }
+        hidden.push({ object: entity, visible: true });
+        entity.visible = false;
+      }
+    }
+
+    if (instancePools) {
+      for (let p = 0; p < instancePools.length; p++) {
+        const pool = instancePools[p];
+        if (pool.visible) {
+          hidden.push({ object: pool, visible: true });
+          pool.visible = false;
+        }
+      }
+    }
+
+    renderer.render(scene, camera);
+
+    for (let h = 0; h < hidden.length; h++) {
+      hidden[h].object.visible = hidden[h].visible;
+    }
+    hidden.length = 0;
+
+    if (casters.length === 0) return;
+    if (!this.arePoolDepthMaterialsSwapped && activePools.length > 0) {
+      this.swapPoolDepthMaterials(activePools);
+    }
+    this.casterBatch.render(renderer, camera, casters, this.depthMaterial);
+    casters.length = 0;
+  }
+
+  /**
+   * Put every visible pool mesh on its skinned depth material for the rest
+   * of this render call, marked so the batch's override material cannot
+   * replace it. Restored (material and override flag) at the end of
+   * `render`.
+   */
+  private swapPoolDepthMaterials(pools: readonly Group[]) {
+    this.arePoolDepthMaterialsSwapped = true;
+    const swaps = this.poolOriginalMaterials;
+    const stack = this.poolSwapStack;
+    stack.length = 0;
+    for (let p = 0; p < pools.length; p++) stack.push(pools[p]);
+    while (stack.length > 0) {
+      const node = stack.pop() as Object3D;
+      if (!node.visible) continue;
+      const mesh = node as THREE.Mesh;
+      if (mesh.isMesh && mesh.customDepthMaterial && !swaps.has(mesh)) {
+        swaps.set(mesh, mesh.material);
+        mesh.customDepthMaterial.allowOverride = false;
+        mesh.material = mesh.customDepthMaterial;
+      }
+      const children = node.children;
+      for (let c = 0; c < children.length; c++) stack.push(children[c]);
+    }
   }
 
   private entityShadowFrameCounter = 0;
@@ -814,12 +1163,23 @@ export class CSMRenderer {
     return this.cascades.length;
   }
 
+  /**
+   * The depth material every cascade draws its casters with. A load-time
+   * shader warmup compiles it against each kind of caster (plain, instanced,
+   * batched) so no depth program is built on a frame the player sees.
+   */
+  get casterDepthMaterial(): MeshDepthMaterial {
+    return this.depthMaterial;
+  }
+
   getDebugState(): {
     isCameraStill: boolean;
     cascadeDirty: boolean[];
     cascadeNeedsRender: boolean[];
     currentShadowStrength: number;
     lastFrameLightSwing: number;
+    lastLightSwingPerSecond: number;
+    lightLagRadians: number;
   } {
     return {
       isCameraStill: this.isCameraStill,
@@ -827,7 +1187,17 @@ export class CSMRenderer {
       cascadeNeedsRender: [...this.cascadeNeedsRender],
       currentShadowStrength: this.currentShadowStrength,
       lastFrameLightSwing: this.lastFrameLightSwing,
+      lastLightSwingPerSecond: this.lastLightSwingPerSecond,
+      lightLagRadians: this.lightLagRadians,
     };
+  }
+
+  /**
+   * The angle between the live light and the direction the cascades were
+   * last fitted to: how far drawn shadows lag the sun.
+   */
+  get lightLagRadians(): number {
+    return this.renderLightDirection.angleTo(this.lightDirection);
   }
 
   get shadowBias(): number {

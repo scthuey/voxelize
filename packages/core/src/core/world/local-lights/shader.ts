@@ -1,6 +1,14 @@
+import { blockLightCurve } from "../block-light-transfer";
 import { WATER_VIEW_EXTINCTION_GLSL } from "../water-optics";
 
-import { GRID_CELLS_PER_ROW, MAX_LIGHTS_PER_CELL } from "./clustering";
+import { AIRLIGHT_UNIFORMS_GLSL } from "./airlight";
+import {
+  GRID_CELLS_PER_ROW,
+  MAX_LIGHTS_PER_CELL,
+  OVERFLOW_SLOTS_PER_CELL,
+  SLOT_ROW_MASK,
+  SLOT_WEIGHT_SHIFT,
+} from "./clustering";
 
 export const FLUID_SPECULAR_LIGHTS_PER_CELL = 1;
 
@@ -15,9 +23,11 @@ export const EMISSIVE_LEVELS: [number, number, number, number] = [
 
 /**
  * Same diffuse wrap the cone lights use, so a surface grazing any local
- * light keeps the same rim response.
+ * light keeps the same rim response. Exported for the CPU entity mirror
+ * (`composeEntityLight`), which has no per-fragment normal and applies the
+ * wrap at an average N·L instead; change neither side alone.
  */
-const LAMBERT_WRAP = 0.25;
+export const LAMBERT_WRAP = 0.25;
 
 /**
  * Safety gain on the analytic claim when it suppresses the baked flood
@@ -46,8 +56,7 @@ export function blockLightFloodRemainder(args: {
   floodLevel: number;
   windowFade: number;
 }): number {
-  const level = Math.min(Math.max(args.floodLevel, 0), 1);
-  const floodSmooth = level * level * (3 - 2 * level);
+  const floodSmooth = blockLightCurve(args.floodLevel);
   const ratio =
     (args.scaledClaim * BLOCK_LIGHT_OWNERSHIP_GAIN) /
     Math.max(floodSmooth, 1e-3);
@@ -59,9 +68,19 @@ export function blockLightFloodRemainder(args: {
 export const LOCAL_LIGHTS_UNIFORM_DECLARATIONS = `
 uniform highp usampler2D uLightGrid;
 uniform sampler2D uLightData;
+// Per cell, the lights past its slots (clustering.ts writeCellOverflow).
+uniform highp usampler2D uLightOverflow;
 uniform vec3 uLightGridOrigin;
 uniform vec3 uLightGridDims;
 uniform float uLightGridCellSize;
+// The window origin's cell mod the dims: its storage cell, per axis.
+uniform vec3 uLightGridStorageOffset;
+// Window centre (xyz, moves every frame) and rim fade width in blocks (w).
+uniform vec4 uLightGridCenter;
+// Half extent the window covers around its centre on every frame.
+uniform vec3 uLightGridHalf;
+// 1: temporally stable layer; 0: the legacy frame (A/B captures).
+uniform float uLocalLightStable;
 uniform int uClusteredLightCount;
 uniform float uLocalMaskKnee;
 uniform float uLocalSpecularStrength;
@@ -73,6 +92,13 @@ uniform sampler2D uLocalShadowAtlas;
 uniform vec4 uLocalShadowParams;
 // [pcf radius (texels), shadow strength, unused, unused]
 uniform vec4 uLocalShadowParams2;
+${AIRLIGHT_UNIFORMS_GLSL}
+uniform float uRoomFillStrength;
+uniform float uRoomFillRangeScale;
+uniform float uRoomFillCoreScale;
+// 1: fill only where the fragment's own flood reaches (walls stop it); 0:
+// unmasked, reaching past the flood and through walls.
+uniform float uRoomFillFloodMask;
 `;
 
 /**
@@ -90,7 +116,11 @@ uniform vec4 uLocalShadowParams2;
  *   t2 = spot [dir.xyz, cosOuter] / capsule [end offset.xyz, 0]
  *   t3 = [flickerSpeed, flickerAmplitude, flickerPhase, spotInvCosDelta]
  *   t4 = [shadow slot (-1 none), static face mask, dynamic face mask, near]
- *   t5 = [far, guard tanHalf, 0, 0]
+ *   t5 = [far, guard tanHalf, shadow fade weight, 0]
+ *
+ * Grid slots (R16UI): data row + 1 in the low byte (0 ends the cell's list),
+ * the slot's fade weight in the high byte — a light fading into or out of a
+ * cell scales both its light and its flood claim by it.
  *
  * Shadow lookup mirrors the camera construction in `shadow-atlas.ts`
  * (face bases, guard FOV, GL perspective depth); change neither side alone.
@@ -195,24 +225,46 @@ float localLightShadow(
     }
     llVis = min(llVis, llHits * 0.25);
   }
-  return mix(1.0, llVis, uLocalShadowParams2.y);
+  // t5.z fades a shadow in once its faces exist and out before its slot is
+  // handed to another light.
+  return mix(1.0, llVis, uLocalShadowParams2.y * llT5.z);
 }
 
+// Toroidal storage: a world cell keeps its storage cell (and its slots'
+// fades) while the window scrolls around it. Integer math on purpose: a
+// float mod() can return the modulus itself at exact multiples on GPUs that
+// divide by reciprocal, which would read a neighbouring cell's lights.
 int localLightCell(vec3 llPos) {
   vec3 llRel = (llPos - uLightGridOrigin) / uLightGridCellSize;
   if (any(lessThan(llRel, vec3(0.0))) || any(greaterThanEqual(llRel, uLightGridDims))) {
     return -1;
   }
-  ivec3 llCell = ivec3(llRel);
-  return (llCell.z * int(uLightGridDims.y) + llCell.y) * int(uLightGridDims.x) + llCell.x;
+  ivec3 llDims = ivec3(uLightGridDims);
+  ivec3 llCell = ivec3(llRel) + ivec3(uLightGridStorageOffset);
+  llCell -= llDims * ivec3(greaterThanEqual(llCell, llDims));
+  return (llCell.z * llDims.y + llCell.y) * llDims.x + llCell.x;
 }
 
-int localLightSlot(int llCell, int llSlot) {
+int localLightSlot(int llCell, int llSlot, out float llWeight) {
   ivec2 llCoord = ivec2(
     (llCell % ${GRID_CELLS_PER_ROW}) * ${MAX_LIGHTS_PER_CELL} + llSlot,
     llCell / ${GRID_CELLS_PER_ROW}
   );
-  return int(texelFetch(uLightGrid, llCoord, 0).r);
+  uint llValue = texelFetch(uLightGrid, llCoord, 0).r;
+  llWeight = float(llValue >> ${SLOT_WEIGHT_SHIFT}u) * ${(1 / 255).toFixed(8)};
+  return int(llValue & ${SLOT_ROW_MASK}u);
+}
+
+// The cell's overflow list, laid out like its slots: data row + 1 (0 ends
+// the list) and the light's share of it in the high byte.
+int localLightOverflowSlot(int llCell, int llSlot, out float llShare) {
+  ivec2 llCoord = ivec2(
+    (llCell % ${GRID_CELLS_PER_ROW}) * ${OVERFLOW_SLOTS_PER_CELL} + llSlot,
+    llCell / ${GRID_CELLS_PER_ROW}
+  );
+  uint llValue = texelFetch(uLightOverflow, llCoord, 0).r;
+  llShare = float(llValue >> ${SLOT_WEIGHT_SHIFT}u) * ${(1 / 255).toFixed(8)};
+  return int(llValue & ${SLOT_ROW_MASK}u);
 }
 
 float localLightFlicker(vec4 llT3) {
@@ -222,15 +274,130 @@ float localLightFlicker(vec4 llT3) {
 }
 
 // Window-rim fade shared by the analytic output and its flood claim: the
-// grid window's edge steps with the camera in whole cells, so both fade
-// over the outer two cells — the analytic light hands its coverage back to
-// the flood term in lockstep, and the combined visible block light stays
-// continuous across the rim instead of stacking full analytic on top of a
-// partially returned flood.
+// analytic light hands its coverage back to the flood term in lockstep, and
+// the combined visible block light stays continuous across the rim instead
+// of stacking full analytic on top of a partially returned flood. It is
+// measured from the window's centre, which moves smoothly, and reaches 0
+// inside the extent the window always covers — so the fade never steps when
+// the window scrolls a cell. (The legacy fade is measured from the window's
+// cell-snapped edge and steps by half at every scroll.)
 float localLightWindowFade(vec3 llPos) {
+  if (uLocalLightStable > 0.5) {
+    vec3 llEdge = uLightGridHalf - abs(llPos - uLightGridCenter.xyz);
+    return clamp(min(min(llEdge.x, llEdge.y), llEdge.z) / uLightGridCenter.w, 0.0, 1.0);
+  }
   vec3 llCellPos = (llPos - uLightGridOrigin) / uLightGridCellSize;
   vec3 llEdge = min(llCellPos, uLightGridDims - llCellPos);
   return clamp(min(min(llEdge.x, llEdge.y), llEdge.z) * 0.5, 0.0, 1.0);
+}
+
+// One clustered light at a fragment, everything but its shadow map: adds
+// the light's claim and hue, and returns its light (zero beyond its reach).
+// The cell's slots and its overflow both come through here, so a lamp a
+// full cell sends to overflow lights it exactly as a slot would; only the
+// shadow map is the slots' own (the flood mask still occludes an overflow
+// light, as it does every masked light).
+vec3 localLightResponse(
+  int llRec, vec3 llPos, vec3 llNormal, float llMask, float llSlotWeight,
+  inout float llClaim, inout vec3 llLightHue
+) {
+  vec4 llT0 = texelFetch(uLightData, ivec2(0, llRec), 0);
+  vec4 llT1 = texelFetch(uLightData, ivec2(1, llRec), 0);
+  int llFlags = int(llT1.w + 0.5);
+  int llShape = llFlags >> 4;
+
+  vec3 llOrigin = llT0.xyz;
+  if (llShape == 2) {
+    // Capsule: light from the closest point on the segment.
+    vec4 llT2 = texelFetch(uLightData, ivec2(2, llRec), 0);
+    vec3 llAxis = llT2.xyz;
+    float llLen2 = max(dot(llAxis, llAxis), 1e-6);
+    float llT = clamp(dot(llPos - llT0.xyz, llAxis) / llLen2, 0.0, 1.0);
+    llOrigin = llT0.xyz + llAxis * llT;
+  }
+
+  vec3 llToLight = llOrigin - llPos;
+  float llD2 = dot(llToLight, llToLight);
+  llLightHue += llT1.rgb * (llSlotWeight / (1.0 + llD2));
+  float llRange = llT0.w;
+  if (llD2 >= llRange * llRange) return vec3(0.0);
+  float llDist = sqrt(max(llD2, 1e-6));
+  vec3 llL = llToLight / llDist;
+
+  // A masked light's flood ends on the L1 diamond of its range, and the
+  // mask cuts it there. Windowing by the larger of the two distances
+  // brings the light to zero on that diamond instead of leaving it bright
+  // along the diagonals right up to the cut.
+  float llWindowDist = llDist;
+  if ((llFlags & 1) != 0) {
+    vec3 llAbs = abs(llToLight);
+    llWindowDist = mix(llDist, max(llDist, llAbs.x + llAbs.y + llAbs.z), uBlockLightDiamond);
+    if (llWindowDist >= llRange) return vec3(0.0);
+  }
+
+  // Windowed inverse square (legacy (1 - n^2)^2 behind the kernel switch):
+  // a hot core that fades evenly, instead of a plateau with a hard rim.
+  // On a ceiling the light hangs just under, the falloff is flat across
+  // its core: a cluster of hanging emitters lights its ceiling evenly
+  // instead of painting a bright pool round itself.
+  float llMountCore = (1.0 - blockLightMountFade(llToLight, llNormal))
+    * uBlockLightKernelCore * llRange;
+  float llFall = blockLightKernelFalloff(
+    llWindowDist,
+    max(llD2, llMountCore * llMountCore),
+    llRange
+  );
+
+  float llAngular = 1.0;
+  if (llShape == 1) {
+    vec4 llT2 = texelFetch(uLightData, ivec2(2, llRec), 0);
+    vec4 llT3s = texelFetch(uLightData, ivec2(3, llRec), 0);
+    llAngular = clamp((dot(-llL, llT2.xyz) - llT2.w) * llT3s.w, 0.0, 1.0);
+    llAngular *= llAngular;
+  }
+
+  // llT1.rgb is color pre-multiplied by intensity × share, so this is the
+  // light's unoccluded luminance claim at the fragment; a light fading in
+  // or out of the cell claims in proportion, handing the flood back.
+  llClaim += (llFall * llAngular * llSlotWeight) * dot(llT1.rgb, vec3(0.2126, 0.7152, 0.0722));
+
+  float llLambert = max(dot(llNormal, llL), 0.0) * ${(1 - LAMBERT_WRAP).toFixed(
+    4,
+  )} + ${LAMBERT_WRAP.toFixed(4)};
+
+  float llFlicker = 1.0;
+  if ((llFlags & 2) != 0) {
+    llFlicker = localLightFlicker(texelFetch(uLightData, ivec2(3, llRec), 0));
+  }
+
+  // Occlusion ladder, first rung: a masked light multiplies by the shared
+  // flood mask. A slot holding a shadow map COMPOSES the map on top of
+  // this (localLightSurface) rather than replacing it. The mask is the
+  // conservative always-available occluder; the maps refine it where
+  // cached content exists. A holder's face with no cached map
+  // (mount-skipped by allowedMask, or still queued in the FIFO) samples
+  // as fully visible, so without the mask floor a ceiling-mounted lamp
+  // pours full unoccluded light through the roof above it — giant colored
+  // patches across surfaces its flood provably cannot reach.
+  float llOcclusion = (llFlags & 1) != 0 ? llMask : 1.0;
+
+  // Submerged emitters lose energy to the water column, with the same
+  // extinction the cone lights use; the waterline transition spans one
+  // block so a bobbing lantern does not pop. Gated on camera submersion
+  // exactly like the terrain's downwelling attenuation, and measured
+  // against the surface of the water the camera is in, not the world's
+  // nominal waterline: that is a sea level, and in a world without a sea
+  // it drowned every lamp in view the moment the camera dipped into a
+  // pool. It must not drown dry lights in below-sea-level terrain either.
+  vec3 llTransmit = vec3(1.0);
+  if (uCameraSubmersion > 0.001 && llOrigin.y < uCameraWaterPlaneY) {
+    float llSubmersion = clamp(uCameraWaterPlaneY - llOrigin.y, 0.0, 1.0);
+    llTransmit = exp(
+      -${WATER_VIEW_EXTINCTION_GLSL} * llDist * llSubmersion
+    );
+  }
+
+  return llT1.rgb * (llFall * llAngular * llLambert * llFlicker * llOcclusion * llSlotWeight) * llTransmit;
 }
 
 // Alongside the lit response, computes llFloodRemainder: the fraction of
@@ -240,12 +407,17 @@ float localLightWindowFade(vec3 llPos) {
 // surfaces stay owned (dark) instead of being refilled by flat flood. Both
 // the lit response and the claim ride the window-rim fade, and the claim is
 // scaled by uLocalOwnership (0 at the off/potato tiers, where the clustered
-// count is also 0: the exact legacy frame).
+// count is also 0: the exact legacy frame). llLightHue is the colour of the
+// cell's lights at the fragment, each by inverse square distance and with
+// no range cutoff (a flood outlives its light's analytic reach by a few
+// blocks): the flood borrows it for the channels it has run out of
+// (blockLightCurveFilled).
 vec3 localLightSurface(
   vec3 llPos, vec3 llNormal, vec3 llFlood, int llSlotLimit, int llUseShadows,
-  out float llFloodRemainder
+  out float llFloodRemainder, out vec3 llLightHue
 ) {
   llFloodRemainder = 1.0;
+  llLightHue = vec3(0.0);
   if (llSlotLimit == 0) return vec3(0.0);
   if (uClusteredLightCount == 0) return vec3(0.0);
   int llCell = localLightCell(llPos);
@@ -262,88 +434,44 @@ vec3 localLightSurface(
   vec3 llTotal = vec3(0.0);
   for (int s = 0; s < ${MAX_LIGHTS_PER_CELL}; s++) {
     if (s >= llSlotLimit) break;
-    int llRec = localLightSlot(llCell, s);
+    float llSlotWeight;
+    int llRec = localLightSlot(llCell, s, llSlotWeight);
     if (llRec == 0) break;
     llRec -= 1;
-
-    vec4 llT0 = texelFetch(uLightData, ivec2(0, llRec), 0);
-    vec4 llT1 = texelFetch(uLightData, ivec2(1, llRec), 0);
-    int llFlags = int(llT1.w + 0.5);
-    int llShape = llFlags >> 4;
-
-    vec3 llOrigin = llT0.xyz;
-    vec3 llSpotDir = vec3(0.0);
-    if (llShape == 2) {
-      // Capsule: light from the closest point on the segment.
-      vec4 llT2 = texelFetch(uLightData, ivec2(2, llRec), 0);
-      vec3 llAxis = llT2.xyz;
-      float llLen2 = max(dot(llAxis, llAxis), 1e-6);
-      float llT = clamp(dot(llPos - llT0.xyz, llAxis) / llLen2, 0.0, 1.0);
-      llOrigin = llT0.xyz + llAxis * llT;
+    vec3 llLit = localLightResponse(
+      llRec, llPos, llNormal, llMask, llSlotWeight, llClaim, llLightHue
+    );
+    // Second rung of the occlusion ladder: a granted shadow slot's atlas
+    // maps, composed on the flood mask.
+    if (llUseShadows != 0 && llLit.r + llLit.g + llLit.b > 0.0) {
+      vec4 llT1 = texelFetch(uLightData, ivec2(1, llRec), 0);
+      int llFlags = int(llT1.w + 0.5);
+      if ((llFlags & 4) != 0) {
+        int llShape = llFlags >> 4;
+        vec3 llSpotDir = llShape == 1
+          ? texelFetch(uLightData, ivec2(2, llRec), 0).xyz
+          : vec3(0.0);
+        llLit *= localLightShadow(
+          llRec, llPos, llNormal, llShape,
+          texelFetch(uLightData, ivec2(0, llRec), 0).xyz, llSpotDir
+        );
+      }
     }
+    llTotal += llLit;
+  }
 
-    vec3 llToLight = llOrigin - llPos;
-    float llD2 = dot(llToLight, llToLight);
-    float llRange = llT0.w;
-    if (llD2 >= llRange * llRange) continue;
-    float llDist = sqrt(max(llD2, 1e-6));
-    vec3 llL = llToLight / llDist;
-
-    float llNorm = llDist / llRange;
-    float llFall = 1.0 - llNorm * llNorm;
-    llFall *= llFall;
-
-    float llAngular = 1.0;
-    if (llShape == 1) {
-      vec4 llT2 = texelFetch(uLightData, ivec2(2, llRec), 0);
-      vec4 llT3s = texelFetch(uLightData, ivec2(3, llRec), 0);
-      llSpotDir = llT2.xyz;
-      llAngular = clamp((dot(-llL, llT2.xyz) - llT2.w) * llT3s.w, 0.0, 1.0);
-      llAngular *= llAngular;
-    }
-
-    // llT1.rgb is color pre-multiplied by intensity × share, so this is the
-    // light's unoccluded luminance claim at the fragment.
-    llClaim += (llFall * llAngular) * dot(llT1.rgb, vec3(0.2126, 0.7152, 0.0722));
-
-    float llLambert = max(dot(llNormal, llL), 0.0) * ${(
-      1 - LAMBERT_WRAP
-    ).toFixed(4)} + ${LAMBERT_WRAP.toFixed(4)};
-
-    float llFlicker = 1.0;
-    if ((llFlags & 2) != 0) {
-      llFlicker = localLightFlicker(texelFetch(uLightData, ivec2(3, llRec), 0));
-    }
-
-    // Occlusion ladder: a masked light multiplies by the shared flood
-    // mask, and a granted shadow slot COMPOSES its atlas maps on top of
-    // that mask rather than replacing it. The mask is the conservative
-    // always-available occluder; the maps refine it where cached content
-    // exists. A holder's face with no cached map (mount-skipped by
-    // allowedMask, or still queued in the FIFO) samples as fully visible,
-    // so without the mask floor a ceiling-mounted lamp pours full
-    // unoccluded light through the roof above it — giant colored patches
-    // across surfaces its flood provably cannot reach. The common
-    // masked-point case costs the same select it did before shadows.
-    float llOcclusion = (llFlags & 1) != 0 ? llMask : 1.0;
-    if ((llFlags & 4) != 0 && llUseShadows != 0) {
-      llOcclusion *= localLightShadow(llRec, llPos, llNormal, llShape, llT0.xyz, llSpotDir);
-    }
-
-    // Submerged emitters lose energy to the water column, with the same
-    // extinction the cone lights use; the waterline transition spans one
-    // block so a bobbing lantern does not pop. Gated on camera submersion
-    // exactly like the terrain's downwelling attenuation: the nominal
-    // waterline must not drown dry lights in below-sea-level terrain.
-    vec3 llTransmit = vec3(1.0);
-    if (uCameraSubmersion > 0.001 && llOrigin.y < uWaterLevel) {
-      float llSubmersion = clamp(uWaterLevel - llOrigin.y, 0.0, 1.0);
-      llTransmit = exp(
-        -${WATER_VIEW_EXTINCTION_GLSL} * llDist * llSubmersion
+  // The cell's overflow: every light that reaches it past its slots (and
+  // the share a fading slot hands back), lit the same way minus the shadow
+  // map, so a cell that runs out of slots draws no line along its edge.
+  if (llSlotLimit >= ${MAX_LIGHTS_PER_CELL}) {
+    for (int s = 0; s < ${OVERFLOW_SLOTS_PER_CELL}; s++) {
+      float llShare;
+      int llRec = localLightOverflowSlot(llCell, s, llShare);
+      if (llRec == 0) break;
+      llTotal += localLightResponse(
+        llRec - 1, llPos, llNormal, llMask, llShare, llClaim, llLightHue
       );
     }
-
-    llTotal += llT1.rgb * (llFall * llAngular * llLambert * llFlicker * llOcclusion) * llTransmit;
   }
 
   // A true crossfade between the two complete compositions: the owned
@@ -353,7 +481,7 @@ vec3 localLightSurface(
   // rim; mixing the remainder toward 1 by the same fade the analytic rides
   // keeps the combined block light continuous across the whole band.
   float llFloodLum = max(max(llFlood.r, llFlood.g), llFlood.b);
-  float llFloodSmooth = llFloodLum * llFloodLum * (3.0 - 2.0 * llFloodLum);
+  float llFloodSmooth = blockLightCurve1(llFloodLum);
   float llRemainderOwned = 1.0 - clamp(
     (llClaim * uLocalOwnership * ${BLOCK_LIGHT_OWNERSHIP_GAIN.toFixed(2)})
       / max(llFloodSmooth, 1e-3),
@@ -363,6 +491,39 @@ vec3 localLightSurface(
   llFloodRemainder = mix(1.0, llRemainderOwned, llWindowFade);
 
   return llTotal * llWindowFade;
+}
+
+// Room fill (block-light plan step 8): the few lights nearest the camera,
+// as a weak half-Lambert bounce on surfaces the sky does not reach — the
+// side of a pillar facing away from a lamp is not black. Masked by the
+// fragment's own flood, which cannot pass a wall, so it never lights the
+// room next door; zero wherever the sky lights the fragment. The set
+// carries its own fades and daylight dimmer, so the fill never pops.
+vec3 localLightRoomFill(vec3 llPos, vec3 llNormal, float llSkyExposure, vec3 llFlood) {
+  if (uAirCount == 0 || llSkyExposure >= 0.999) return vec3(0.0);
+  float llFillMask = mix(
+    1.0,
+    // Eased in over the flood's outer eight levels: a two-level ramp cut
+    // the fill off along the flood's ragged diamond edge, leaving a warm
+    // band with a red fringe and specks on the floor.
+    smoothstep(0.0, 8.0 / 15.0, max(max(llFlood.r, llFlood.g), llFlood.b)),
+    uRoomFillFloodMask
+  );
+  if (llFillMask <= 0.0) return vec3(0.0);
+  vec3 llFill = vec3(0.0);
+  for (int i = 0; i < AIRLIGHT_SLOTS; i++) {
+    if (i >= uAirCount) break;
+    vec3 llToLight = uAirPos[i].xyz - llPos;
+    float llD2 = dot(llToLight, llToLight);
+    float llReach = uAirPos[i].w * uRoomFillRangeScale;
+    if (llD2 >= llReach * llReach) continue;
+    float llFacing = dot(llNormal, llToLight * inversesqrt(max(llD2, 1e-4))) * 0.5 + 0.5;
+    float llN2 = llD2 / (llReach * llReach);
+    float llCore = uAirColor[i].w * uRoomFillCoreScale;
+    llFill += uAirColor[i].rgb
+      * (llFacing * (1.0 - llN2) * (1.0 - llN2) / (1.0 + llD2 / (llCore * llCore)));
+  }
+  return llFill * (uRoomFillStrength * (1.0 - llSkyExposure) * llFillMask);
 }
 
 vec3 localLightSpecular(vec3 llPos, vec3 llNormal, vec3 llViewDir, vec3 llFlood) {
@@ -382,7 +543,8 @@ vec3 localLightSpecular(vec3 llPos, vec3 llNormal, vec3 llViewDir, vec3 llFlood)
     // Water already pays the diffuse clustered pass and screen refraction;
     // only the strongest resident light needs a positional highlight.
     if (s >= ${FLUID_SPECULAR_LIGHTS_PER_CELL}) break;
-    int llRec = localLightSlot(llCell, s);
+    float llSlotWeight;
+    int llRec = localLightSlot(llCell, s, llSlotWeight);
     if (llRec == 0) break;
     llRec -= 1;
 
@@ -393,9 +555,9 @@ vec3 localLightSpecular(vec3 llPos, vec3 llNormal, vec3 llViewDir, vec3 llFlood)
     if (llD2 >= llRange * llRange) continue;
     float llDist = sqrt(max(llD2, 1e-6));
 
-    float llNorm = llDist / llRange;
-    float llFall = 1.0 - llNorm * llNorm;
-    llFall *= llFall;
+    // Windowed inverse square (legacy (1 - n^2)^2 behind the kernel switch):
+    // a hot core that fades evenly, instead of a plateau with a hard rim.
+    float llFall = blockLightKernelFalloff(llDist, llD2, llRange);
 
     vec3 llHalf = normalize(llToLight / llDist + llViewDir);
     float llSpec = max(dot(llNormal, llHalf), 0.0);
@@ -412,7 +574,7 @@ vec3 localLightSpecular(vec3 llPos, vec3 llNormal, vec3 llViewDir, vec3 llFlood)
     // copy of the atlas sampler into the water branch.
     int llFlags = int(llT1.w + 0.5);
     float llOcclusion = (llFlags & 1) != 0 ? llMask : 1.0;
-    llTotal += llT1.rgb * (llSpec * llFall * llOcclusion);
+    llTotal += llT1.rgb * (llSpec * llFall * llOcclusion * llSlotWeight);
   }
   // The same rim fade the diffuse response rides: highlights from a light
   // whose coverage is handing back to the flood must dim in lockstep.
@@ -491,8 +653,9 @@ vec3 localLightDebugColor(
     // Cell occupancy heatmap: black 0, green 1-2, yellow 3-5, red 6+.
     if (llCell < 0) return llBase * 0.2;
     int llCount = 0;
+    float llCountWeight;
     for (int s = 0; s < ${MAX_LIGHTS_PER_CELL}; s++) {
-      if (localLightSlot(llCell, s) == 0) break;
+      if (localLightSlot(llCell, s, llCountWeight) == 0) break;
       llCount++;
     }
     vec3 llRamp = llCount == 0
@@ -517,8 +680,9 @@ vec3 localLightDebugColor(
   if (llCell < 0) return uLocalLightDebugMode < 4.5 ? llBase * 0.2 : vec3(1.0);
   vec3 llTint = llBase * 0.15;
   float llVisAll = 1.0;
+  float llDebugWeight;
   for (int s = 0; s < ${MAX_LIGHTS_PER_CELL}; s++) {
-    int llRec = localLightSlot(llCell, s);
+    int llRec = localLightSlot(llCell, s, llDebugWeight);
     if (llRec == 0) break;
     llRec -= 1;
     vec4 llT1d = texelFetch(uLightData, ivec2(1, llRec), 0);

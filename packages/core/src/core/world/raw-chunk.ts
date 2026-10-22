@@ -132,6 +132,36 @@ export class RawChunk {
     ];
   }
 
+  /**
+   * Whether a full-width, half-open vertical range contains only raw air.
+   * Used before serializing a meshing stencil: empty sky needs no worker.
+   * Reads current storage every time, so bulk loads, edits and shared-buffer
+   * replacement cannot leave a stale occupancy cache. Nonzero metadata is
+   * conservatively sent to the mesher too.
+   */
+  isAirRange(minY: number, maxY: number): boolean {
+    const { size, maxHeight } = this.options;
+    const data = this.voxels.data;
+    if (
+      !Number.isInteger(minY) ||
+      !Number.isInteger(maxY) ||
+      minY < 0 ||
+      maxY > maxHeight ||
+      minY >= maxY ||
+      data.length !== size * maxHeight * size
+    ) {
+      return false;
+    }
+    for (let x = 0; x < size; x++) {
+      const start = (x * maxHeight + minY) * size;
+      const end = (x * maxHeight + maxY) * size;
+      for (let i = start; i < end; i++) {
+        if (data[i] !== 0) return false;
+      }
+    }
+    return true;
+  }
+
   private static makeUint32View(
     buffer: ArrayBufferLike,
     byteOffset?: number,
@@ -190,21 +220,29 @@ export class RawChunk {
     return chunk;
   }
 
-  setData(data: ChunkProtocol) {
+  /**
+   * Takes a server payload for this chunk's coordinates. Returns whether it
+   * came under a different id: a server process mints ids for the chunks it
+   * generates, so after a restart it answers for the same place under a new
+   * one. The chunk is still that place, so it adopts the id and the data;
+   * throwing here wedged the per-frame chunk step on the first such payload.
+   */
+  setData(data: ChunkProtocol): boolean {
     const { id, x, z } = data;
-
-    if (this.id !== id) {
-      throw new Error("Chunk id mismatch");
-    }
 
     if (this.coords[0] !== x || this.coords[1] !== z) {
       throw new Error("Chunk coords mismatch");
     }
 
+    const idChanged = this.id !== id;
+    this.id = id;
+
     const { voxels, lights } = data;
 
     if (lights && lights.byteLength) this.lights.data = new Uint32Array(lights);
     if (voxels && voxels.byteLength) this.voxels.data = new Uint32Array(voxels);
+
+    return idChanged;
   }
 
   /**
@@ -217,11 +255,25 @@ export class RawChunk {
    * the chunk, this method returns `0`.
    */
   getRawValue(vx: number, vy: number, vz: number) {
-    if (!this.contains(vx, vy, vz)) {
+    // Inlined bounds check + local mapping: this is the hottest read in the
+    // client (every column walk, raycast step, and light sample lands here),
+    // and the tuple-returning helpers it used to call allocated two arrays
+    // per read. A water column walk of sixty blocks made a hundred and
+    // twenty of them per entity per frame.
+    const lx = (vx | 0) - this.min[0];
+    const ly = (vy | 0) - this.min[1];
+    const lz = (vz | 0) - this.min[2];
+    const { size, maxHeight } = this.options;
+    if (
+      lx < 0 ||
+      lx >= size ||
+      ly < 0 ||
+      ly >= maxHeight ||
+      lz < 0 ||
+      lz >= size
+    ) {
       return 0;
     }
-
-    const [lx, ly, lz] = this.toLocal(vx, vy, vz);
     return this.voxels.get(lx, ly, lz);
   }
 
@@ -251,8 +303,22 @@ export class RawChunk {
    * @returns The raw light value at the given voxel coordinate.
    */
   getRawLight(vx: number, vy: number, vz: number) {
-    if (!this.contains(vx, vy, vz)) return 0;
-    const [lx, ly, lz] = this.toLocal(vx, vy, vz);
+    // Same inlining as getRawValue: a light sample reads this four times
+    // (sun + three torch channels) per entity per frame.
+    const lx = (vx | 0) - this.min[0];
+    const ly = (vy | 0) - this.min[1];
+    const lz = (vz | 0) - this.min[2];
+    const { size, maxHeight } = this.options;
+    if (
+      lx < 0 ||
+      lx >= size ||
+      ly < 0 ||
+      ly >= maxHeight ||
+      lz < 0 ||
+      lz >= size
+    ) {
+      return 0;
+    }
     return this.lights.get(lx, ly, lz);
   }
 
@@ -711,7 +777,9 @@ export class RawChunk {
 
   private contains(vx: number, vy: number, vz: number) {
     const { size, maxHeight } = this.options;
-    const [lx, ly, lz] = this.toLocal(vx, vy, vz);
+    const lx = (vx | 0) - this.min[0];
+    const ly = (vy | 0) - this.min[1];
+    const lz = (vz | 0) - this.min[2];
 
     return (
       lx >= 0 && lx < size && ly >= 0 && ly < maxHeight && lz >= 0 && lz < size

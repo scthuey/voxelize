@@ -59,6 +59,11 @@ pub struct Chunk {
     pub lights: Arc<Ndarray<u32>>,
     pub height_map: Arc<Ndarray<u32>>,
 
+    /// Optional climate tint at the four horizontal corners, x-fast RGB.
+    /// A byte represents a linear multiplier in 0..1.9921875. Generation/restoration
+    /// owns this small derived field; player voxel edits never change it.
+    pub biome_tints: Option<[u8; 12]>,
+
     pub meshes: Option<HashMap<u32, MeshProtocol>>,
 
     pub min: Vec3<i32>,
@@ -67,6 +72,10 @@ pub struct Chunk {
     pub options: ChunkOptions,
 
     pub extra_changes: Vec<VoxelUpdate>,
+    /// One-time entity contents authored by generation stages. These travel
+    /// with the chunk until it becomes ready; saved entity JSON subsequently
+    /// owns the contents. Ordinary chunks leave this map empty.
+    pub block_entity_seeds: HashMap<Vec3<i32>, (u32, String)>,
     pub updated_levels: HashSet<u32>,
 
     /// Highest y that may hold a nonzero voxel, maintained by `set_raw_voxel`
@@ -87,6 +96,14 @@ pub struct Chunk {
     /// Only a load from disk or the end of worldgen re-establishes the
     /// persisted form and clears it.
     pub(crate) is_save_dirty: bool,
+
+    /// Counts every voxel or light write that reaches this chunk through the
+    /// live `Chunks` map. A Load pass lights a clone taken at dispatch; when
+    /// its result lands with a different epoch than the live chunk, light or
+    /// blocks arrived in between (a neighbour's flood across the border, a
+    /// fluid step, a structure's late write) and the result would erase
+    /// them, so the chunk is lit again from its live state instead.
+    pub write_epoch: u64,
 
     pub waterlogging_rules: Option<Arc<super::waterlogging::WaterloggingRules>>,
 }
@@ -178,6 +195,10 @@ impl Chunk {
             z: self.coords.1,
             id: self.id.clone(),
             meshes,
+            biome_tints: self
+                .biome_tints
+                .map(|tints| tints.to_vec())
+                .unwrap_or_default(),
             voxels: if data {
                 Some((*self.voxels).clone())
             } else {

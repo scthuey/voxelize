@@ -121,6 +121,16 @@ export class Entity<T = any> extends Group {
 
   update?: () => void;
 
+  /**
+   * Called each frame in place of `update` while the server holds the
+   * entity frozen. The pose holds, but state that belongs to the world
+   * rather than the pose — the voxel light an instance is shaded with —
+   * should keep tracking it, or a creature frozen at dusk stays lit as
+   * it was when it froze (or as the pool's default, if it streamed in
+   * frozen).
+   */
+  updateFrozen?: () => void;
+
   setHidden?: (hidden: boolean) => void;
 
   snapToTarget?: () => void;
@@ -139,11 +149,21 @@ export type EntitiesOptions = {
    * suspended, so reconnects and tab suspensions do not purge live entities.
    */
   streamSilenceGraceSeconds: number;
+
+  /**
+   * Seconds a released entity's tick watermark is kept so a late,
+   * out-of-order UPDATE for it cannot resurrect it. Reordering on the
+   * unordered lane is a matter of seconds; past this the watermark is
+   * dropped, which is what keeps the map from growing by one entry for
+   * every creature that ever streamed past the player.
+   */
+  releasedTickRetentionSeconds: number;
 };
 
 const defaultOptions: EntitiesOptions = {
   stalenessTimeoutSeconds: 10,
   streamSilenceGraceSeconds: 3,
+  releasedTickRetentionSeconds: 30,
 };
 
 /**
@@ -173,8 +193,19 @@ const defaultOptions: EntitiesOptions = {
  * @noInheritDoc
  * @category Core
  */
+/**
+ * Method that asks the server for the world's on-request entity metadata
+ * keys (debug views it replicates only on request) or stops them.
+ */
+export const ON_REQUEST_METADATA_METHOD = "vox-builtin:on-request-metadata";
+
 export class Entities extends Group implements NetIntercept {
   public map: Map<string, Entity> = new Map();
+
+  /** Requests for the server (see `setOnRequestMetadata`). */
+  public packets: MessageProtocol[] = [];
+
+  private isOnRequestMetadataWanted = false;
   public types: Map<
     string,
     (new (id: string) => Entity) | ((id: string) => Entity)
@@ -193,6 +224,13 @@ export class Entities extends Group implements NetIntercept {
    * on unordered transports (WebRTC) can never rewind an entity.
    */
   private lastAppliedTick: Map<string, number> = new Map();
+
+  /**
+   * Released entities whose watermark is still held, keyed to the second
+   * they were released. Insertion order is release order, so the sweep in
+   * `update` stops at the first entry inside the retention window.
+   */
+  private releasedAt: Map<string, number> = new Map();
 
   /**
    * Wall-clock ms of the last motion-bearing apply per entity, plus the gap
@@ -219,6 +257,39 @@ export class Entities extends Group implements NetIntercept {
   };
 
   /**
+   * The server tick stamp of the newest state applied for entity `id`, or
+   * `undefined` before any stamped message reached it. A client can name it
+   * in a request that acts on what it sees, so an authoritative server can
+   * tell how old that view was, however long the message queue held it,
+   * and resolve the request against the entity as the client saw it.
+   */
+  /**
+   * Receive the world's on-request entity metadata keys, or stop. A world
+   * keeps metadata only a debug view reads (and that changes every tick)
+   * out of every client's updates unless asked; ask while such a view is
+   * shown. Kept across reconnects: a fresh session is asked again.
+   */
+  setOnRequestMetadata = (isWanted: boolean) => {
+    if (isWanted === this.isOnRequestMetadataWanted) return;
+    this.isOnRequestMetadataWanted = isWanted;
+    this.requestOnRequestMetadata();
+  };
+
+  private requestOnRequestMetadata() {
+    this.packets.push({
+      type: "METHOD",
+      method: {
+        name: ON_REQUEST_METADATA_METHOD,
+        payload: JSON.stringify({ on: this.isOnRequestMetadataWanted }),
+      },
+    } as MessageProtocol);
+  }
+
+  appliedTick = (id: string): number | undefined => {
+    return this.lastAppliedTick.get(id);
+  };
+
+  /**
    * The network intercept implementation for entities.
    *
    * DO NOT CALL THIS METHOD OR CHANGE IT UNLESS YOU KNOW WHAT YOU ARE DOING.
@@ -236,6 +307,7 @@ export class Entities extends Group implements NetIntercept {
     // fresh snapshots, so no stale ghost can outlive a reconnect.
     if (message.type === "INIT") {
       this.releaseAllEntities();
+      if (this.isOnRequestMetadataWanted) this.requestOnRequestMetadata();
     }
 
     const { entities } = message;
@@ -343,6 +415,7 @@ export class Entities extends Group implements NetIntercept {
           object.onCreate?.(metadata);
           this.noteAppliedTick(id, messageTick);
           this.liveness.touchEntity(id, nowSeconds);
+          this.releasedAt.delete(id);
         }
 
         break;
@@ -372,8 +445,8 @@ export class Entities extends Group implements NetIntercept {
           // do. Constructing from a partial snapshot hands game
           // callbacks metadata missing the keys they iterate
           // (position, direction, ...) — the exact shape that broke
-          // Town clients. Partial state waits for the reliable
-          // CREATE.
+          // game clients in production. Partial state waits for the
+          // reliable CREATE.
           if (!metadata || metadata.position === undefined) {
             return;
           }
@@ -381,6 +454,7 @@ export class Entities extends Group implements NetIntercept {
           if (object) {
             object.metadata = metadata;
             object.onCreate?.(metadata);
+            this.releasedAt.delete(id);
           }
         }
 
@@ -415,6 +489,13 @@ export class Entities extends Group implements NetIntercept {
         this.noteAppliedTick(id, messageTick);
 
         if (!object) {
+          // Nothing to release, but the watermark just written still has
+          // to expire: a lifecycle event for an entity that never got
+          // constructed here (it left range before its CREATE landed) is
+          // the common case while streaming past a shoal.
+          if (this.lastAppliedTick.has(id) && !this.releasedAt.has(id)) {
+            this.releasedAt.set(id, nowSeconds);
+          }
           return;
         }
 
@@ -443,6 +524,7 @@ export class Entities extends Group implements NetIntercept {
         this.liveness.forget(id);
       }
     }
+    this.forgetExpiredWatermarks(nowSeconds);
 
     const renderDistSq =
       cameraPos && renderDistance ? renderDistance * renderDistance : 0;
@@ -463,9 +545,11 @@ export class Entities extends Group implements NetIntercept {
       // A server-frozen entity holds whatever pose it last rendered: its
       // class update (animation clocks, interpolation, bone writes) is
       // skipped, while position bookkeeping stays pinned to the replicated
-      // transform so hitboxes and nametags sit at server truth.
+      // transform so hitboxes and nametags sit at server truth, and its
+      // world-driven state (lighting) keeps up through `updateFrozen`.
       if (isEntityMetadataFrozen(entity.metadata as MutableMetadata | null)) {
         entity.snapToTarget?.();
+        entity.updateFrozen?.();
         return;
       }
 
@@ -483,12 +567,34 @@ export class Entities extends Group implements NetIntercept {
     this.map.delete(object.entId);
     this.liveness.forget(object.entId);
     this.lastMotionApplyMs.delete(object.entId);
-    // lastAppliedTick is intentionally kept: it is what blocks an
-    // out-of-order state frame from resurrecting the released entity. It is
+    // lastAppliedTick is kept for now: it is what blocks an out-of-order
+    // state frame from resurrecting the released entity. It expires after
+    // `releasedTickRetentionSeconds` (see forgetExpiredWatermarks) and is
     // cleared wholesale on INIT (a fresh server session).
+    if (this.lastAppliedTick.has(object.entId)) {
+      // Re-insert so the entry sits at the end of the release order even
+      // if this id was released once before.
+      this.releasedAt.delete(object.entId);
+      this.releasedAt.set(object.entId, performance.now() / 1000);
+    }
 
     object.parent?.remove(object);
     object.onDelete?.(metadata);
+  };
+
+  /**
+   * Drop the watermarks of entities released longer ago than the retention
+   * window. Without this the map held one entry for every entity that ever
+   * streamed into range: swimming past reefs and shoals for an hour left
+   * thousands of ids nothing would ever read again.
+   */
+  private forgetExpiredWatermarks = (nowSeconds: number) => {
+    const cutoff = nowSeconds - this.options.releasedTickRetentionSeconds;
+    for (const [id, releasedAt] of this.releasedAt) {
+      if (releasedAt > cutoff) break;
+      this.releasedAt.delete(id);
+      this.lastAppliedTick.delete(id);
+    }
   };
 
   private releaseAllEntities = () => {
@@ -496,6 +602,7 @@ export class Entities extends Group implements NetIntercept {
       this.releaseEntity(object, object.metadata);
     }
     this.lastAppliedTick.clear();
+    this.releasedAt.clear();
   };
 
   /**

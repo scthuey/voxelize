@@ -1,8 +1,11 @@
 import init, { mesh_chunk_fast, set_registry } from "@voxelize/wasm-mesher";
 
 import { Coords3 } from "../../../types";
+import { type BranchShape, type BranchSocket } from "../branch";
 import { type WorldOptions } from "../index";
+import { computeQuadLightTwist } from "../quad-light";
 import { type SerializedChunkPayload } from "../raw-chunk";
+import { Registry } from "../registry";
 import {
   isMainThreadSortedBlock,
   POSITION_BLOCK_BIAS,
@@ -11,6 +14,8 @@ import {
   quantizePositions,
   quantizeUvs,
 } from "../vertex-quantization";
+
+import { WORKER_READY_MESSAGE_TYPE } from "./worker-ready";
 
 type ChunkData = {
   voxels: Uint32Array | number[];
@@ -32,9 +37,11 @@ type WasmBlock = {
   isSeeThrough: boolean;
   isTransparent: [boolean, boolean, boolean, boolean, boolean, boolean];
   transparentStandalone: boolean;
+  standaloneFaceDepth: number;
   occludesFluid: boolean;
   isPlant: boolean;
   stackGroup: number;
+  isAnimated: boolean;
   faces: {
     name: string;
     independent: boolean;
@@ -44,6 +51,9 @@ type WasmBlock = {
     corners: { pos: [number, number, number]; uv: [number, number] }[];
     range: { startU: number; endU: number; startV: number; endV: number };
     emissive: number;
+    stageTintMask: number;
+    pigmentMask: number;
+    regionalTint: boolean;
   }[];
   aabbs: {
     minX: number;
@@ -71,6 +81,9 @@ type WasmBlock = {
               endV: number;
             };
             emissive: number;
+            stageTintMask: number;
+            pigmentMask: number;
+            regionalTint: boolean;
           }[];
           aabbs: {
             minX: number;
@@ -85,6 +98,37 @@ type WasmBlock = {
         }[];
       }[]
     | null;
+  connected: ConnectedFrame | null;
+  // Mirror `branch`, `branch_sockets` and `branch_shell` on the mesher's
+  // `Block`. Dropping any would mesh a branch as its plain texture cube,
+  // leave twigs short of their leaves, or draw a wide trunk's shells as
+  // cubes the moment a chunk re-meshes locally.
+  branch: BranchShape | null;
+  branchSockets: BranchSocket[];
+  branchShell: boolean;
+  // Mirrors `stage_faces`: without it a voxel whose stage picks the block's
+  // other look re-meshes locally in its plain one.
+  stageFaces: { mask: number; faces: WasmBlock["faces"] } | null;
+  // Mirrors `tufts`: without it a canopy's soft outline drops off the moment
+  // a chunk re-meshes locally.
+  tufts: {
+    faces: WasmBlock["faces"];
+    stageFaces: WasmBlock["faces"];
+    jitter: number;
+    tilt: number;
+  } | null;
+};
+
+// Mirrors `ConnectedFrame` in crates/mesher/src/mesher/types.rs. Dropping it
+// here would mesh joined glass with every frame on the moment a chunk
+// re-meshes locally, while the server's meshes drew only the outline.
+type ConnectedFrame = {
+  key: number;
+  frameTexels: number;
+  cornerTexels: number;
+  texelsPerBlock: number;
+  clearInterior: boolean;
+  interiorOneIn?: number;
 };
 
 type WasmRegistry = {
@@ -105,6 +149,9 @@ type RawWasmFace = {
     endV?: number;
   };
   emissive?: number;
+  stageTintMask?: number;
+  pigmentMask?: number;
+  regionalTint?: boolean;
 };
 
 type RawWasmAabb = {
@@ -139,13 +186,26 @@ type RawWasmBlock = {
   isSeeThrough: boolean;
   isTransparent: [boolean, boolean, boolean, boolean, boolean, boolean];
   transparentStandalone: boolean;
+  standaloneFaceDepth?: number;
   lightAttenuation?: number;
   occludesFluid?: boolean;
   isPlant?: boolean;
   stackGroup?: number;
+  isAnimated?: boolean;
   faces: RawWasmFace[];
   aabbs: RawWasmAabb[];
   dynamicPatterns?: RawWasmDynamicPattern[] | null;
+  connected?: ConnectedFrame | null;
+  branch?: BranchShape | null;
+  branchSockets?: BranchSocket[];
+  branchShell?: boolean;
+  stageFaces?: { mask: number; faces: RawWasmFace[] } | null;
+  tufts?: {
+    faces: RawWasmFace[];
+    stageFaces?: RawWasmFace[];
+    jitter: number;
+    tilt?: number;
+  } | null;
 };
 
 type GeometryProtocol = {
@@ -253,7 +313,9 @@ onmessage = async function (e) {
       wasmInitialized = true;
     }
 
-    const rawRegistry = e.data.registryData;
+    // Arrives as one JSON string (see Registry.serialize); parsing it here
+    // is what keeps the main thread out of the registry hand-off.
+    const rawRegistry = Registry.parseSerialized(e.data.registryData);
     const wasmRegistry = convertRegistryToWasm(rawRegistry);
     set_registry(wasmRegistry);
 
@@ -269,6 +331,9 @@ onmessage = async function (e) {
         )
         .map(([id]: [number, RawWasmBlock]) => id),
     );
+    // The pool hands this worker no job until it hears this.
+    // @ts-expect-error postMessage typing
+    postMessage({ type: WORKER_READY_MESSAGE_TYPE }, []);
     return;
   }
 
@@ -281,7 +346,9 @@ onmessage = async function (e) {
 
   const { chunksData, min, max } = e.data;
   const options = e.data.options as WorldOptions;
-  const { chunkSize } = options;
+  // A free-standing voxel box rides as one chunk as wide as itself; its
+  // geometry still quantizes on the world's own section scale.
+  const chunkSize: number = e.data.meshChunkSize ?? options.chunkSize;
   const positionUnits = positionUnitsPerBlock(options);
 
   const chunks = chunksData.map(
@@ -359,9 +426,11 @@ onmessage = async function (e) {
       const bs = workerComputeBoundingSphere(positions);
 
       const isQuantized = !sortedBlockIds.has(geometry.voxel);
+      const lights = new Int32Array(geometry.lights);
       const packedGeometry = {
         indices,
-        lights: new Int32Array(geometry.lights),
+        lights,
+        lightTwist: computeQuadLightTwist(lights, indices),
         positions: isQuantized
           ? quantizePositions(positions, positionUnits)
           : positions,
@@ -382,6 +451,7 @@ onmessage = async function (e) {
 
       arrayBuffers.push(packedGeometry.indices.buffer);
       arrayBuffers.push(packedGeometry.lights.buffer);
+      arrayBuffers.push(packedGeometry.lightTwist.buffer as ArrayBuffer);
       arrayBuffers.push(packedGeometry.positions.buffer as ArrayBuffer);
       arrayBuffers.push(packedGeometry.uvs.buffer as ArrayBuffer);
       arrayBuffers.push(packedGeometry.normals.buffer as ArrayBuffer);
@@ -398,7 +468,7 @@ onmessage = async function (e) {
   postMessage(payload, arrayBuffers);
 };
 
-function convertRegistryToWasm(rawRegistry: {
+export function convertRegistryToWasm(rawRegistry: {
   blocksById: [number, RawWasmBlock][];
   blocksByName: [string, RawWasmBlock][];
 }): WasmRegistry {
@@ -417,13 +487,33 @@ function convertRegistryToWasm(rawRegistry: {
         isSeeThrough: block.isSeeThrough,
         isTransparent: block.isTransparent,
         transparentStandalone: block.transparentStandalone as boolean,
+        standaloneFaceDepth: block.standaloneFaceDepth ?? 0,
         occludesFluid: block.occludesFluid ?? false,
         isPlant: block.isPlant ?? false,
         stackGroup: block.stackGroup ?? 0,
+        isAnimated: block.isAnimated ?? false,
         faces: convertFaces(block.faces),
         aabbs: convertAabbs(block.aabbs),
         dynamicPatterns: block.dynamicPatterns
           ? convertDynamicPatterns(block.dynamicPatterns)
+          : null,
+        connected: block.connected ?? null,
+        branch: block.branch ?? null,
+        branchSockets: block.branchSockets ?? [],
+        branchShell: block.branchShell ?? false,
+        stageFaces: block.stageFaces
+          ? {
+              mask: block.stageFaces.mask,
+              faces: convertFaces(block.stageFaces.faces),
+            }
+          : null,
+        tufts: block.tufts
+          ? {
+              faces: convertFaces(block.tufts.faces),
+              stageFaces: convertFaces(block.tufts.stageFaces ?? []),
+              jitter: block.tufts.jitter,
+              tilt: block.tufts.tilt ?? 0,
+            }
           : null,
       };
       return [id, wasmBlock];
@@ -446,6 +536,9 @@ function convertFaces(faces: RawWasmFace[] | undefined): WasmBlock["faces"] {
       uv: corner.uv,
     })),
     emissive: face.emissive ?? 0,
+    stageTintMask: face.stageTintMask ?? 0,
+    pigmentMask: face.pigmentMask ?? 0,
+    regionalTint: face.regionalTint ?? false,
     range: {
       startU: face.range?.startU ?? 0,
       endU: face.range?.endU ?? 1,

@@ -1,5 +1,6 @@
 use serde::Serialize;
 
+use super::far_terrain::FarTerrainDescriptor;
 use super::fixed_step::FixedStepConfig;
 use super::generators::NoiseOptions;
 use super::lag_comp::LagCompConfig;
@@ -48,8 +49,55 @@ pub struct WorldConfig {
     /// Maximum chunks to be processed per tick. Default is 24 chunks.
     pub max_chunks_per_tick: usize,
 
-    /// Maximum voxel updates to be processed per tick. Default is 1000 voxels.
+    /// Maximum external voxel updates (edits, methods, commands) to commit
+    /// per tick, whatever `max_update_ms_per_tick` would allow. Default is
+    /// 50000, i.e. effectively unbounded.
     pub max_updates_per_tick: usize,
+
+    /// Milliseconds a tick may spend committing voxel updates and lighting
+    /// them, on both lanes: the simulation's first, then the external ones.
+    /// They commit in batches of at most `max_active_updates_per_batch` and
+    /// `max_updates_per_batch`, each lit in full before the next starts, and
+    /// the tick takes no further batch once it has spent this, but each lane
+    /// commits at least one batch a tick.
+    /// The updates it does not reach wait, in order, at the head of their
+    /// lane for the next tick, and none is dropped: a bulk edit that floods a
+    /// pit with sunlight, or a felled tree taken to air, lands over a few
+    /// ticks instead of in one long one. Default is 6.
+    pub max_update_ms_per_tick: f64,
+
+    /// The most external updates committed and lit as one batch: what
+    /// `max_update_ms_per_tick` can be overrun by is one batch's cost on that
+    /// lane. Default is 256.
+    pub max_updates_per_batch: usize,
+
+    /// The most simulation-produced updates committed and lit as one batch.
+    /// Smaller than an external batch: the simulation takes a felled tree's
+    /// crown to air, where one write can open a column of sky, so a batch's
+    /// light costs far more per write than a fill's. Default is 64.
+    pub max_active_updates_per_batch: usize,
+
+    /// Maximum simulation-produced voxel updates (fluid steps, growth,
+    /// active-block tickers) to commit per tick, whatever
+    /// `max_update_ms_per_tick` would allow. These drain on their own lane,
+    /// so a world that budgets external edits tightly (a shared world
+    /// throttling bulk builds) still lets its water flow at full cadence.
+    /// Default is 50000, i.e. effectively unbounded.
+    pub max_active_updates_per_tick: usize,
+
+    /// Milliseconds a tick may spend asking active tickers when they next
+    /// want to run, for the voxels its writes touched (each written voxel
+    /// and its neighbors). The consults a tick does not reach carry into the
+    /// next one, ahead of that tick's own, and none is dropped: a bulk edit
+    /// beside costly tickers wakes its neighbors over a few ticks instead of
+    /// in one long one. At least one consult runs a tick. Default is 4.
+    pub max_ticker_consult_ms_per_tick: f64,
+
+    /// Milliseconds a tick may spend planning due active voxels (running
+    /// their updaters). The due voxels it does not reach keep the deadline
+    /// they missed and plan first the next tick; none is dropped. At least
+    /// one plans a tick. Default is 4.
+    pub max_active_plan_ms_per_tick: f64,
 
     /// Subchunk random-tick sampler rate: each loaded/interested
     /// 16x16x(section) subchunk samples this many random positions per world
@@ -65,7 +113,8 @@ pub struct WorldConfig {
     /// `ChunkUpdatingSystem`; the sampler only *queues* work for later pops.
     pub max_random_ticks_per_tick: usize,
 
-    /// Maximum responses to send to client per tick to prevent bottle-necking. Default is 4 chunks.
+    /// Maximum already-ready chunks answered to a client per tick, to keep one
+    /// client's burst from monopolising a tick. Default is 16 chunks.
     pub max_response_per_tick: usize,
 
     /// Maximum chunks saved per tick.
@@ -93,6 +142,38 @@ pub struct WorldConfig {
     pub air_drag: f32,
 
     pub does_tick_time: bool,
+
+    /// While no client is in the world, it dispatches its systems once per
+    /// this many milliseconds instead of every tick, and the day clock
+    /// catches up by the real time that passed. `0` never hibernates.
+    /// Deterministic (fixed-step) worlds and preloading worlds never
+    /// hibernate. Default is 500 (2 Hz).
+    pub hibernation_interval_ms: u64,
+
+    /// The length of one world step in milliseconds: how much world time one
+    /// `stats.tick` stands for. A dispatch advances `tick` by the steps the
+    /// real time since the last one covers, so tick-counted timers keep real
+    /// time however often the world dispatches. Default is 16 (the Server's
+    /// tick period).
+    pub world_step_ms: u64,
+
+    /// The most steps one dispatch advances; the rest carries to the next
+    /// dispatches, so recovering from a stall never spikes. Default is 64.
+    pub max_catch_up_steps: u64,
+
+    /// The most real time a world carries as unpaid steps, in seconds. Past
+    /// it (a machine that slept for hours) the world resumes rather than
+    /// racing to catch up. Default is 600.
+    pub max_catch_up_debt_secs: u64,
+
+    /// How many ticks of random-tick sampling a chunk is owed when players
+    /// come back to it, at most (crops and saplings that grew while nobody
+    /// watched). Default is 75000, 20 minutes of steps.
+    pub max_random_tick_catch_up_ticks: u64,
+
+    /// Random-tick samples per dispatch spent paying chunks back, on top of
+    /// `max_random_ticks_per_tick`. Default is 1024.
+    pub max_random_tick_catch_up_per_tick: usize,
 
     pub default_time: f32,
 
@@ -127,6 +208,18 @@ pub struct WorldConfig {
     /// Prefix for all commands.
     pub command_symbol: String,
 
+    /// Public chat lines the world remembers and replays to every client that
+    /// joins (see [`ChatLog`](super::ChatLog)). `0` keeps no history. Default
+    /// is 2000.
+    pub chat_history_capacity: usize,
+
+    /// Directory the chat history persists to. `None` (default) uses
+    /// `<save_dir>/chat` on a saved world and keeps an unsaved world's history
+    /// in memory only; set it to keep chat across restarts of a world whose
+    /// terrain is not saved.
+    #[serde(skip)]
+    pub chat_log_dir: Option<String>,
+
     /// Whether entities should be saved. Only applies if `saving` is true.
     pub save_entities: bool,
 
@@ -154,6 +247,13 @@ pub struct WorldConfig {
     /// Ticks between keep-alive updates for tracked entities whose metadata has
     /// not changed, letting clients treat prolonged silence as a lost entity.
     pub entity_keep_alive_interval: u64,
+
+    /// Entity metadata keys replicated only to clients that ask for them
+    /// (the `vox-builtin:on-request-metadata` method): views a game keeps for
+    /// debugging that change every tick. Left in the shared metadata lane,
+    /// one would resend an entity's whole metadata, static keys included, to
+    /// every client every tick. CREATE snapshots still carry them.
+    pub on_request_metadata_keys: Vec<String>,
 
     /// Wall-clock bound (milliseconds) on how stale a pending MOTION update
     /// for a visible entity may get before it is flushed regardless of the
@@ -198,6 +298,12 @@ pub struct WorldConfig {
     /// tick-anchored; a `Some` here without a fixed step is rejected at build
     /// time.
     pub lag_comp: Option<LagCompConfig>,
+
+    /// The far-terrain layer this world serves, as every client learns it
+    /// from the INIT options; `None` (the default) is a world with no far
+    /// layer. Set through `World::set_far_terrain`, not the builder, because
+    /// it comes with the sampler that answers the tiles.
+    pub far_terrain: Option<FarTerrainDescriptor>,
 }
 
 impl Default for WorldConfig {
@@ -234,10 +340,25 @@ const DEFAULT_MAX_LIGHT_LEVEL: u32 = 15;
 // written when the drain was unbounded, so nothing ever ran at 4.
 const DEFAULT_MAX_CHUNKS_PER_TICK: usize = 64;
 const DEFAULT_MAX_UPDATES_PER_TICK: usize = 50000;
+const DEFAULT_MAX_ACTIVE_UPDATES_PER_TICK: usize = 50000;
+// The wake work a tick does for its writes, held to a few milliseconds each
+// so a bulk edit beside costly tickers stays inside a 60 Hz tick.
+const DEFAULT_MAX_TICKER_CONSULT_MS_PER_TICK: f64 = 4.0;
+const DEFAULT_MAX_ACTIVE_PLAN_MS_PER_TICK: f64 = 4.0;
+// The writes themselves and their light, held the same way: a bulk edit
+// opening a pit to the sky floods it a few batches a tick.
+const DEFAULT_MAX_UPDATE_MS_PER_TICK: f64 = 6.0;
+const DEFAULT_MAX_UPDATES_PER_BATCH: usize = 256;
+const DEFAULT_MAX_ACTIVE_UPDATES_PER_BATCH: usize = 64;
 /// Three random-tick samples per 16^3 subchunk section per world tick.
 const DEFAULT_RANDOM_TICK_SPEED: usize = 3;
 const DEFAULT_MAX_RANDOM_TICKS_PER_TICK: usize = 2048;
-const DEFAULT_MAX_RESPONSE_PER_TICK: usize = 4;
+// Ready chunks answered straight from memory, per client per tick. A
+// joining client asks for its 3x3 spawn window plus a few more in one packet;
+// at 4 the ninth chunk of that window went out on the third tick and a
+// twenty-chunk burst took five, each a separate ~1KB bulk message. 16 clears
+// the burst in two ticks and is what a production world already ran.
+const DEFAULT_MAX_RESPONSE_PER_TICK: usize = 16;
 const DEFAULT_MAX_SAVES_PER_TICK: usize = 2;
 /// A chunk pushed back through the pipeline is readable again within a handful
 /// of ticks, so a save that still cannot read its chunk a full second later
@@ -254,12 +375,21 @@ const DEFAULT_FLUID_DENSITY: f32 = 0.8;
 const DEFAULT_COLLISION_REPULSION: f32 = 2.3;
 const DEFAULT_CLIENT_COLLISION_REPULSION: f32 = 0.0;
 const DEFAULT_DOES_TICK_TIME: bool = true;
+/// 2 Hz: an empty world still drains its queues, saves, and moves its clocks,
+/// at a thirtieth of the cost of ticking at 60 Hz.
+const DEFAULT_HIBERNATION_INTERVAL_MS: u64 = 500;
+const DEFAULT_WORLD_STEP_MS: u64 = 16;
+const DEFAULT_MAX_CATCH_UP_STEPS: u64 = 64;
+const DEFAULT_MAX_CATCH_UP_DEBT_SECS: u64 = 600;
+const DEFAULT_MAX_RANDOM_TICK_CATCH_UP_TICKS: u64 = 75_000;
+const DEFAULT_MAX_RANDOM_TICK_CATCH_UP_PER_TICK: usize = 1024;
 const DEFAULT_TIME: f32 = 0.0;
 const DEFAULT_SAVING: bool = false;
 const DEFAULT_SAVE_DIR: &str = "";
 const DEFAULT_SAVE_INTERVAL: usize = 300;
 const DEFAULT_SAVE_PRISTINE_CHUNKS: bool = false;
 const DEFAULT_COMMAND_SYMBOL: &str = "/";
+const DEFAULT_CHAT_HISTORY_CAPACITY: usize = 2000;
 const DEFAULT_CLIENT_ONLY_MESHING: bool = true;
 const DEFAULT_ENTITY_VISIBLE_RADIUS_CHUNKS: f32 = 24.0;
 const DEFAULT_ENTITY_RELEASE_RADIUS_RATIO: f32 = 1.125;
@@ -281,6 +411,12 @@ pub struct WorldConfigBuilder {
     max_light_level: u32,
     max_chunks_per_tick: usize,
     max_updates_per_tick: usize,
+    max_update_ms_per_tick: f64,
+    max_updates_per_batch: usize,
+    max_active_updates_per_batch: usize,
+    max_active_updates_per_tick: usize,
+    max_ticker_consult_ms_per_tick: f64,
+    max_active_plan_ms_per_tick: f64,
     random_tick_speed: usize,
     max_random_ticks_per_tick: usize,
     max_response_per_tick: usize,
@@ -292,6 +428,12 @@ pub struct WorldConfigBuilder {
     gravity: [f32; 3],
     min_bounce_impulse: f32,
     does_tick_time: bool,
+    hibernation_interval_ms: u64,
+    world_step_ms: u64,
+    max_catch_up_steps: u64,
+    max_catch_up_debt_secs: u64,
+    max_random_tick_catch_up_ticks: u64,
+    max_random_tick_catch_up_per_tick: usize,
     default_time: f32,
     air_drag: f32,
     fluid_drag: f32,
@@ -303,12 +445,15 @@ pub struct WorldConfigBuilder {
     save_dir: String,
     save_interval: usize,
     command_symbol: String,
+    chat_history_capacity: usize,
+    chat_log_dir: Option<String>,
     save_entities: bool,
     save_pristine_chunks: bool,
     client_only_meshing: bool,
     entity_visible_radius: f32,
     entity_release_radius: f32,
     entity_keep_alive_interval: u64,
+    on_request_metadata_keys: Vec<String>,
     entity_motion_max_age_ms: u64,
     entity_flush_base_bytes_per_tick: usize,
     peer_visible_radius: Option<f32>,
@@ -326,6 +471,12 @@ impl WorldConfigBuilder {
             min_chunk: DEFAULT_MIN_CHUNK,
             max_chunk: DEFAULT_MAX_CHUNK,
             does_tick_time: DEFAULT_DOES_TICK_TIME,
+            hibernation_interval_ms: DEFAULT_HIBERNATION_INTERVAL_MS,
+            world_step_ms: DEFAULT_WORLD_STEP_MS,
+            max_catch_up_steps: DEFAULT_MAX_CATCH_UP_STEPS,
+            max_catch_up_debt_secs: DEFAULT_MAX_CATCH_UP_DEBT_SECS,
+            max_random_tick_catch_up_ticks: DEFAULT_MAX_RANDOM_TICK_CATCH_UP_TICKS,
+            max_random_tick_catch_up_per_tick: DEFAULT_MAX_RANDOM_TICK_CATCH_UP_PER_TICK,
             default_time: DEFAULT_TIME,
             preload: DEFAULT_PRELOAD,
             preload_radius: DEFAULT_PRELOAD_RADIUS,
@@ -334,6 +485,12 @@ impl WorldConfigBuilder {
             max_light_level: DEFAULT_MAX_LIGHT_LEVEL,
             max_chunks_per_tick: DEFAULT_MAX_CHUNKS_PER_TICK,
             max_updates_per_tick: DEFAULT_MAX_UPDATES_PER_TICK,
+            max_update_ms_per_tick: DEFAULT_MAX_UPDATE_MS_PER_TICK,
+            max_updates_per_batch: DEFAULT_MAX_UPDATES_PER_BATCH,
+            max_active_updates_per_batch: DEFAULT_MAX_ACTIVE_UPDATES_PER_BATCH,
+            max_active_updates_per_tick: DEFAULT_MAX_ACTIVE_UPDATES_PER_TICK,
+            max_ticker_consult_ms_per_tick: DEFAULT_MAX_TICKER_CONSULT_MS_PER_TICK,
+            max_active_plan_ms_per_tick: DEFAULT_MAX_ACTIVE_PLAN_MS_PER_TICK,
             random_tick_speed: DEFAULT_RANDOM_TICK_SPEED,
             max_random_ticks_per_tick: DEFAULT_MAX_RANDOM_TICKS_PER_TICK,
             max_response_per_tick: DEFAULT_MAX_RESPONSE_PER_TICK,
@@ -354,12 +511,15 @@ impl WorldConfigBuilder {
             save_interval: DEFAULT_SAVE_INTERVAL,
             terrain: NoiseOptions::default(),
             command_symbol: DEFAULT_COMMAND_SYMBOL.to_owned(),
+            chat_history_capacity: DEFAULT_CHAT_HISTORY_CAPACITY,
+            chat_log_dir: None,
             save_entities: true,
             save_pristine_chunks: DEFAULT_SAVE_PRISTINE_CHUNKS,
             client_only_meshing: DEFAULT_CLIENT_ONLY_MESHING,
             entity_visible_radius: 0.0,
             entity_release_radius: 0.0,
             entity_keep_alive_interval: DEFAULT_ENTITY_KEEP_ALIVE_INTERVAL,
+            on_request_metadata_keys: Vec::new(),
             entity_motion_max_age_ms: DEFAULT_ENTITY_MOTION_MAX_AGE_MS,
             entity_flush_base_bytes_per_tick: DEFAULT_ENTITY_FLUSH_BASE_BYTES_PER_TICK,
             peer_visible_radius: None,
@@ -441,9 +601,56 @@ impl WorldConfigBuilder {
         self
     }
 
-    /// Configure the maximum amount of voxel updates to be processed per tick. Default is 1000 voxel updates.
+    /// Configure the most external voxel updates committed per tick. Default
+    /// is 50000.
     pub fn max_updates_per_tick(mut self, max_updates_per_tick: usize) -> Self {
         self.max_updates_per_tick = max_updates_per_tick;
+        self
+    }
+
+    /// Configure the milliseconds a tick may spend committing external
+    /// updates and lighting them; the rest wait, in order, for later ticks.
+    /// At least one batch commits a tick. Default is 6.
+    pub fn max_update_ms_per_tick(mut self, max_update_ms_per_tick: f64) -> Self {
+        self.max_update_ms_per_tick = max_update_ms_per_tick;
+        self
+    }
+
+    /// Configure the most external updates committed and lit as one batch.
+    /// Default is 256.
+    pub fn max_updates_per_batch(mut self, max_updates_per_batch: usize) -> Self {
+        self.max_updates_per_batch = max_updates_per_batch;
+        self
+    }
+
+    /// Configure the most simulation-produced updates committed and lit as
+    /// one batch. Default is 64.
+    pub fn max_active_updates_per_batch(mut self, max_active_updates_per_batch: usize) -> Self {
+        self.max_active_updates_per_batch = max_active_updates_per_batch;
+        self
+    }
+
+    /// Configure the per-tick budget for simulation-produced voxel updates
+    /// (fluids, growth, active tickers), which drain on their own lane.
+    /// Default is 50000.
+    pub fn max_active_updates_per_tick(mut self, max_active_updates_per_tick: usize) -> Self {
+        self.max_active_updates_per_tick = max_active_updates_per_tick;
+        self
+    }
+
+    /// Configure the milliseconds a tick may spend consulting the active
+    /// tickers its writes touched; the rest carry into later ticks. At least
+    /// one consult runs a tick. Default is 4.
+    pub fn max_ticker_consult_ms_per_tick(mut self, max_ticker_consult_ms_per_tick: f64) -> Self {
+        self.max_ticker_consult_ms_per_tick = max_ticker_consult_ms_per_tick;
+        self
+    }
+
+    /// Configure the milliseconds a tick may spend planning due active
+    /// voxels; the rest keep their deadline and plan first the next tick.
+    /// At least one plans a tick. Default is 4.
+    pub fn max_active_plan_ms_per_tick(mut self, max_active_plan_ms_per_tick: f64) -> Self {
+        self.max_active_plan_ms_per_tick = max_active_plan_ms_per_tick;
         self
     }
 
@@ -464,6 +671,42 @@ impl WorldConfigBuilder {
 
     pub fn does_tick_time(mut self, does_tick_time: bool) -> Self {
         self.does_tick_time = does_tick_time;
+        self
+    }
+
+    /// How often a world with no clients dispatches, in milliseconds. `0`
+    /// keeps it ticking at full rate. Default is 500.
+    pub fn hibernation_interval_ms(mut self, hibernation_interval_ms: u64) -> Self {
+        self.hibernation_interval_ms = hibernation_interval_ms;
+        self
+    }
+
+    /// World time one tick stands for, in milliseconds. Default is 16.
+    pub fn world_step_ms(mut self, world_step_ms: u64) -> Self {
+        self.world_step_ms = world_step_ms;
+        self
+    }
+
+    pub fn max_catch_up_steps(mut self, max_catch_up_steps: u64) -> Self {
+        self.max_catch_up_steps = max_catch_up_steps;
+        self
+    }
+
+    pub fn max_catch_up_debt_secs(mut self, max_catch_up_debt_secs: u64) -> Self {
+        self.max_catch_up_debt_secs = max_catch_up_debt_secs;
+        self
+    }
+
+    pub fn max_random_tick_catch_up_ticks(mut self, max_random_tick_catch_up_ticks: u64) -> Self {
+        self.max_random_tick_catch_up_ticks = max_random_tick_catch_up_ticks;
+        self
+    }
+
+    pub fn max_random_tick_catch_up_per_tick(
+        mut self,
+        max_random_tick_catch_up_per_tick: usize,
+    ) -> Self {
+        self.max_random_tick_catch_up_per_tick = max_random_tick_catch_up_per_tick;
         self
     }
 
@@ -555,6 +798,20 @@ impl WorldConfigBuilder {
         self
     }
 
+    /// Configure how many public chat lines the world remembers and replays
+    /// to joining clients. `0` keeps no history. Default is 2000.
+    pub fn chat_history_capacity(mut self, capacity: usize) -> Self {
+        self.chat_history_capacity = capacity;
+        self
+    }
+
+    /// Persist the chat history to `dir` even when the world itself is not
+    /// saved. By default a saved world keeps it in `<save_dir>/chat`.
+    pub fn chat_log_dir(mut self, dir: &str) -> Self {
+        self.chat_log_dir = Some(dir.to_owned());
+        self
+    }
+
     /// Configure whether entities should be saved. Only applies if `saving` is true.
     pub fn save_entities(mut self, save_entities: bool) -> Self {
         self.save_entities = save_entities;
@@ -588,6 +845,13 @@ impl WorldConfigBuilder {
 
     pub fn entity_keep_alive_interval(mut self, entity_keep_alive_interval: u64) -> Self {
         self.entity_keep_alive_interval = entity_keep_alive_interval;
+        self
+    }
+
+    /// Entity metadata keys replicated only to clients that ask for them;
+    /// see [`WorldConfig::on_request_metadata_keys`].
+    pub fn on_request_metadata_keys(mut self, keys: &[&str]) -> Self {
+        self.on_request_metadata_keys = keys.iter().map(|key| (*key).to_owned()).collect();
         self
     }
 
@@ -671,6 +935,30 @@ impl WorldConfigBuilder {
             panic!("Entity motion max age must be positive.");
         }
 
+        for (name, ms) in [
+            (
+                "max_ticker_consult_ms_per_tick",
+                self.max_ticker_consult_ms_per_tick,
+            ),
+            (
+                "max_active_plan_ms_per_tick",
+                self.max_active_plan_ms_per_tick,
+            ),
+            ("max_update_ms_per_tick", self.max_update_ms_per_tick),
+        ] {
+            if !ms.is_finite() || ms < 0.0 {
+                panic!("{name} must be a finite, non-negative number of milliseconds, not {ms}.");
+            }
+        }
+
+        if self.max_updates_per_batch == 0 {
+            panic!("Max updates per batch must be positive.");
+        }
+
+        if self.max_active_updates_per_batch == 0 {
+            panic!("Max active updates per batch must be positive.");
+        }
+
         if self.entity_flush_base_bytes_per_tick == 0 {
             panic!("Entity flush base bytes per tick must be positive.");
         }
@@ -701,6 +989,12 @@ impl WorldConfigBuilder {
             max_light_level: self.max_light_level,
             max_chunks_per_tick: self.max_chunks_per_tick,
             max_updates_per_tick: self.max_updates_per_tick,
+            max_update_ms_per_tick: self.max_update_ms_per_tick,
+            max_updates_per_batch: self.max_updates_per_batch,
+            max_active_updates_per_batch: self.max_active_updates_per_batch,
+            max_active_updates_per_tick: self.max_active_updates_per_tick,
+            max_ticker_consult_ms_per_tick: self.max_ticker_consult_ms_per_tick,
+            max_active_plan_ms_per_tick: self.max_active_plan_ms_per_tick,
             random_tick_speed: self.random_tick_speed,
             max_random_ticks_per_tick: self.max_random_ticks_per_tick,
             max_response_per_tick: self.max_response_per_tick,
@@ -737,23 +1031,33 @@ impl WorldConfigBuilder {
             min_bounce_impulse: self.min_bounce_impulse,
             collision_repulsion: self.collision_repulsion,
             does_tick_time: self.does_tick_time,
+            hibernation_interval_ms: self.hibernation_interval_ms,
+            world_step_ms: self.world_step_ms,
+            max_catch_up_steps: self.max_catch_up_steps,
+            max_catch_up_debt_secs: self.max_catch_up_debt_secs,
+            max_random_tick_catch_up_ticks: self.max_random_tick_catch_up_ticks,
+            max_random_tick_catch_up_per_tick: self.max_random_tick_catch_up_per_tick,
             client_collision_repulsion: self.client_collision_repulsion,
             terrain: self.terrain,
             saving: self.saving,
             save_dir: self.save_dir,
             save_interval: self.save_interval,
             command_symbol: self.command_symbol,
+            chat_history_capacity: self.chat_history_capacity,
+            chat_log_dir: self.chat_log_dir,
             save_entities: self.save_entities,
             save_pristine_chunks: self.save_pristine_chunks,
             client_only_meshing: self.client_only_meshing,
             entity_visible_radius,
             entity_release_radius,
             entity_keep_alive_interval: self.entity_keep_alive_interval,
+            on_request_metadata_keys: self.on_request_metadata_keys,
             entity_motion_max_age_ms: self.entity_motion_max_age_ms,
             entity_flush_base_bytes_per_tick: self.entity_flush_base_bytes_per_tick,
             peer_visible_radius: self.peer_visible_radius,
             fixed_timestep: self.fixed_timestep,
             lag_comp: self.lag_comp,
+            far_terrain: None,
         }
     }
 }

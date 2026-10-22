@@ -16,12 +16,22 @@ import { Arm, Character } from "../libs";
 import { Coords3 } from "../types";
 import { ChunkUtils } from "../utils";
 
+import { findLedgeTop, planAutoJump } from "./auto-jump";
 import { Inputs } from "./inputs";
 import { NetIntercept } from "./network";
+import { StepEyeSmoother } from "./step-smoothing";
 import { World } from "./world";
 
 const PI_2 = Math.PI / 2;
 const emptyQ = new Quaternion();
+/**
+ * How much of a thick fluid's slowness (1 - its `swimSpeedMultiplier`) it
+ * takes from a body's lift: in one at 0.4 a swimmer keeps 88% of the lift
+ * that would carry it, and sinks slowly instead of hanging in place.
+ */
+const THICK_FLUID_SINK_SHARE = 0.2;
+/** A wading body feels a thick fluid fully from this depth (of its height). */
+const THICK_FLUID_FULL_WADE_RATIO = 1 / 3;
 
 type SwimState = "upright" | "swimming" | "idleStanding";
 
@@ -85,7 +95,8 @@ export type RigidControlState = {
   isJumping: boolean;
 
   /**
-   * The current amount of time spent in the air from jump. Defaults to `0`.
+   * Seconds left of the current jump's push, while its key is held. Defaults
+   * to `0`.
    */
   currentJumpTime: number;
 };
@@ -134,9 +145,32 @@ export type RigidControlsOptions = {
   rotationLerp: number;
 
   /**
-   * The force upwards when a client tries to jump in water. Defaults to `0.3`.
+   * The strongest upward impulse a held jump key gives in fluid: what one
+   * frame at `referenceFrameRate` may add, scaled by frame time at any other
+   * rate. Treading water spends it swimming up at the swim speed and holding
+   * the body at `fluidTreadEyeHeight`. Defaults to `0.3`.
    */
   fluidPushForce: number;
+
+  /**
+   * Height of the eyes over a fluid's surface where a body treading it, its
+   * jump key held, comes to rest. Defaults to `0.25`.
+   */
+  fluidTreadEyeHeight: number;
+
+  /**
+   * A body treading fluid with its head out that presses into a bank no
+   * taller than `fluidExitMaxHeight` over the surface climbs out: launched
+   * so its feet peak this far over the bank's top. `0` turns the climb off.
+   * Defaults to `0.3`.
+   */
+  fluidExitClearance: number;
+
+  /**
+   * Tallest bank, over a fluid's surface, a body treading it climbs out
+   * onto. Defaults to `1.2`.
+   */
+  fluidExitMaxHeight: number;
 
   /**
    * Target speed while swimming. Defaults to `4.5`.
@@ -165,7 +199,8 @@ export type RigidControlsOptions = {
   swimBodyHeight: number;
 
   /**
-   * Lerp factor for the swim hitbox height transition. Defaults to `0.08`.
+   * Lerp factor for the swim hitbox height transition, per frame at
+   * `referenceFrameRate`. Defaults to `0.08`.
    */
   swimAABBLerp: number;
 
@@ -187,9 +222,32 @@ export type RigidControlsOptions = {
   positionLerp: number;
 
   /**
-   * The interpolation factor when the client is auto-stepping. Defaults to `0.6`.
+   * How long, in milliseconds, the eye takes to close 95% of a one-block
+   * auto-step; smaller steps settle proportionally faster (a half slab in
+   * half the time). The body itself climbs the step in a single physics
+   * tick; this eases only the eye (and what follows it: the streamed
+   * position, the third-person character) up after it on a critically
+   * damped spring, so the rise is an S-curve with no pop and no overshoot at
+   * any frame rate. `0` snaps the eye with the body. Defaults to `250`.
    */
-  stepLerp: number;
+  stepSmoothTime: number;
+
+  /**
+   * Height, in blocks, the eye always keeps above the top of a step it just
+   * climbed while it eases up after the body. Caps how far the eye may trail
+   * when a staircase stacks steps faster than they settle, so the camera
+   * never sinks into the tread it stands on. Defaults to `0.25`.
+   */
+  stepEyeClearance: number;
+
+  /**
+   * Along-face to into-face motion ratio above which contact with a ledge is
+   * a graze that slides along it rather than an approach that steps onto it.
+   * `4` ignores approaches shallower than ~14°, so brushing a block while
+   * walking past does not pop the client onto it. `0` steps on any blocked
+   * contact. Defaults to `4`.
+   */
+  stepGrazeRatio: number;
 
   /**
    * The width of the client's avatar. Defaults to `0.8` blocks.
@@ -215,6 +273,10 @@ export type RigidControlsOptions = {
    * The maximum level of speed of a client. Default is `6` .
    */
   maxSpeed: number;
+  /** Server-provided temporary effects; applies only to ordinary ground walking. */
+  statusSpeedFactor: number;
+  /** Server-provided temporary effects; applies only to swimming. */
+  statusSwimFactor: number;
 
   /**
    * The level of force of which the client can move at. Default is `30`.
@@ -222,7 +284,9 @@ export type RigidControlsOptions = {
   moveForce: number;
 
   /**
-   * The level of responsiveness of a client to movements. Default is `240`.
+   * How fast, per second, a client's velocity settles onto the one its input
+   * asks for, once it is close enough that the movement force no longer caps
+   * the change. Default is `240`.
    */
   responsiveness: number;
 
@@ -247,7 +311,9 @@ export type RigidControlsOptions = {
   flyForce: number;
 
   /**
-   * The level impulse of which a client flies at. Defaults to `2.5`.
+   * The vertical impulse a held fly-up or fly-down key gives: what one frame
+   * at `referenceFrameRate` adds, scaled by frame time at any other rate.
+   * Defaults to `2.5`.
    */
   flyImpulse: number;
 
@@ -302,12 +368,15 @@ export type RigidControlsOptions = {
   jumpImpulse: number;
 
   /**
-   * The level of force applied to the client when jumping. Defaults to `1`.
+   * The upward force a held jump key adds for the first `jumpTime` of a
+   * jump, so holding it lifts the jump a little higher than the impulse
+   * alone. Defaults to `3.5`.
    */
   jumpForce: number;
 
   /**
-   * The time, in milliseconds, that a client can be jumping. Defaults to `50`ms.
+   * How long, in milliseconds, a held jump key keeps pushing (`jumpForce`)
+   * after the jump starts. Defaults to `50`ms.
    */
   jumpTime: number;
 
@@ -322,11 +391,65 @@ export type RigidControlsOptions = {
   stepHeight: number;
 
   /**
+   * Jump automatically at a ledge too tall to step onto but low enough for
+   * a jump to clear, the way voxel games with an auto-jump option do. The
+   * jump is a real one through the normal jump path, started ahead of the
+   * ledge so the feet pass its top on the way up instead of bumping the face
+   * first. Off while crouching, swimming, climbing, flying, or walking
+   * backwards. Defaults to `true`.
+   */
+  autoJump: boolean;
+
+  /**
+   * Seconds of travel scanned ahead for a jumpable ledge. The jump fires as
+   * soon as a ledge enters this window, so it must exceed the time the jump
+   * takes to rise past the tallest auto-jumpable ledge (about 0.24 s for 1.2
+   * blocks at the default impulse and gravity). Defaults to `0.3`.
+   */
+  autoJumpLookahead: number;
+
+  /**
+   * Minimum scan distance in blocks, so a client standing against a ledge
+   * still hops the moment it starts walking into it. Defaults to `0.2`.
+   */
+  autoJumpMinLookahead: number;
+
+  /**
+   * Tallest rise auto-jump attempts, in blocks. Kept under what the jump
+   * actually clears (the apex from `jumpImpulse` against gravity, 1.29 at
+   * the defaults) so the landing has margin. Defaults to `1.2`.
+   */
+  autoJumpMaxHeight: number;
+
+  /**
+   * Cosine between the look direction and the travel direction below which
+   * auto-jump stays off, so walking backwards into a ledge never hops onto
+   * it blind. Pure strafing (cosine 0) still hops. Defaults to `-0.15`.
+   */
+  autoJumpFacingDot: number;
+
+  /**
+   * Milliseconds after an automatic jump before another may fire.
+   * Defaults to `100`.
+   */
+  autoJumpCooldown: number;
+
+  /**
    * The height of the client's avatar when crouching. Defaults to `bodyHeight * 0.83`.
    */
   crouchBodyHeight: number;
 
   restoreFootSnapEpsilon: number;
+
+  /**
+   * The frame rate, in frames per second, that the per-frame tunables
+   * (`flyImpulse`, `fluidPushForce`, `swimAABBLerp`, the ladder's easing)
+   * were tuned at.
+   * Each frame applies them scaled by how many of these frames it lasted,
+   * so a held key climbs, swims or flies the same distance per second at
+   * any frame rate, and exactly as tuned at this one. Defaults to `120`.
+   */
+  referenceFrameRate: number;
 };
 
 const defaultOptions: RigidControlsOptions = {
@@ -337,7 +460,9 @@ const defaultOptions: RigidControlsOptions = {
   initialDirection: [0, 0, 0],
   rotationLerp: 0.9,
   positionLerp: 1.0,
-  stepLerp: 0.6,
+  stepSmoothTime: 250,
+  stepEyeClearance: 0.25,
+  stepGrazeRatio: 4,
 
   bodyWidth: 0.8,
   bodyHeight: 1.55,
@@ -345,6 +470,8 @@ const defaultOptions: RigidControlsOptions = {
   eyeHeight: 0.9193548387096774,
 
   maxSpeed: 6,
+  statusSpeedFactor: 1,
+  statusSwimFactor: 1,
   moveForce: 30,
   responsiveness: 240,
   runningFriction: 0.1,
@@ -363,6 +490,9 @@ const defaultOptions: RigidControlsOptions = {
   alwaysSprint: false,
   airMoveMult: 0.7,
   fluidPushForce: 0.3,
+  fluidTreadEyeHeight: 0.25,
+  fluidExitClearance: 0.3,
+  fluidExitMaxHeight: 1.2,
   swimSpeed: 4.5,
   swimForce: 28,
   swimFriction: 0.05,
@@ -372,14 +502,22 @@ const defaultOptions: RigidControlsOptions = {
   swimIdleStandDelay: 3000,
   swimRestoreGraceFrames: 2,
   jumpImpulse: 8,
-  jumpForce: 1,
+  jumpForce: 3.5,
   jumpTime: 50,
   airJumps: 0,
 
   stepHeight: 0.5,
 
+  autoJump: true,
+  autoJumpLookahead: 0.3,
+  autoJumpMinLookahead: 0.2,
+  autoJumpMaxHeight: 1.2,
+  autoJumpFacingDot: -0.15,
+  autoJumpCooldown: 100,
+
   crouchBodyHeight: 1.29,
   restoreFootSnapEpsilon: 1e-4,
+  referenceFrameRate: 120,
 };
 
 /**
@@ -469,6 +607,13 @@ export class RigidControls extends EventEmitter implements NetIntercept {
   public body: RigidBody;
 
   /**
+   * How many times these controls have been teleported. A reader that follows
+   * the body frame by frame (a fall meter, a trail) starts over when it
+   * changes: the body did not travel the distance a teleport moves it.
+   */
+  public teleportCount = 0;
+
+  /**
    * Whether or not the client has certain movement potentials. For example, if the forward
    * key is pressed, then "front" would be `true`. Vice versa for "back".
    */
@@ -491,6 +636,19 @@ export class RigidControls extends EventEmitter implements NetIntercept {
    * The callback to unlocking the pointer.
    */
   private unlockCallback: () => void;
+
+  /**
+   * Whether Escape is physically down. The browser drops pointer lock on
+   * Escape, so a lock that lands while it is held (Escape closing a UI layer
+   * and asking for the lock back) is lost on the same press.
+   */
+  private isEscapeHeld = false;
+
+  /**
+   * A lock asked for while Escape was held, requested on its release.
+   */
+  private deferredLock: { callback?: () => void; fallback: number } | null =
+    null;
 
   /**
    * An internal euler for sharing rotation calculations.
@@ -521,10 +679,31 @@ export class RigidControls extends EventEmitter implements NetIntercept {
 
   private _swimAABBBlend = 0;
 
+  /** How hard treading pushed last frame, in blocks per second squared. */
+  private _treadPush = 0;
+
   /**
    * The new position of the controls. This is used to lerp the position of the controls.
    */
   private newPosition = new Vector3();
+
+  /**
+   * `newPosition` with the auto-step eye offset applied: the point the
+   * camera group actually lerps toward each frame.
+   */
+  private eyeTarget = new Vector3();
+
+  /**
+   * Eases the eye up after the rigid body auto-steps. Physics climbs a step
+   * in one tick; this carries the camera (and everything anchored to it)
+   * after it on a critically damped spring instead of popping.
+   */
+  private stepSmoother = new StepEyeSmoother();
+
+  /**
+   * Seconds left before auto-jump may fire again.
+   */
+  private _autoJumpCooldownLeft = 0;
 
   /**
    * Whether or not is the first movement back on lock. This is because Chrome has a bug where
@@ -593,7 +772,7 @@ export class RigidControls extends EventEmitter implements NetIntercept {
     this.camera = camera;
     this.world = world;
     this.domElement = domElement;
-    this.state = defaultControlState;
+    this.state = { ...defaultControlState };
 
     const { bodyWidth, bodyHeight, bodyDepth } = (this.options = {
       ...defaultOptions,
@@ -606,17 +785,14 @@ export class RigidControls extends EventEmitter implements NetIntercept {
     this.body = world.physics.addBody({
       aabb: new AABB(0, 0, 0, bodyWidth, bodyHeight, bodyDepth),
       onStep: (newAABB) => {
-        const { positionLerp, stepLerp } = this.options;
-
-        this.options.positionLerp = stepLerp;
+        // The body commits the climb now, in one tick, so collision and the
+        // authoritative position are right immediately; the eye is told how
+        // far it now trails and glides up over the following frames.
+        this.stepSmoother.noteStep(newAABB.minY - this.body.aabb.minY);
         this.body.aabb = newAABB.clone();
-
-        const stepTimeout = setTimeout(() => {
-          this.options.positionLerp = positionLerp;
-          clearTimeout(stepTimeout);
-        }, 500);
       },
       stepHeight: this.options.stepHeight,
+      stepGrazeRatio: this.options.stepGrazeRatio,
     });
 
     this._smoothedBodyHeight = bodyHeight;
@@ -640,6 +816,7 @@ export class RigidControls extends EventEmitter implements NetIntercept {
             case "vox-builtin:position": {
               this.body.setPosition(event.payload);
               this.body.velocity = [0, 0, 0];
+              this.stepSmoother.reset();
               break;
             }
 
@@ -688,7 +865,20 @@ export class RigidControls extends EventEmitter implements NetIntercept {
     const delta = Math.min(0.1, this.timer.getDelta());
 
     this.object.quaternion.slerp(this.quaternion, this.options.rotationLerp);
-    this.object.position.lerp(this.newPosition, this.options.positionLerp);
+
+    // The frame drawn now shows the body as the previous frame's physics
+    // step left it: one step behind, the minimum for a body integrated
+    // after the camera is posed. Deriving the anchor at the end of this
+    // method (before `world.update` integrates) and consuming it next frame
+    // made it two.
+    this.updateEyeAnchor();
+
+    // Only the vertical axis eases over a step; X/Z stay 1:1 with the body
+    // so a step never costs horizontal responsiveness.
+    this.stepSmoother.advance(delta, this.options.stepSmoothTime / 1000);
+    this.eyeTarget.copy(this.newPosition);
+    this.eyeTarget.y += this.stepSmoother.offset;
+    this.object.position.lerp(this.eyeTarget, this.options.positionLerp);
 
     if (this.character) {
       const {
@@ -737,8 +927,16 @@ export class RigidControls extends EventEmitter implements NetIntercept {
     };
     const pointerLockErrorHandler = this.onPointerlockError;
     const documentClickHandler = this.onDocumentClick;
+    const escapeHandler = this.onEscapeKey;
+    const escapeResetHandler = this.onEscapeReset;
+    const view = this.domElement.ownerDocument.defaultView;
 
     this.domElement.addEventListener("mousemove", mouseMoveHandler);
+    // Capture on the window, ahead of any page handler that closes a layer
+    // on this Escape and asks for the lock back.
+    view?.addEventListener("keydown", escapeHandler, true);
+    view?.addEventListener("keyup", escapeHandler, true);
+    view?.addEventListener("blur", escapeResetHandler);
     this.domElement.ownerDocument.addEventListener(
       "pointerlockchange",
       pointerLockChangeHandler,
@@ -760,6 +958,10 @@ export class RigidControls extends EventEmitter implements NetIntercept {
         pointerLockErrorHandler,
       );
       this.domElement.removeEventListener("click", documentClickHandler);
+      view?.removeEventListener("keydown", escapeHandler, true);
+      view?.removeEventListener("keyup", escapeHandler, true);
+      view?.removeEventListener("blur", escapeResetHandler);
+      this.cancelDeferredLock();
     });
 
     const keyMappings = {
@@ -835,11 +1037,42 @@ export class RigidControls extends EventEmitter implements NetIntercept {
    * @param callback - Callback to be run once done.
    */
   lock = (callback?: () => void) => {
-    this.domElement.requestPointerLock();
+    // Escape still down: the browser would drop a lock granted now on this
+    // same press, so wait for the key to come up. The fallback covers a
+    // release the page never sees.
+    if (this.isEscapeHeld) {
+      this.cancelDeferredLock();
+      this.deferredLock = {
+        callback,
+        fallback: window.setTimeout(this.flushDeferredLock, 1000),
+      };
+      return;
+    }
+    this.cancelDeferredLock();
+
+    // Refused requests (the browser's cooldown right after an exit) also
+    // fire `pointerlockerror`, which is where they are reported.
+    const request = this.domElement.requestPointerLock() as unknown;
+    if (request instanceof Promise) request.catch(() => {});
 
     if (callback) {
       this.lockCallback = callback;
     }
+  };
+
+  /**
+   * Take over a pointer lock the document already holds on this element, as
+   * when a page swaps one world's controls for another's on the same canvas
+   * and the lock outlives the swap: no `pointerlockchange` fires for it, so
+   * without this the new controls think they are unlocked. Returns whether
+   * the element holds the lock.
+   */
+  adoptPointerLock = () => {
+    if (this.domElement.ownerDocument.pointerLockElement !== this.domElement) {
+      return false;
+    }
+    if (!this.isLocked) this.onPointerlockChange();
+    return true;
   };
 
   /**
@@ -849,6 +1082,7 @@ export class RigidControls extends EventEmitter implements NetIntercept {
    * @param callback - Callback to be run once done.
    */
   unlock = (callback?: () => void) => {
+    this.cancelDeferredLock();
     this.domElement.ownerDocument.exitPointerLock();
 
     if (callback) {
@@ -866,6 +1100,8 @@ export class RigidControls extends EventEmitter implements NetIntercept {
   teleport = (vx: number, vy: number, vz: number) => {
     const { bodyHeight, eyeHeight } = this.options;
     this.newPosition.set(vx + 0.5, vy + bodyHeight * eyeHeight + 1, vz + 0.5);
+    this.stepSmoother.reset();
+    this.teleportCount += 1;
 
     if (this.body) {
       this.body.resting = [0, 0, 0];
@@ -936,6 +1172,8 @@ export class RigidControls extends EventEmitter implements NetIntercept {
   teleportToExact = (x: number, y: number, z: number) => {
     this.newPosition.set(x, y, z);
     this.object.position.set(x, y, z);
+    this.stepSmoother.reset();
+    this.teleportCount += 1;
 
     if (this.body) {
       const { eyeHeight, bodyHeight, restoreFootSnapEpsilon } = this.options;
@@ -992,6 +1230,7 @@ export class RigidControls extends EventEmitter implements NetIntercept {
     const [x, y, z] = this.body.getPosition();
     const { eyeHeight } = this.options;
     this.newPosition.set(x, y + targetHeight * (eyeHeight - 0.5), z);
+    this.stepSmoother.reset();
     this.object.position.copy(this.newPosition);
   };
 
@@ -1121,15 +1360,26 @@ export class RigidControls extends EventEmitter implements NetIntercept {
    * the norm players expect.
    *
    * @param character The {@link Character} to attach to this controls instance.
-   * @param newLerpFactor The new lerp factor to use for the character.
+   * @param newLerpFactor The position lerp factor to use for the character.
+   *   `1` pins the body to the eye, which is what the controls' own body
+   *   wants: its pose is local and known every frame, not a network sample.
+   * @param newRotationLerpFactor The rotation lerp factor for the character's
+   *   head and body; left as the character's own setting when omitted.
    */
-  attachCharacter = (character: Character, newLerpFactor = 1) => {
+  attachCharacter = (
+    character: Character,
+    newLerpFactor = 1,
+    newRotationLerpFactor?: number,
+  ) => {
     if (!(character instanceof Character)) {
       console.warn("Character not attached: not a default character.");
       return;
     }
 
     character.options.positionLerp = newLerpFactor;
+    if (newRotationLerpFactor !== undefined) {
+      character.options.rotationLerp = newRotationLerpFactor;
+    }
 
     const crouchRatio = this.options.crouchBodyHeight / this.options.bodyHeight;
 
@@ -1326,6 +1576,54 @@ export class RigidControls extends EventEmitter implements NetIntercept {
       : 1;
   };
 
+  /**
+   * Reads `swimSpeedMultiplier` off the fluid block the body is in (at its
+   * center, or at its feet when it wades), so a viscous fluid slows it
+   * without either side of the engine boundary knowing the other's name for
+   * it (this is the same extension point as `getGroundFrictionMultiplier`).
+   * 1 is water; under 1 the fluid is thicker, and holds a body back in
+   * every way, not only at the swim stroke (`applyFluidThickness`).
+   */
+  private getSwimSpeedMultiplier = (): number => {
+    const { aabb } = this.body;
+    const vx = Math.floor(aabb.minX + aabb.width / 2);
+    const vz = Math.floor(aabb.minZ + aabb.depth / 2);
+
+    for (const vy of [
+      Math.floor(aabb.minY + aabb.height / 2),
+      Math.floor(aabb.minY + 0.01),
+    ]) {
+      const block = this.world.getBlockAt(vx, vy, vz);
+      if (block?.isFluid) {
+        return block.swimSpeedMultiplier > 0 ? block.swimSpeedMultiplier : 1;
+      }
+    }
+
+    return 1;
+  };
+
+  /**
+   * A thick fluid holds a body back everywhere in it: drag grows as the
+   * fluid's swim speed shrinks, and it takes a share of the lift, so a
+   * swimmer sinks slowly instead of hanging in place. The physics step and
+   * `treadFluid` both read these off the body. Water leaves both at 1.
+   */
+  private applyFluidThickness = () => {
+    const multiplier = this.body.inFluid ? this.getSwimSpeedMultiplier() : 1;
+    this.body.fluidDragMultiplier = 1 / multiplier;
+    this.body.fluidBuoyancyMultiplier =
+      1 - (1 - multiplier) * THICK_FLUID_SINK_SHARE;
+    return multiplier;
+  };
+
+  /**
+   * Footing in fluid: water lifts a wading body off its feet (a tenth of the
+   * friction, so the current can push it); a thick fluid grips it, and the
+   * thicker the fluid the less it slides.
+   */
+  private fluidFrictionMultiplier = (fluidSpeedMultiplier: number) =>
+    this.body.inFluid ? 0.1 + 0.9 * (1 - fluidSpeedMultiplier) : 1;
+
   private isSubmergedForSwimming = (): boolean => {
     return (
       this.body.gravityMultiplier > 0 &&
@@ -1341,8 +1639,68 @@ export class RigidControls extends EventEmitter implements NetIntercept {
     return front || back || left || right || up || down || this.state.jumping;
   };
 
-  private updateSwimState = (): SwimState => {
-    if (!this.isSubmergedForSwimming() || this.state.crouching) {
+  /** Upward speed a held jump key swims at, in fluid. */
+  private treadRiseSpeed = () => {
+    const { swimSpeed, statusSwimFactor, sprintFactor } = this.options;
+    const speed = swimSpeed * this.getSwimSpeedMultiplier() * statusSwimFactor;
+    return this.state.sprinting ? speed * sprintFactor : speed;
+  };
+
+  /**
+   * How far the feet sit below where a body treading fluid comes to rest,
+   * standing, eyes `fluidTreadEyeHeight` over the surface (`surface`).
+   */
+  private treadGap = (surface: number) => {
+    const { fluidTreadEyeHeight, bodyHeight, eyeHeight } = this.options;
+    return (
+      surface +
+      fluidTreadEyeHeight -
+      bodyHeight * eyeHeight -
+      this.body.aabb.minY
+    );
+  };
+
+  /**
+   * A swimmer holding the jump key stands up into treading once it has
+   * swum up to where treading holds it, rather than surfacing in the pose.
+   */
+  private hasSwumUpToTread = (dt: number) => {
+    if (!this.state.jumping) return false;
+    const surface = this.world.physics.fluidSurfaceOver(
+      this.body.aabb,
+      this.options.bodyHeight,
+    );
+    if (surface === null || surface === Infinity) return false;
+    return this.treadGap(surface) <= this.treadRiseSpeed() * dt;
+  };
+
+  /**
+   * Whether the swim hitbox has room over it to grow back to the height the
+   * body stands at. The physics sweep cannot see a box the body already
+   * overlaps, so standing up into a ceiling would carry it through.
+   */
+  private hasRoomToStand = () => {
+    const { aabb } = this.body;
+    const standing = this.state.crouching
+      ? this.options.crouchBodyHeight
+      : this.options.bodyHeight;
+    const grow = standing - aabb.height;
+    if (grow <= 0) return true;
+    return this.world.physics.isSweepClear(aabb, [0, grow, 0]);
+  };
+
+  private updateSwimState = (dt: number): SwimState => {
+    // Under a ceiling too low to stand in, the body keeps its swim pose.
+    if (this._swimState === "swimming" && !this.hasRoomToStand()) {
+      this._swimIdleStartedAt = -1;
+      return this._swimState;
+    }
+
+    if (
+      !this.isSubmergedForSwimming() ||
+      this.state.crouching ||
+      this.hasSwumUpToTread(dt)
+    ) {
       this._swimState = "upright";
       this._swimIdleStartedAt = -1;
       return this._swimState;
@@ -1402,10 +1760,11 @@ export class RigidControls extends EventEmitter implements NetIntercept {
     aabb.maxZ = cz + bodyDepth / 2;
   };
 
-  private updateSwimAABB = () => {
+  private updateSwimAABB = (frames = 1) => {
     const swimAABBTarget = this.isSwimPoseActive ? 1 : 0;
     this._swimAABBBlend +=
-      (swimAABBTarget - this._swimAABBBlend) * this.options.swimAABBLerp;
+      (swimAABBTarget - this._swimAABBBlend) *
+      (1 - (1 - this.options.swimAABBLerp) ** frames);
 
     if (this._swimAABBBlend < 0.001) {
       this._swimAABBBlend = 0;
@@ -1426,9 +1785,23 @@ export class RigidControls extends EventEmitter implements NetIntercept {
     const { bodyWidth, bodyDepth, bodyHeight, swimBodyHeight } = this.options;
     const [cx, , cz] = this.body.getPosition();
     const { aabb } = this.body;
-    const height =
+    let height =
       bodyHeight + (swimBodyHeight - bodyHeight) * this._swimAABBBlend;
     const minY = aabb.minY;
+
+    // Growing into a ceiling would leave the top inside it, where the sweep
+    // no longer stops the body: grow only as far as the room over it.
+    const grow = height - aabb.height;
+    if (grow > 0) {
+      const hit = this.world.physics.sweepObstruction(aabb, [0, grow, 0]);
+      if (hit) {
+        height = aabb.height + Math.max(hit.distance - Engine.EPSILON, 0);
+        this._swimAABBBlend = Math.min(
+          Math.max((bodyHeight - height) / (bodyHeight - swimBodyHeight), 0),
+          1,
+        );
+      }
+    }
 
     aabb.minX = cx - bodyWidth / 2;
     aabb.minY = minY;
@@ -1442,16 +1815,148 @@ export class RigidControls extends EventEmitter implements NetIntercept {
     }
   };
 
-  private applySwimmingMovement = () => {
+  /**
+   * The force that closes `gap`, the speed still missing toward a movement
+   * target, at `responsiveness` per second over a frame of `dt` seconds:
+   * the exact one-frame step of that approach. `responsiveness * gap` is
+   * only its short-frame limit; applied as is, it overshoots the target once
+   * a frame lasts longer than `1 / responsiveness`, and past twice that the
+   * speed swings above and below the target every frame, as far as the
+   * movement force allows.
+   */
+  private approachForce = (gap: number, dt: number) => {
+    const { responsiveness } = this.options;
+    const { mass } = this.body;
+    if (dt <= 0) return responsiveness * gap;
+    return (gap * mass * (1 - Math.exp((-responsiveness * dt) / mass))) / dt;
+  };
+
+  /**
+   * The top of the bank the body presses into, if one stands no higher
+   * than `maxTop`, with room to rise `apexAbove` over it and stand on it.
+   */
+  private bankTopAhead = (maxTop: number, apexAbove: number) => {
+    const { aabb, resting } = this.body;
+    let lowest: number | null = null;
+    for (const axis of [0, 2]) {
+      const dir = resting[axis];
+      if (dir === 0) continue;
+      const top = findLedgeTop(
+        this.world.physics,
+        aabb,
+        axis === 0 ? [dir, 0] : [0, dir],
+        maxTop,
+        apexAbove,
+      );
+      if (top !== null && (lowest === null || top < lowest)) lowest = top;
+    }
+    return lowest;
+  };
+
+  /**
+   * A held jump key in fluid treads it: the body swims up at its swim speed
+   * and stops with its eyes `fluidTreadEyeHeight` over the surface, braking
+   * no harder than gravity stops it once the stroke eases off, so it
+   * surfaces without leaping clear and never cuts a jump short. With its
+   * head out and pressing into a bank it can climb, it is launched instead,
+   * on the arc that peaks `fluidExitClearance` over the bank's top.
+   *
+   * The push is solved for the speed the body should average over this
+   * frame, through the gravity, buoyancy and drag the physics step is about
+   * to apply, so the body treads the same path at any frame rate; a launch
+   * averaged over the frame carries on exactly under the step's integration
+   * once the body leaves the fluid.
+   */
+  private treadFluid = (dt: number) => {
     const {
-      swimSpeed,
-      swimForce,
-      responsiveness,
-      sprintFactor,
-      crouchFactor,
-      swimFriction,
       fluidPushForce,
+      fluidExitClearance,
+      fluidExitMaxHeight,
+      referenceFrameRate,
     } = this.options;
+    const { body } = this;
+    const { physics } = this.world;
+    const { aabb, mass } = body;
+    const lastPush = this._treadPush;
+    this._treadPush = 0;
+    const gravity = -physics.options.gravity[1] * body.gravityMultiplier;
+    if (dt <= 0 || gravity <= 0 || body.onClimbable) return;
+
+    const height = aabb.height;
+    const stroke = fluidPushForce * referenceFrameRate;
+    const lift = body.fluidBuoyancyMultiplier;
+    const uprightBuoyancy =
+      (physics.options.fluidDensity *
+        aabb.width *
+        height *
+        aabb.depth *
+        gravity *
+        lift) /
+      mass;
+    // Gravity stops a rising upright body at least this hard once the stroke
+    // eases off, and the stroke stops a sinking one at least this hard.
+    const braking = Math.min(gravity - uprightBuoyancy, stroke - gravity);
+    const riseSpeed = this.treadRiseSpeed();
+
+    const brakingDistance = braking > 0 ? riseSpeed ** 2 / (2 * braking) : 0;
+    const surface = physics.fluidSurfaceOver(aabb, brakingDistance);
+    if (surface === null) return;
+
+    const ratio = Math.min(Math.max((surface - aabb.minY) / height, 0), 1);
+    const buoyancy =
+      (body.isSwimming ? gravity * lift : uprightBuoyancy) * ratio;
+    const fluidDrag =
+      (body.fluidDrag >= 0 ? body.fluidDrag : physics.options.fluidDrag) *
+      body.fluidDragMultiplier;
+    const kept = 1 - (fluidDrag * (1 - (1 - ratio) ** 2) * dt) / mass;
+    if (kept <= 0) return;
+    const unpushed =
+      body.velocity[1] +
+      body.impulses[1] / mass +
+      (body.forces[1] / mass + buoyancy - gravity) * dt;
+    const pushFor = (averageSpeed: number) => averageSpeed / kept - unpushed;
+
+    if (fluidExitClearance > 0 && ratio < 1) {
+      const top = this.bankTopAhead(
+        surface + fluidExitMaxHeight,
+        fluidExitClearance,
+      );
+      if (top !== null) {
+        const rise = Math.max(top + fluidExitClearance - aabb.minY, 0);
+        const push = pushFor(
+          Math.sqrt(2 * gravity * rise) - (gravity * dt) / 2,
+        );
+        if (push > 0) body.applyImpulse([0, push * mass, 0]);
+        return;
+      }
+    }
+
+    const below = this.treadGap(surface);
+    const speed = Math.min(
+      riseSpeed,
+      Math.abs(below) / dt,
+      braking > 0 ? Math.sqrt(2 * braking * Math.abs(below)) : riseSpeed,
+    );
+    // Neutrally buoyant in the swim pose, nothing else slows a rising body.
+    let push = Math.max(
+      pushFor(Math.sign(below) * speed),
+      body.isSwimming ? -stroke * dt : 0,
+    );
+    if (push >= stroke * dt) {
+      // The step moves the body at the speed it ends the frame with, so a
+      // stroke that strengthens all at once would run the whole climb half
+      // a frame early: its first frame averages it with last frame's push.
+      push = lastPush < stroke ? ((lastPush + stroke) * dt) / 2 : stroke * dt;
+      this._treadPush = stroke;
+    } else {
+      this._treadPush = push / dt;
+    }
+    if (push !== 0) body.applyImpulse([0, push * mass, 0]);
+  };
+
+  private applySwimmingMovement = (dt: number) => {
+    const { swimSpeed, swimForce, sprintFactor, crouchFactor, swimFriction } =
+      this.options;
 
     this._lookDirection.set(0, 0, -1);
     this._lookDirection.applyQuaternion(this.object.quaternion).normalize();
@@ -1463,13 +1968,13 @@ export class RigidControls extends EventEmitter implements NetIntercept {
     const fb = front ? (back ? 0 : 1) : back ? -1 : 0;
     const side = right ? (left ? 0 : 1) : left ? -1 : 0;
 
-    if (this.state.jumping) {
-      this.body.applyImpulse([0, fluidPushForce, 0]);
-    }
     this.state.isJumping = false;
 
     if (this.state.running && (fb !== 0 || side !== 0)) {
-      let speed = swimSpeed;
+      let speed =
+        swimSpeed *
+        this.getSwimSpeedMultiplier() *
+        this.options.statusSwimFactor;
       if (this.state.sprinting) speed *= sprintFactor;
       if (this.state.crouching) speed *= crouchFactor;
 
@@ -1494,7 +1999,7 @@ export class RigidControls extends EventEmitter implements NetIntercept {
           push[2] /= pushLen;
 
           let canPush = swimForce;
-          const pushAmt = responsiveness * pushLen;
+          const pushAmt = this.approachForce(pushLen, dt);
           if (canPush > pushAmt) canPush = pushAmt;
 
           this.body.applyForce([
@@ -1512,6 +2017,85 @@ export class RigidControls extends EventEmitter implements NetIntercept {
   };
 
   /**
+   * Whether the body should jump now at a ledge ahead of it. The geometry
+   * decision lives in {@link planAutoJump}; this gathers the state the
+   * decision needs and applies the input-side gates (moving, not crouching,
+   * facing roughly where it travels, grounded with gravity on).
+   */
+  private shouldAutoJump = (onGround: boolean): boolean => {
+    const {
+      autoJump,
+      autoJumpLookahead,
+      autoJumpMinLookahead,
+      autoJumpMaxHeight,
+      autoJumpFacingDot,
+      autoJumpCooldown,
+      jumpImpulse,
+      stepHeight,
+      stepGrazeRatio,
+    } = this.options;
+
+    if (!autoJump || !onGround || this._autoJumpCooldownLeft > 0) return false;
+    if (!this.state.running || this.state.crouching || this.state.isJumping) {
+      return false;
+    }
+    if (
+      this.ghostMode ||
+      this.body.gravityMultiplier <= 0 ||
+      jumpImpulse <= 0
+    ) {
+      return false;
+    }
+    // Wading on a bed counts as the ground; swimming does not.
+    if (this.body.onClimbable || this.body.isSwimming) return false;
+
+    // What the jump can actually clear, from the same impulse and gravity
+    // the jump itself will use.
+    const gravityY = Math.abs(this.world.options.gravity?.[1] ?? 0);
+    if (gravityY <= 0) return false;
+    const launchSpeed = jumpImpulse / this.body.mass;
+    const apex =
+      (launchSpeed * launchSpeed) /
+      (2 * gravityY * this.body.gravityMultiplier);
+
+    // Travel direction: the body's own motion, or the input heading once
+    // the motion is too small to trust (standing against the ledge).
+    const [vx, , vz] = this.body.velocity;
+    const speed = Math.hypot(vx, vz);
+    const lookahead = Math.max(speed * autoJumpLookahead, autoJumpMinLookahead);
+    let dx: number;
+    let dz: number;
+    if (speed * autoJumpLookahead >= autoJumpMinLookahead) {
+      dx = vx / speed;
+      dz = vz / speed;
+    } else {
+      dx = Math.sin(this.state.heading);
+      dz = Math.cos(this.state.heading);
+    }
+
+    // Never hop onto something behind the player.
+    this._lookDirection.set(0, 0, -1).applyQuaternion(this.object.quaternion);
+    const lookLength = Math.hypot(this._lookDirection.x, this._lookDirection.z);
+    if (lookLength > 0) {
+      const facing =
+        (this._lookDirection.x * dx + this._lookDirection.z * dz) / lookLength;
+      if (facing < autoJumpFacingDot) return false;
+    }
+
+    const plan = planAutoJump(this.world.physics, this.body.aabb, [dx, dz], {
+      lookahead,
+      minHeight: stepHeight,
+      maxHeight: Math.min(autoJumpMaxHeight, apex),
+      apexHeight: apex,
+      grazeRatio: stepGrazeRatio,
+    });
+    if (!plan) return false;
+
+    this._autoJumpCooldownLeft = autoJumpCooldown / 1000;
+    return true;
+  };
+
+  /**
    * Update the rigid body by the physics engine.
    */
   private updateRigidBody = (dt: number) => {
@@ -1525,7 +2109,6 @@ export class RigidControls extends EventEmitter implements NetIntercept {
       crouchFactor,
       moveForce,
       airMoveMult,
-      responsiveness,
       runningFriction,
       standingFriction,
       flyInertia,
@@ -1535,11 +2118,17 @@ export class RigidControls extends EventEmitter implements NetIntercept {
       flyPitchSteering,
       flyDiveSpeedBoost,
       flyClimbSpeedPenalty,
-      fluidPushForce,
+      referenceFrameRate,
     } = this.options;
 
+    // A held key pushes for as long as it is held, not once per frame drawn:
+    // per-frame tunables scale by how many reference frames this one lasted.
+    const frames = dt * referenceFrameRate;
+
+    const fluidSpeedMultiplier = this.applyFluidThickness();
+
     if (this.body.gravityMultiplier) {
-      const isSwimming = this.updateSwimState() === "swimming";
+      const isSwimming = this.updateSwimState(dt) === "swimming";
       this.body.isSwimming = isSwimming;
 
       // ladder climbing
@@ -1563,17 +2152,24 @@ export class RigidControls extends EventEmitter implements NetIntercept {
           targetVelocityY = -slowDescentSpeed;
         }
 
-        this.body.velocity[1] +=
-          (targetVelocityY - this.body.velocity[1]) * verticalSmoothing;
+        const velocityY =
+          this.body.velocity[1] +
+          (targetVelocityY - this.body.velocity[1]) *
+            (1 - (1 - verticalSmoothing) ** frames);
+        // A force wakes a resting body and a velocity written onto it does
+        // not: asleep on the floor at a ladder's foot, it would never climb.
+        if (velocityY !== this.body.velocity[1]) this.body.markActive();
+        this.body.velocity[1] = velocityY;
 
         if (!this.state.running) {
-          this.body.velocity[0] *= ladderDamping;
-          this.body.velocity[2] *= ladderDamping;
+          const damping = ladderDamping ** frames;
+          this.body.velocity[0] *= damping;
+          this.body.velocity[2] *= damping;
         }
       }
 
       if (isSwimming) {
-        this.applySwimmingMovement();
+        this.applySwimmingMovement(dt);
       } else {
         // jumping
         const onGround = this.body.atRestY < 0;
@@ -1586,29 +2182,38 @@ export class RigidControls extends EventEmitter implements NetIntercept {
           this.state.jumpCount = 0;
         }
 
+        // a ledge ahead that is too tall to step but low enough to clear
+        // presses jump for the player, the same jump they would have made
+        this._autoJumpCooldownLeft = Math.max(
+          0,
+          this._autoJumpCooldownLeft - dt,
+        );
+        const isAutoJumping =
+          !this.state.jumping && this.shouldAutoJump(onGround);
+
         // process jump input (skip if on climbable - handled above)
-        if (this.state.jumping && !this.body.onClimbable) {
-          if (this.state.isJumping) {
+        if ((this.state.jumping || isAutoJumping) && !this.body.onClimbable) {
+          if (this.state.isJumping && this.state.currentJumpTime > 0) {
             // continue previous jump
-            if (this.state.currentJumpTime > 0) {
-              let jf = jumpForce;
-              if (this.state.currentJumpTime < dt)
-                jf *= this.state.currentJumpTime / dt;
-              this.body.applyForce([0, jf, 0]);
-              this.state.currentJumpTime -= dt;
-            }
-          } else if (canjump) {
+            let jf = jumpForce;
+            if (this.state.currentJumpTime < dt)
+              jf *= this.state.currentJumpTime / dt;
+            this.body.applyForce([0, jf, 0]);
+            this.state.currentJumpTime -= dt;
+          } else if (
+            !this.state.isJumping &&
+            canjump &&
+            // with its head under, a held key swims it up (`treadFluid`)
+            (isAutoJumping || !this.body.inFluid || this.body.ratioInFluid < 1)
+          ) {
             // start new jump
             this.state.isJumping = true;
             if (!onGround) this.state.jumpCount++;
-            this.state.currentJumpTime = jumpTime;
+            this.state.currentJumpTime = jumpTime / 1000;
             this.body.applyImpulse([0, jumpImpulse, 0]);
             // clear downward velocity on airjump
             if (!onGround && this.body.velocity[1] < 0)
               this.body.velocity[1] = 0;
-          } else if (this.body.ratioInFluid > 0) {
-            // apply impulse to swim
-            this.body.applyImpulse([0, fluidPushForce, 0]);
           }
         } else if (!this.body.onClimbable) {
           this.state.isJumping = false;
@@ -1618,7 +2223,19 @@ export class RigidControls extends EventEmitter implements NetIntercept {
         let m = [0, 0, 0];
         let push = [0, 0, 0];
         if (this.state.running) {
-          let speed = maxSpeed;
+          let speed =
+            maxSpeed *
+            (this.body.gravityMultiplier === 0
+              ? 1
+              : this.options.statusSpeedFactor);
+          // wading a thick fluid is slow, the deeper the slower
+          if (this.body.inFluid && fluidSpeedMultiplier < 1) {
+            const depth = Math.min(
+              this.body.ratioInFluid / THICK_FLUID_FULL_WADE_RATIO,
+              1,
+            );
+            speed *= 1 - (1 - fluidSpeedMultiplier) * depth;
+          }
           // todo: add crouch/sprint modifiers if needed
           if (this.state.sprinting) speed *= sprintFactor;
           if (this.state.crouching && this.body.resting[1] === -1)
@@ -1653,7 +2270,7 @@ export class RigidControls extends EventEmitter implements NetIntercept {
             if (!onGround) canPush *= airMoveMult;
 
             // apply final force
-            const pushAmt = responsiveness * pushLen;
+            const pushAmt = this.approachForce(pushLen, dt);
             if (canPush > pushAmt) canPush = pushAmt;
 
             push[0] *= canPush;
@@ -1666,15 +2283,20 @@ export class RigidControls extends EventEmitter implements NetIntercept {
           // different friction when not moving
           // idea from Sonic: http://info.sonicretro.org/SPG:Running
           // reduce friction when in fluid to allow water current to push
-          const fluidFrictionMult = this.body.inFluid ? 0.1 : 1.0;
+          const fluidFrictionMult =
+            this.fluidFrictionMultiplier(fluidSpeedMultiplier);
           this.body.friction =
             runningFriction * fluidFrictionMult * groundFrictionMult;
         } else {
-          const fluidFrictionMult = this.body.inFluid ? 0.1 : 1.0;
+          const fluidFrictionMult =
+            this.fluidFrictionMultiplier(fluidSpeedMultiplier);
           this.body.friction =
             standingFriction * fluidFrictionMult * groundFrictionMult;
         }
       }
+
+      if (this.state.jumping) this.treadFluid(dt);
+      else this._treadPush = 0;
     } else {
       this._swimState = "upright";
       this._swimIdleStartedAt = -1;
@@ -1683,12 +2305,13 @@ export class RigidControls extends EventEmitter implements NetIntercept {
       this.body.velocity[1] -= this.body.velocity[1] * flyInertia * dt;
       this.body.velocity[2] -= this.body.velocity[2] * flyInertia * dt;
 
+      const thrust = flyImpulse * frames;
       if (this.state.jumping) {
-        this.body.applyImpulse([0, flyImpulse, 0]);
+        this.body.applyImpulse([0, thrust, 0]);
       }
 
       if (this.state.crouching) {
-        this.body.applyImpulse([0, -flyImpulse, 0]);
+        this.body.applyImpulse([0, -thrust, 0]);
       }
 
       // apply movement forces if entity is moving, otherwise just friction
@@ -1762,7 +2385,7 @@ export class RigidControls extends EventEmitter implements NetIntercept {
           let canPush = flyForce;
 
           // apply final force
-          const pushAmt = responsiveness * pushLen;
+          const pushAmt = this.approachForce(pushLen, dt);
           if (canPush > pushAmt) canPush = pushAmt;
 
           push[0] *= canPush;
@@ -1784,8 +2407,16 @@ export class RigidControls extends EventEmitter implements NetIntercept {
     }
 
     this.updateCrouchAABB();
-    this.updateSwimAABB();
+    this.updateSwimAABB(frames);
+  };
 
+  /**
+   * Re-derive the eye anchor (`newPosition`) from the rigid body as the last
+   * physics step left it. Runs at the top of `update`, before the eye lerps
+   * toward the anchor, so the pose drawn this frame is one physics step
+   * behind the body rather than two.
+   */
+  private updateEyeAnchor = () => {
     const [x, y, z] = this.body.getPosition();
     const targetHeight = this._crouching
       ? this.options.crouchBodyHeight
@@ -1796,11 +2427,19 @@ export class RigidControls extends EventEmitter implements NetIntercept {
       this._smoothedBodyHeight +=
         (targetHeight - this._smoothedBodyHeight) * 0.25;
     }
-    const { eyeHeight } = this.options;
+    const { eyeHeight, stepEyeClearance } = this.options;
     this.newPosition.set(
       x,
       y + this._smoothedBodyHeight * (eyeHeight - 0.5),
       z,
+    );
+
+    // The anchor now stands on any step the body climbed since last frame.
+    // Absorbing the rise here, in the same frame, is what keeps the eye from
+    // dipping or popping: it holds its height and the spring carries it up
+    // (the spring advances right after this, so the climb starts this frame).
+    this.stepSmoother.absorbPending(
+      this._smoothedBodyHeight * eyeHeight - stepEyeClearance,
     );
   };
 
@@ -1916,6 +2555,34 @@ export class RigidControls extends EventEmitter implements NetIntercept {
 
       this.isLocked = false;
     }
+  };
+
+  private onEscapeKey = (event: KeyboardEvent) => {
+    if (event.code !== "Escape" && event.key !== "Escape") return;
+    if (event.type === "keydown") {
+      this.isEscapeHeld = true;
+      return;
+    }
+    this.isEscapeHeld = false;
+    this.flushDeferredLock();
+  };
+
+  private onEscapeReset = () => {
+    this.isEscapeHeld = false;
+  };
+
+  private flushDeferredLock = () => {
+    const deferred = this.deferredLock;
+    if (!deferred) return;
+    this.isEscapeHeld = false;
+    this.cancelDeferredLock();
+    this.lock(deferred.callback);
+  };
+
+  private cancelDeferredLock = () => {
+    if (!this.deferredLock) return;
+    window.clearTimeout(this.deferredLock.fallback);
+    this.deferredLock = null;
   };
 
   /**

@@ -9,8 +9,13 @@ import {
   Vector3,
 } from "three";
 
+import { computeVoxelLightColor } from "./block-light";
 import { ParticleEmitter } from "./emitter";
-import { ParticleLayer, relaunchBody } from "./layer";
+import {
+  PARTICLE_BLOOM_EXEMPT_LAYER,
+  ParticleLayer,
+  relaunchBody,
+} from "./layer";
 import type {
   BurstOptions,
   EmitterOptions,
@@ -25,6 +30,9 @@ import type {
 const DEFAULT_OPTIONS: ParticleSystemOptions = {
   capacityPerLayer: 768,
   maxFlashLights: 4,
+  bloomExemptLayer: PARTICLE_BLOOM_EXEMPT_LAYER,
+  isQuadSinglePass: true,
+  softLayerRenderOrder: 0,
 };
 
 const TAU = Math.PI * 2;
@@ -77,6 +85,9 @@ export class ParticleSystem {
   private readonly flashes: FlashSlot[] = [];
   private flashCursor = 0;
   private readonly capacityPerLayer: number;
+  private readonly bloomExemptLayer: number;
+  private readonly isQuadSinglePass: boolean;
+  private readonly softLayerRenderOrder: number;
 
   private readonly scratchColor = new Color();
   private readonly scratchPosition = new Vector3();
@@ -89,16 +100,27 @@ export class ParticleSystem {
   private readonly scratchAxisA = new Vector3();
   private readonly scratchAxisB = new Vector3();
   private readonly viewAxis = new Vector3(0, 0, 1);
+  private readonly cameraQuaternion = new Quaternion();
+  private readonly scratchLight = new Color();
 
   constructor(
     private readonly world: ParticleWorld,
     options: Partial<ParticleSystemOptions> = {},
   ) {
-    const { capacityPerLayer, maxFlashLights } = {
+    const {
+      capacityPerLayer,
+      maxFlashLights,
+      bloomExemptLayer,
+      isQuadSinglePass,
+      softLayerRenderOrder,
+    } = {
       ...DEFAULT_OPTIONS,
       ...options,
     };
     this.capacityPerLayer = capacityPerLayer;
+    this.bloomExemptLayer = bloomExemptLayer;
+    this.isQuadSinglePass = isQuadSinglePass;
+    this.softLayerRenderOrder = softLayerRenderOrder;
     for (let i = 0; i < maxFlashLights; i += 1) {
       const light = new PointLight(WHITE, 0, 0);
       light.visible = false;
@@ -127,6 +149,8 @@ export class ParticleSystem {
         texture: config.texture,
         physics: config.physics,
         isCutout: config.isCutout,
+        isBloomExempt: config.isBloomExempt,
+        layerGroup: config.layerGroup,
       },
       this.scratchPosition,
       { speed: { min: 0, max: 0 } },
@@ -134,8 +158,10 @@ export class ParticleSystem {
   }
 
   burst(config: ParticleConfig, options: BurstOptions): void {
+    // One light sample for the whole burst: it leaves from one point.
+    const light = config.isLit ? this.lightAt(options.position) : null;
     for (let i = 0; i < options.count; i += 1) {
-      this.spawnOne(config, options.position, options);
+      this.spawnOne(config, options.position, options, light);
     }
   }
 
@@ -160,32 +186,38 @@ export class ParticleSystem {
     slot.peakIntensity = options.intensity;
   }
 
+  /**
+   * `light` is the tint a lit config takes, sampled by the caller for a
+   * burst; omitted, a lit config samples its own spawn point.
+   */
   spawnOne(
     config: ParticleConfig,
     position: { x: number; y: number; z: number },
     motion: SpawnMotion,
+    light: Color | null = config.isLit ? this.lightAt(position) : null,
   ): void {
     const layer = this.resolveLayer(config, false);
     if (layer.alive >= layer.capacity) return;
     const i = layer.alive;
     layer.alive += 1;
 
+    const random = motion.random ?? Math.random;
     const jitter = motion.jitterRadius ?? 0;
-    layer.posX[i] = position.x + (Math.random() - 0.5) * 2 * jitter;
-    layer.posY[i] = position.y + (Math.random() - 0.5) * 2 * jitter;
-    layer.posZ[i] = position.z + (Math.random() - 0.5) * 2 * jitter;
+    layer.posX[i] = position.x + (random() - 0.5) * 2 * jitter;
+    layer.posY[i] = position.y + (random() - 0.5) * 2 * jitter;
+    layer.posZ[i] = position.z + (random() - 0.5) * 2 * jitter;
 
-    const speed = sample(motion.speed);
-    const dir = this.pickDirection(motion);
+    const speed = sample(motion.speed, random);
+    const dir = this.pickDirection(motion, random);
     const bias = motion.velocityBias;
     layer.velX[i] = dir.x * speed + (bias?.x ?? 0);
     layer.velY[i] = dir.y * speed + (bias?.y ?? 0);
     layer.velZ[i] = dir.z * speed + (bias?.z ?? 0);
 
     layer.age[i] = 0;
-    layer.life[i] = sample(config.lifetimeSec);
+    layer.life[i] = sample(config.lifetimeSec, random);
 
-    const size = sample(config.size) * (motion.sizeScale ?? 1);
+    const size = sample(config.size, random) * (motion.sizeScale ?? 1);
     layer.sizeStart[i] = size * config.sizeOverLife.from;
     layer.sizeEnd[i] = size * config.sizeOverLife.to;
     layer.alphaStart[i] = config.alphaOverLife.from;
@@ -194,14 +226,16 @@ export class ParticleSystem {
 
     const start = this.scratchColor.set(
       motion.color ??
-        config.palette[Math.floor(Math.random() * config.palette.length)],
+        config.palette[Math.floor(random() * config.palette.length)],
     );
+    if (light) start.multiply(light);
     layer.colStartR[i] = start.r;
     layer.colStartG[i] = start.g;
     layer.colStartB[i] = start.b;
     const end = config.fadeToColor
       ? this.scratchColor.set(config.fadeToColor)
       : start;
+    if (light && config.fadeToColor) end.multiply(light);
     layer.colEndR[i] = end.r;
     layer.colEndG[i] = end.g;
     layer.colEndB[i] = end.b;
@@ -210,9 +244,9 @@ export class ParticleSystem {
     layer.dragPerSec[i] = config.dragPerSec;
     layer.turbulence[i] = config.turbulence;
     layer.spinRate[i] = config.spinRadPerSec;
-    layer.spinPhase[i] = Math.random() * TAU;
+    layer.spinPhase[i] = config.initialSpinRad ?? random() * TAU;
 
-    const swayAngle = Math.random() * TAU;
+    const swayAngle = random() * TAU;
     const swaySpeed = config.sway?.speed ?? 0;
     layer.swayVelX[i] = Math.cos(swayAngle) * swaySpeed;
     layer.swayVelZ[i] = Math.sin(swayAngle) * swaySpeed;
@@ -220,6 +254,7 @@ export class ParticleSystem {
 
     layer.isSettling[i] = config.isSettlingOnGround ? 1 : 0;
     layer.isSettled[i] = 0;
+    layer.forgetMedium(i);
 
     if (layer.bodies) {
       relaunchBody(
@@ -241,8 +276,8 @@ export class ParticleSystem {
       const patchV = vSpan * config.texture.patchFraction;
       layer.writeUvRect(
         i,
-        region.startU + Math.random() * (uSpan - patchU),
-        region.startV + Math.random() * (vSpan - patchV),
+        region.startU + random() * (uSpan - patchU),
+        region.startV + random() * (vSpan - patchV),
         patchU,
         patchV,
       );
@@ -251,8 +286,24 @@ export class ParticleSystem {
 
   update(deltaSec: number, camera: Camera): void {
     const dt = Math.min(deltaSec, 0.05);
-    for (const layer of this.layers.values()) this.stepLayer(layer, dt, camera);
+    // World space: a player camera is parented under its controls' rig,
+    // whose rotation its local quaternion never sees.
+    camera.getWorldQuaternion(this.cameraQuaternion);
+    for (const layer of this.layers.values()) this.stepLayer(layer, dt);
     this.stepFlashes(dt);
+  }
+
+  /**
+   * Every layer mesh a selective bloom should leave out, for bloom setups
+   * that take objects rather than a layer channel. Layers are built as
+   * configs are prewarmed, so read this after the load phase.
+   */
+  getBloomExemptMeshes(): ParticleLayer["mesh"][] {
+    const meshes: ParticleLayer["mesh"][] = [];
+    for (const layer of this.layers.values()) {
+      if (layer.spec.bloomExemptLayer !== null) meshes.push(...layer.meshes);
+    }
+    return meshes;
   }
 
   dispose(): void {
@@ -268,9 +319,12 @@ export class ParticleSystem {
   ): ParticleLayer {
     const shape = config.shape ?? "cube";
     const isCutout = config.isCutout === true;
+    const isBloomExempt = config.isBloomExempt === true;
     const key = `${config.blend}|${shape}|${config.texture?.key ?? ""}|${physicsKey(
       config.physics,
-    )}|${isCutout ? "cutout" : "soft"}`;
+    )}|${isCutout ? "cutout" : "soft"}${isBloomExempt ? "|no-bloom" : ""}${
+      config.layerGroup ? `|group:${config.layerGroup}` : ""
+    }`;
     const existing = this.layers.get(key);
     if (existing) return existing;
 
@@ -287,13 +341,26 @@ export class ParticleSystem {
       map: config.texture?.map ?? null,
       physics: config.physics ?? null,
       isCutout,
+      bloomExemptLayer: isBloomExempt ? this.bloomExemptLayer : null,
+      isSinglePass: this.isQuadSinglePass,
+      renderOrder: isCutout ? 0 : this.softLayerRenderOrder,
     });
     this.layers.set(key, layer);
-    this.group.add(layer.mesh);
+    for (const mesh of layer.meshes) this.group.add(mesh);
     return layer;
   }
 
-  private pickDirection(motion: SpawnMotion): Vector3 {
+  private lightAt(position: { x: number; y: number; z: number }): Color {
+    return computeVoxelLightColor(
+      this.world,
+      Math.floor(position.x),
+      Math.floor(position.y),
+      Math.floor(position.z),
+      this.scratchLight,
+    );
+  }
+
+  private pickDirection(motion: SpawnMotion, random: () => number): Vector3 {
     const out = this.scratchDir;
     if (motion.direction) {
       // Cone around the axis: axis + tangent jitter scaled by the half-angle.
@@ -305,16 +372,16 @@ export class ParticleSystem {
       if (a.lengthSq() < 1e-6) a.set(0, -axis.z, axis.y);
       a.normalize();
       b.set(axis.x, axis.y, axis.z).cross(a);
-      const angle = Math.random() * TAU;
-      const radial = Math.random() * spread;
+      const angle = random() * TAU;
+      const radial = random() * spread;
       out
         .set(axis.x, axis.y, axis.z)
         .addScaledVector(a, Math.cos(angle) * radial)
         .addScaledVector(b, Math.sin(angle) * radial);
       return out.normalize();
     }
-    const theta = Math.random() * TAU;
-    const phi = Math.acos(2 * Math.random() - 1);
+    const theta = random() * TAU;
+    const phi = Math.acos(2 * random() - 1);
     out.set(
       Math.sin(phi) * Math.cos(theta),
       Math.cos(phi),
@@ -328,7 +395,7 @@ export class ParticleSystem {
     return out;
   }
 
-  private stepLayer(layer: ParticleLayer, dt: number, camera: Camera): void {
+  private stepLayer(layer: ParticleLayer, dt: number): void {
     const bodies = layer.bodies;
     for (let i = layer.alive - 1; i >= 0; i -= 1) {
       layer.age[i] += dt;
@@ -379,8 +446,10 @@ export class ParticleSystem {
       }
     }
 
-    // Write render state after removals so instance i maps to particle i.
-    const colors = layer.mesh.instanceColor;
+    // Write render state after removals, packing each medium's particles
+    // into its own mesh.
+    layer.beginWrite();
+    const isSplitByMedium = layer.wetMesh !== null;
     const isBillboard = layer.spec.shape === "billboard";
     for (let i = 0; i < layer.alive; i += 1) {
       const t = layer.age[i] / layer.life[i];
@@ -393,7 +462,7 @@ export class ParticleSystem {
         // Face the camera, then spin in the plane of the screen.
         this.scratchSpinQuaternion.setFromAxisAngle(this.viewAxis, spin);
         this.scratchQuaternion
-          .copy(camera.quaternion)
+          .copy(this.cameraQuaternion)
           .multiply(this.scratchSpinQuaternion);
       } else if (layer.isSettled[i]) {
         // Spun about its own normal first, then tipped flat, so a landed
@@ -411,25 +480,42 @@ export class ParticleSystem {
         this.scratchQuaternion,
         this.scratchScale,
       );
-      layer.mesh.setMatrixAt(i, this.scratchMatrix);
-
-      if (colors) {
-        colors.array[i * 3] =
-          layer.colStartR[i] + (layer.colEndR[i] - layer.colStartR[i]) * t;
-        colors.array[i * 3 + 1] =
-          layer.colStartG[i] + (layer.colEndG[i] - layer.colStartG[i]) * t;
-        colors.array[i * 3 + 2] =
-          layer.colStartB[i] + (layer.colEndB[i] - layer.colStartB[i]) * t;
-      }
       const hold = layer.alphaHold[i];
       const alphaT = hold > 0 ? Math.max(0, (t - hold) / (1 - hold)) : t;
-      layer.writeAlpha(
+      layer.writeInstance(
         i,
+        isSplitByMedium && this.isInWater(layer, i),
+        this.scratchMatrix,
+        layer.colStartR[i] + (layer.colEndR[i] - layer.colStartR[i]) * t,
+        layer.colStartG[i] + (layer.colEndG[i] - layer.colStartG[i]) * t,
+        layer.colStartB[i] + (layer.colEndB[i] - layer.colStartB[i]) * t,
         layer.alphaStart[i] +
           (layer.alphaEnd[i] - layer.alphaStart[i]) * alphaT,
       );
     }
     layer.markDirty();
+  }
+
+  /**
+   * Whether particle `i` stands in water, read again only when it crosses
+   * into another voxel.
+   */
+  private isInWater(layer: ParticleLayer, i: number): boolean {
+    const vx = Math.floor(layer.posX[i]);
+    const vy = Math.floor(layer.posY[i]);
+    const vz = Math.floor(layer.posZ[i]);
+    const voxel = layer.mediumVoxel;
+    const at = i * 3;
+    if (voxel[at] !== vx || voxel[at + 1] !== vy || voxel[at + 2] !== vz) {
+      voxel[at] = vx;
+      voxel[at + 1] = vy;
+      voxel[at + 2] = vz;
+      const isWater = this.world.isFluidOrWaterloggedAt
+        ? this.world.isFluidOrWaterloggedAt(vx, vy, vz)
+        : this.world.getBlockAt(vx, vy, vz)?.isFluid ?? false;
+      layer.isWet[i] = isWater ? 1 : 0;
+    }
+    return layer.isWet[i] === 1;
   }
 
   /**
@@ -474,6 +560,9 @@ function physicsKey(physics: ParticlePhysics | undefined): string {
   return `${physics.bodySize}:${physics.friction}:${physics.restitution}:${physics.gravityMultiplier}`;
 }
 
-function sample(range: { min: number; max: number }): number {
-  return range.min + Math.random() * (range.max - range.min);
+function sample(
+  range: { min: number; max: number },
+  random: () => number,
+): number {
+  return range.min + random() * (range.max - range.min);
 }

@@ -73,14 +73,81 @@ export type ArmOptions = {
   receiveShadows?: boolean;
   receiveHeldObjectShadows?: boolean;
   minOccluderDepth?: number;
+  /**
+   * How far the viewmodel reaches into the world, as a share of the
+   * distance it is drawn at: placed with {@link Arm.updateShadowUniforms},
+   * its shadows are looked up at that scale about the eye, so a block drawn
+   * two blocks down the screen is shaded where a hand would hold it.
+   */
+  shadowReach?: number;
+  /**
+   * How far whatever the arm holds sinks below its rest, in the arm's
+   * units, while {@link Arm.recovery} is 0: a game whose swings land harder
+   * for waiting shows the hand coming back. It rises with the recovery,
+   * late (by the cube of it), so it is up only once the next swing is
+   * full. 0, the default, never sinks.
+   */
+  recoveryDip?: number;
 };
 
-type ArmObjectOptions = {
+/**
+ * A slow breathing sway the held object makes while it is at rest: neither
+ * swinging nor being swapped. It is laid on top of the rest pose each frame
+ * and taken off again before the next, so it never accumulates, and it
+ * keeps real time, so every frame rate sees the same sway.
+ */
+export type ArmIdleSway = {
+  /** The point it sways about, in the arm's frame: where it is held. */
+  pivot: THREE.Vector3;
+  /** Seconds per breath. */
+  breathSeconds: number;
+  /** How far it rises at the top of a breath. */
+  breathLift: number;
+  /** How far it tips back toward the eye at the top of a breath, radians. */
+  breathTilt: number;
+  /**
+   * Seconds per drift from one side to the other and back. Not a multiple
+   * of a breath, so the two never settle into one short loop.
+   */
+  driftSeconds: number;
+  /** How far it drifts to either side. */
+  driftReach: number;
+  /** How far it rolls into the drift, radians. */
+  driftRoll: number;
+  /** Seconds it takes to come in once the object is at rest. */
+  fadeInSeconds: number;
+  /** Seconds it takes to leave when a swing starts. */
+  fadeOutSeconds: number;
+};
+
+export type ArmObjectOptions = {
   position: THREE.Vector3;
   quaternion: THREE.Quaternion;
   swingPositions?: THREE.Vector3[];
   swingQuaternions?: THREE.Quaternion[];
   swingTimes?: number[];
+  /**
+   * How far through a swing (0 to 1) it has to be before another swing
+   * request restarts it. Earlier requests are dropped, and not sent to
+   * peers, so a strike that has started always lands. 0, the default,
+   * restarts on every request.
+   */
+  swingRestartAfter?: number;
+  /**
+   * Seconds a restarted swing takes to ease out of the pose it interrupted
+   * instead of snapping to its first key. 0, the default, snaps.
+   */
+  swingRestartBlend?: number;
+  /** A breathing sway while the object is at rest. None by default. */
+  idleSway?: ArmIdleSway;
+  /**
+   * The field of view, in degrees, the object is posed for. While it is
+   * held, the arm keeps it the size and place on screen it has at that
+   * field of view, whatever {@link Arm.viewCamera} is drawn at, so a pose
+   * tuned once holds when a player widens or narrows the view. Unset, the
+   * object follows the camera's field of view like the world does.
+   */
+  fixedFov?: number;
 };
 
 const defaultOptions: ArmOptions = {
@@ -100,7 +167,13 @@ const defaultOptions: ArmOptions = {
     swingTimes: SWING_TIMES,
   },
   armColor: defaultArmsOptions.color,
+  shadowReach: 0.35,
 };
+
+const shadowReachScale = new THREE.Matrix4();
+const swayEuler = new THREE.Euler();
+const swayInverse = new THREE.Quaternion();
+const swingPose = new THREE.Quaternion();
 
 export class Arm extends THREE.Group {
   public options: ArmOptions;
@@ -131,9 +204,70 @@ export class Arm extends THREE.Group {
   private targetArmY = 0;
   private currentArmObject: THREE.Object3D | null = null;
 
-  private heldObjectShadowUniforms: EntityShadowUniforms[] = [];
+  /** The options of what the arm holds now: its rest, swing and sway. */
+  private currentObjectOptions: ArmObjectOptions | undefined;
+
+  // A swing restarted part way eases out of the pose it interrupted.
+  private readonly restartFromPosition = new THREE.Vector3();
+  private readonly restartFromQuaternion = new THREE.Quaternion();
+  private restartBlendLeft = 0;
+  private restartBlendSeconds = 0;
+
+  /** Whether {@link holdSwingAt} has the swing pinned at one moment. */
+  private isSwingHeld = false;
+
+  // The idle sway laid on the held object this frame, taken off before the
+  // next one is laid.
+  private swayClock = 0;
+  private swayWeight = 0;
+  private swayedObject: THREE.Object3D | null = null;
+  private readonly swayTurn = new THREE.Quaternion();
+  private readonly swayShift = new THREE.Vector3();
+  private readonly swayPivot = new THREE.Vector3();
+
+  /**
+   * How far the holder has come back since their last swing, 0 to 1. The
+   * game sets it every frame; while it is under 1 the held object sinks by
+   * {@link ArmOptions.recoveryDip}.
+   */
+  public recovery = 1;
+
+  // The recovery dip laid on the held object this frame, taken off before
+  // the next one is laid.
+  private dippedObject: THREE.Object3D | null = null;
+  private dipShift = 0;
+
+  /** One block every held object's shadowed material reads. */
+  private heldObjectShadowUniforms: EntityShadowUniforms =
+    createEntityShadowUniforms();
+
+  /**
+   * The arm's own copy of each material a held object arrives with, set up
+   * once. A held object usually shares its materials with every other copy
+   * of the same thing (an item's cached mesh is cloned into each hand with
+   * one material), so the arm never sets up a material it is handed.
+   */
+  private heldMaterials = new WeakMap<THREE.Material, THREE.Material>();
+  private ownHeldMaterials = new WeakSet<THREE.Material>();
+  /**
+   * The listener on each source material that frees its held copy when the
+   * source goes, kept so {@link dispose} can take it off again: a source
+   * shared page-wide (item art kept across a world switch) otherwise held
+   * this arm, and the world it reads, for the rest of the page.
+   */
+  private heldMaterialListeners = new Map<THREE.Material, () => void>();
+
+  private shadowSelfBounds: THREE.Vector4 | null = null;
+  private readonly noShadowSelfBounds = new THREE.Vector4();
+  private readonly shadowWorldMatrix = new THREE.Matrix4();
 
   public heldLightColor = new THREE.Color(1, 1, 1);
+
+  /**
+   * The camera the arm's scene is drawn with, which an object posed for a
+   * {@link ArmObjectOptions.fixedFov} is held against.
+   */
+  public viewCamera: THREE.PerspectiveCamera | null = null;
 
   /**
    * Whether a left click plays the default arm swing. Consumers that own the
@@ -191,37 +325,71 @@ export class Arm extends THREE.Group {
     this.setArm();
   }
 
+  /**
+   * Copy the frame's lighting into the arm's and the held object's shadows.
+   *
+   * @param viewToWorld Where the viewmodel's scene sits in the world: the eye
+   * camera's world matrix times the viewmodel camera's inverse. The
+   * viewmodel is then shaded where it would be held, at
+   * {@link ArmOptions.shadowReach} of the distance it is drawn at, and
+   * nothing inside the body it belongs to ({@link setShadowSelfBounds})
+   * shades any of its faces. A vector instead offsets the viewmodel's own,
+   * unrotated frame into the world.
+   */
   updateShadowUniforms(
     lightingUniforms: ShaderLightingUniforms,
-    playerWorldPosition?: THREE.Vector3,
+    viewToWorld?: THREE.Matrix4 | THREE.Vector3,
   ): void {
     const receiveArmShadows = this.shouldReceiveArmShadows();
     const receiveHeldObjectShadows = this.shouldReceiveHeldObjectShadows();
     if (!receiveArmShadows && !receiveHeldObjectShadows) return;
 
     const minDepth = this.options.minOccluderDepth ?? 0.0;
+    const isPlaced = viewToWorld instanceof THREE.Matrix4;
+    if (isPlaced) {
+      const reach = this.options.shadowReach ?? 1;
+      this.shadowWorldMatrix
+        .copy(viewToWorld)
+        .multiply(shadowReachScale.makeScale(reach, reach, reach));
+    }
+
+    const apply = (uniforms: EntityShadowUniforms) => {
+      updateEntityShadowUniforms(uniforms, lightingUniforms);
+      uniforms.uMinOccluderDepth.value = minDepth;
+      uniforms.uShadowSelfBounds.value =
+        this.shadowSelfBounds ?? this.noShadowSelfBounds;
+      uniforms.uShadowIgnoresSelf.value = isPlaced ? 1 : 0;
+      if (isPlaced) {
+        uniforms.uShadowWorldMatrix.value.copy(this.shadowWorldMatrix);
+        uniforms.uWorldOffset.value.set(0, 0, 0);
+      } else {
+        uniforms.uShadowWorldMatrix.value.identity();
+        if (viewToWorld) uniforms.uWorldOffset.value.copy(viewToWorld);
+      }
+    };
 
     if (receiveArmShadows) {
       this.traverse((child) => {
         if (child instanceof CanvasBox && child.shadowUniforms) {
-          updateEntityShadowUniforms(child.shadowUniforms, lightingUniforms);
-          child.shadowUniforms.uMinOccluderDepth.value = minDepth;
-          if (playerWorldPosition) {
-            child.shadowUniforms.uWorldOffset.value.copy(playerWorldPosition);
-          }
+          apply(child.shadowUniforms);
         }
       });
     }
 
     if (receiveHeldObjectShadows) {
-      for (const uniforms of this.heldObjectShadowUniforms) {
-        updateEntityShadowUniforms(uniforms, lightingUniforms);
-        uniforms.uMinOccluderDepth.value = minDepth;
-        if (playerWorldPosition) {
-          uniforms.uWorldOffset.value.copy(playerWorldPosition);
-        }
-      }
+      apply(this.heldObjectShadowUniforms);
     }
+  }
+
+  /**
+   * The body the viewmodel belongs to, as its world-space bounding sphere
+   * (`Character.shadowSelfBounds`), shared by reference so the body keeps it
+   * current. With a placed viewmodel nothing inside it shades the arm or
+   * the held object, which lets the body cast its own shadow from just
+   * behind the eye. `null` for none.
+   */
+  setShadowSelfBounds(bounds: THREE.Vector4 | null) {
+    this.shadowSelfBounds = bounds;
   }
 
   /**
@@ -262,6 +430,15 @@ export class Arm extends THREE.Group {
     animate: boolean,
     customType?: string,
   ) => {
+    // The outgoing object leaves from its plain rest pose, and whatever
+    // comes in starts its own sway once it is up.
+    this.holdSwingAt(null);
+    this.liftRecoveryDip();
+    this.liftIdleSway();
+    this.swayWeight = 0;
+    this.swayClock = 0;
+    this.restartBlendLeft = 0;
+
     if (!animate) {
       this.clear();
 
@@ -299,8 +476,6 @@ export class Arm extends THREE.Group {
   };
 
   private setArm = () => {
-    this.heldObjectShadowUniforms = [];
-
     const arm = new CanvasBox({
       width: 0.5,
       height: 1,
@@ -331,6 +506,7 @@ export class Arm extends THREE.Group {
     );
     arm.quaternion.multiply(this.options.armObjectOptions?.quaternion);
 
+    this.currentObjectOptions = this.options.armObjectOptions;
     this.mixer = new THREE.AnimationMixer(arm);
     this.swingAnimation = this.mixer.clipAction(this.armSwingClip);
     this.swingAnimation.setLoop(THREE.LoopOnce, 1);
@@ -348,8 +524,9 @@ export class Arm extends THREE.Group {
     );
     object.quaternion.multiply(this.options.blockObjectOptions?.quaternion);
 
-    this.injectHeldObjectLighting(object);
+    this.adoptHeldMaterials(object);
 
+    this.currentObjectOptions = this.options.blockObjectOptions;
     this.mixer = new THREE.AnimationMixer(object);
     this.swingAnimation = this.mixer.clipAction(this.blockSwingClip);
     this.swingAnimation.setLoop(THREE.LoopOnce, 1);
@@ -372,12 +549,9 @@ export class Arm extends THREE.Group {
     );
     object.quaternion.multiply(options.quaternion);
 
-    if (this.shouldReceiveHeldObjectShadows()) {
-      this.injectShadowShaders(object);
-    } else {
-      this.injectHeldObjectLighting(object);
-    }
+    this.adoptHeldMaterials(object);
 
+    this.currentObjectOptions = options;
     this.mixer = new THREE.AnimationMixer(object);
     this.swingAnimation = this.mixer.clipAction(this.customSwingClips[type]);
     this.swingAnimation.setLoop(THREE.LoopOnce, 1);
@@ -387,121 +561,170 @@ export class Arm extends THREE.Group {
     this.currentArmObject = object;
   };
 
-  private injectHeldObjectLighting(object: THREE.Object3D): void {
-    this.heldObjectShadowUniforms = [];
-
+  /** Point every mesh of a held object at the arm's own copy of its material. */
+  private adoptHeldMaterials(object: THREE.Object3D): void {
     object.traverse((child) => {
       if (!("isMesh" in child) || !(child as THREE.Mesh).isMesh) return;
       const mesh = child as THREE.Mesh;
-      const materials = Array.isArray(mesh.material)
-        ? mesh.material
-        : [mesh.material];
-
-      for (const material of materials) {
-        if ((material as THREE.Material).type !== "MeshBasicMaterial") continue;
-        if (material.userData.heldObjectLighting === true) continue;
-        if (isSelfIlluminated(material)) continue;
-
-        material.userData.heldObjectLighting = true;
-        material.userData.lightEffectSetup = true;
-
-        const lightColorRef = this.heldLightColor;
-        const oldOnBeforeCompile = material.onBeforeCompile;
-        material.onBeforeCompile = (shader, renderer) => {
-          if (oldOnBeforeCompile) {
-            oldOnBeforeCompile(shader, renderer);
-          }
-
-          shader.uniforms.uLightColor = { value: lightColorRef };
-
-          shader.fragmentShader = shader.fragmentShader
-            .replace(
-              "#include <common>",
-              `#include <common>
-uniform vec3 uLightColor;
-`,
-            )
-            .replace(
-              "#include <dithering_fragment>",
-              `#include <dithering_fragment>
-gl_FragColor.rgb *= uLightColor;
-`,
-            );
-        };
-
-        material.onBeforeCompile.toString = () => "held-object-lighting-shader";
-        material.needsUpdate = true;
-      }
+      mesh.material = Array.isArray(mesh.material)
+        ? mesh.material.map(this.heldMaterialFor)
+        : this.heldMaterialFor(mesh.material);
     });
   }
 
-  private injectShadowShaders(object: THREE.Object3D): void {
-    this.heldObjectShadowUniforms = [];
-    if (!this.shouldReceiveHeldObjectShadows()) return;
+  private heldMaterialFor = (material: THREE.Material): THREE.Material => {
+    if (material.type !== "MeshBasicMaterial") return material;
+    if (isSelfIlluminated(material)) return material;
+    if (this.ownHeldMaterials.has(material)) return material;
+    const cached = this.heldMaterials.get(material);
+    if (cached) return cached;
 
-    object.traverse((child) => {
-      if (!("isMesh" in child) || !(child as THREE.Mesh).isMesh) return;
-      const mesh = child as THREE.Mesh;
-      const materials = Array.isArray(mesh.material)
-        ? mesh.material
-        : [mesh.material];
+    // A clone copies flags but not compile hooks, so it must not pass as
+    // set up; a hook the source was built with comes along, an effect's
+    // wrapper does not.
+    const own = material.clone();
+    const isSetUpElsewhere =
+      material.userData.heldObjectLighting === true ||
+      material.userData.lightEffectSetup === true;
+    delete own.userData.heldObjectLighting;
+    delete own.userData.lightEffectSetup;
+    if (
+      !isSetUpElsewhere &&
+      Object.prototype.hasOwnProperty.call(material, "onBeforeCompile")
+    ) {
+      own.onBeforeCompile = material.onBeforeCompile;
+    }
+    if (this.shouldReceiveHeldObjectShadows()) this.setUpHeldShadow(own);
+    else this.setUpHeldLighting(own);
 
-      for (const material of materials) {
-        if ((material as THREE.Material).type !== "MeshBasicMaterial") continue;
-        if (isSelfIlluminated(material)) continue;
+    this.heldMaterials.set(material, own);
+    this.ownHeldMaterials.add(own);
+    const onSourceDispose = () => {
+      this.heldMaterials.delete(material);
+      this.heldMaterialListeners.delete(material);
+      own.dispose();
+    };
+    material.addEventListener("dispose", onSourceDispose);
+    this.heldMaterialListeners.set(material, onSourceDispose);
+    return own;
+  };
 
-        material.userData.heldObjectLighting = true;
-        material.userData.lightEffectSetup = true;
+  /**
+   * Let go of what the arm made for held items: their materials, and the
+   * listeners it put on the materials they were made from.
+   */
+  dispose = () => {
+    for (const [source, onSourceDispose] of this.heldMaterialListeners) {
+      source.removeEventListener("dispose", onSourceDispose);
+      this.heldMaterials.get(source)?.dispose();
+    }
+    this.heldMaterialListeners.clear();
+    this.heldMaterials = new WeakMap();
+  };
 
-        const shadowUniforms = createEntityShadowUniforms();
-        this.heldObjectShadowUniforms.push(shadowUniforms);
+  /** The program key for a held material, kept apart per hook it wraps. */
+  private heldProgramKey(material: THREE.Material, name: string): string {
+    return Object.prototype.hasOwnProperty.call(material, "onBeforeCompile")
+      ? `${name}|${material.onBeforeCompile.toString()}`
+      : name;
+  }
 
-        const lightColorRef = this.heldLightColor;
-        const oldOnBeforeCompile = material.onBeforeCompile;
-        material.onBeforeCompile = (shader, renderer) => {
-          if (oldOnBeforeCompile) {
-            oldOnBeforeCompile(shader, renderer);
-          }
+  private setUpHeldLighting(material: THREE.Material): void {
+    material.userData.heldObjectLighting = true;
+    material.userData.lightEffectSetup = true;
 
-          Object.assign(shader.uniforms, shadowUniforms);
-          shader.uniforms.uLightColor = { value: lightColorRef };
+    const key = this.heldProgramKey(material, "held-object-lighting-shader");
+    const lightColorRef = this.heldLightColor;
+    const oldOnBeforeCompile = material.onBeforeCompile;
+    material.onBeforeCompile = (shader, renderer) => {
+      if (oldOnBeforeCompile) {
+        oldOnBeforeCompile(shader, renderer);
+      }
 
-          shader.vertexShader = shader.vertexShader
-            .replace(
-              "#include <uv_pars_vertex>",
-              `#include <uv_pars_vertex>
-${ENTITY_SHADOW_VERTEX_PARS}
-`,
-            )
-            .replace(
-              "#include <worldpos_vertex>",
-              `#include <worldpos_vertex>
-vec4 worldPosition = modelMatrix * vec4(transformed, 1.0);
-${ENTITY_SHADOW_VERTEX_MAIN}
-`,
-            );
+      shader.uniforms.uLightColor = { value: lightColorRef };
 
-          shader.fragmentShader = shader.fragmentShader
-            .replace(
-              "#include <common>",
-              `#include <common>
-${ENTITY_SHADOW_FRAGMENT_PARS}
+      shader.fragmentShader = shader.fragmentShader
+        .replace(
+          "#include <common>",
+          `#include <common>
 uniform vec3 uLightColor;
 `,
-            )
-            .replace(
-              "#include <dithering_fragment>",
-              `#include <dithering_fragment>
-float shadow = getEntityShadow(vec3(0.0, 1.0, 0.0));
+        )
+        .replace(
+          "#include <dithering_fragment>",
+          `#include <dithering_fragment>
+gl_FragColor.rgb *= uLightColor;
+`,
+        );
+    };
+
+    material.onBeforeCompile.toString = () => key;
+    material.needsUpdate = true;
+  }
+
+  private setUpHeldShadow(material: THREE.Material): void {
+    const shadowUniforms = this.heldObjectShadowUniforms;
+    material.userData.heldObjectLighting = true;
+    material.userData.lightEffectSetup = true;
+
+    const key = this.heldProgramKey(material, "held-object-shadow-shader");
+    const lightColorRef = this.heldLightColor;
+    const oldOnBeforeCompile = material.onBeforeCompile;
+    material.onBeforeCompile = (shader, renderer) => {
+      if (oldOnBeforeCompile) {
+        oldOnBeforeCompile(shader, renderer);
+      }
+
+      Object.assign(shader.uniforms, shadowUniforms);
+      shader.uniforms.uLightColor = { value: lightColorRef };
+
+      shader.vertexShader = shader.vertexShader
+        .replace(
+          "#include <uv_pars_vertex>",
+          `#include <uv_pars_vertex>
+${ENTITY_SHADOW_VERTEX_PARS}
+varying vec3 vHeldShadowNormal;
+varying vec3 vHeldShadowPosition;
+`,
+        )
+        .replace(
+          "#include <worldpos_vertex>",
+          `#include <worldpos_vertex>
+vec4 worldPosition = modelMatrix * vec4(transformed, 1.0);
+${ENTITY_SHADOW_VERTEX_MAIN}
+// Item shapes carry no normals, and a zero vector does not normalize.
+vec3 heldShadowNormal = mat3(uShadowWorldMatrix) * mat3(modelMatrix) * normal;
+vHeldShadowNormal = dot(heldShadowNormal, heldShadowNormal) > 0.0
+  ? normalize(heldShadowNormal)
+  : vec3(0.0, 1.0, 0.0);
+vHeldShadowPosition = shadowWorldPos.xyz;
+`,
+        );
+
+      shader.fragmentShader = shader.fragmentShader
+        .replace(
+          "#include <common>",
+          `#include <common>
+${ENTITY_SHADOW_FRAGMENT_PARS}
+uniform vec3 uLightColor;
+varying vec3 vHeldShadowNormal;
+varying vec3 vHeldShadowPosition;
+`,
+        )
+        .replace(
+          "#include <dithering_fragment>",
+          `#include <dithering_fragment>
+float shadow = getEntityShadowAt(
+  normalize(vHeldShadowNormal),
+  vHeldShadowPosition
+);
 gl_FragColor.rgb *= shadow * uLightColor;
 `,
-            );
-        };
+        );
+    };
 
-        material.onBeforeCompile.toString = () => "held-object-shadow-shader";
-        material.needsUpdate = true;
-      }
-    });
+    material.onBeforeCompile.toString = () => key;
+    material.needsUpdate = true;
   }
 
   private shouldReceiveArmShadows(): boolean {
@@ -524,7 +747,10 @@ gl_FragColor.rgb *= shadow * uLightColor;
     this.timer.update();
     const delta = Math.min(0.1, this.timer.getDelta());
 
+    this.liftRecoveryDip();
+    this.liftIdleSway();
     this.mixer.update(delta);
+    this.easeSwingRestart(delta);
 
     // Handle arm object transition animation if active
     if (this.isTransitioning) {
@@ -608,16 +834,82 @@ gl_FragColor.rgb *= shadow * uLightColor;
         }
       }
     }
+
+    this.layIdleSway(delta);
+    this.layRecoveryDip();
+    this.holdFixedFov();
   }
 
   /**
-   * Perform an arm swing by playing the swing animation and sending an event to the network.
+   * Scale the arm across the view, about its axis, so an object posed for a
+   * fixed field of view projects as it would there: a point drawn at
+   * `x / -z` lands where it would at `fixedFov` once x and y are scaled by
+   * the ratio of the two fields' tangents. Depth is left alone, so nothing
+   * comes nearer the eye.
    */
-  public doSwing = () => {
-    this.playSwingAnimation();
-    if (this.emitSwingEvent) {
-      this.emitSwingEvent();
+  private holdFixedFov() {
+    const fixedFov = this.currentObjectOptions?.fixedFov;
+    const camera = this.viewCamera;
+    if (fixedFov === undefined || !camera) {
+      this.scale.set(1, 1, 1);
+      return;
     }
+    const across =
+      Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) /
+      Math.tan(THREE.MathUtils.degToRad(fixedFov / 2));
+    this.scale.set(across, across, 1);
+  }
+
+  /**
+   * Swing what the arm holds and send the swing to the network, so peers
+   * swing too. A request the swing in progress is not ready for (see
+   * {@link ArmObjectOptions.swingRestartAfter}) does neither, so peers see
+   * exactly the swings the holder sees. Returns whether a swing started.
+   */
+  public doSwing = (): boolean => {
+    if (!this.playSwingAnimation()) return false;
+    this.emitSwingEvent?.();
+    return true;
+  };
+
+  /**
+   * How far through its swing the held object is, 0 to 1, or null when it
+   * is not swinging.
+   */
+  get swingProgress(): number | null {
+    const action = this.swingAnimation;
+    if (!action || !(this.isSwingHeld || action.isRunning())) return null;
+    return action.time / action.getClip().duration;
+  }
+
+  /**
+   * Pin the held object's swing `seconds` into it, or release it with
+   * `null`. A pinned swing shows that one frame, with no sway, until it is
+   * released and the object is back at rest. For stills of a swing and the
+   * tests that check one; play never needs it.
+   */
+  public holdSwingAt = (seconds: number | null) => {
+    const action = this.swingAnimation;
+    if (!action) return;
+    if (seconds === null && !this.isSwingHeld) return;
+
+    this.liftRecoveryDip();
+    this.liftIdleSway();
+    this.swayWeight = 0;
+    this.restartBlendLeft = 0;
+    const duration = action.getClip().duration;
+    if (seconds === null) {
+      this.isSwingHeld = false;
+      action.paused = false;
+      action.time = duration;
+    } else {
+      this.isSwingHeld = true;
+      action.reset();
+      action.play();
+      action.time = THREE.MathUtils.clamp(seconds, 0, duration);
+      action.paused = true;
+    }
+    this.mixer.update(0);
   };
 
   /**
@@ -644,12 +936,143 @@ gl_FragColor.rgb *= shadow * uLightColor;
   };
 
   /**
-   * Play the "swing" animation.
+   * Play the "swing" animation, unless the swing in progress is not yet
+   * {@link ArmObjectOptions.swingRestartAfter} of the way through. Returns
+   * whether a swing started.
    */
-  private playSwingAnimation = () => {
-    if (this.swingAnimation) {
-      this.swingAnimation.reset();
-      this.swingAnimation.play();
+  private playSwingAnimation = (): boolean => {
+    const action = this.swingAnimation;
+    if (!action || this.isSwingHeld) return false;
+
+    const options = this.currentObjectOptions;
+    if (action.isRunning()) {
+      const progress = action.time / action.getClip().duration;
+      if (progress < (options?.swingRestartAfter ?? 0)) return false;
+      const blend = options?.swingRestartBlend ?? 0;
+      const object = this.currentArmObject;
+      if (blend > 0 && object) {
+        this.restartFromPosition.copy(object.position);
+        this.restartFromQuaternion.copy(object.quaternion);
+        this.restartBlendLeft = blend;
+        this.restartBlendSeconds = blend;
+      }
     }
+
+    action.reset();
+    action.play();
+    return true;
   };
+
+  /** Ease a restarted swing out of the pose it interrupted. */
+  private easeSwingRestart(delta: number) {
+    if (this.restartBlendLeft <= 0) return;
+    const object = this.currentArmObject;
+    if (!object) {
+      this.restartBlendLeft = 0;
+      return;
+    }
+
+    this.restartBlendLeft = Math.max(0, this.restartBlendLeft - delta);
+    const t = 1 - this.restartBlendLeft / this.restartBlendSeconds;
+    const k = t * t * (3 - 2 * t);
+    object.position.lerpVectors(this.restartFromPosition, object.position, k);
+    swingPose.copy(object.quaternion);
+    object.quaternion.slerpQuaternions(
+      this.restartFromQuaternion,
+      swingPose,
+      k,
+    );
+  }
+
+  /**
+   * Lay this frame's idle sway on the held object: it fades in while the
+   * object is at rest and out while it swings or is swapped, on a clock
+   * that keeps real time.
+   */
+  private layIdleSway(delta: number) {
+    const sway = this.currentObjectOptions?.idleSway;
+    const object = this.currentArmObject;
+    if (!sway || !object) {
+      this.swayWeight = 0;
+      return;
+    }
+
+    const isAtRest =
+      !this.isTransitioning &&
+      !this.isSwingHeld &&
+      this.restartBlendLeft <= 0 &&
+      !this.swingAnimation?.isRunning();
+    const fadeSeconds = isAtRest ? sway.fadeInSeconds : sway.fadeOutSeconds;
+    const step = fadeSeconds > 0 ? delta / fadeSeconds : 1;
+    this.swayWeight = isAtRest
+      ? Math.min(1, this.swayWeight + step)
+      : Math.max(0, this.swayWeight - step);
+    this.swayClock += delta;
+    if (this.swayWeight <= 0) return;
+
+    const weight = this.swayWeight;
+    const amount = weight * weight * (3 - 2 * weight);
+    const breath =
+      0.5 - 0.5 * Math.cos((2 * Math.PI * this.swayClock) / sway.breathSeconds);
+    const drift = Math.sin((2 * Math.PI * this.swayClock) / sway.driftSeconds);
+    this.swayShift
+      .set(sway.driftReach * drift, sway.breathLift * breath, 0)
+      .multiplyScalar(amount);
+    this.swayTurn.setFromEuler(
+      swayEuler.set(
+        sway.breathTilt * breath * amount,
+        0,
+        -sway.driftRoll * drift * amount,
+      ),
+    );
+    this.swayPivot.copy(sway.pivot);
+
+    object.position
+      .sub(this.swayPivot)
+      .applyQuaternion(this.swayTurn)
+      .add(this.swayPivot)
+      .add(this.swayShift);
+    object.quaternion.premultiply(this.swayTurn);
+    this.swayedObject = object;
+  }
+
+  /**
+   * Lay this frame's recovery dip on the held object, over its sway: none
+   * while a swing is pinned for a still, so the still shows the pose.
+   */
+  private layRecoveryDip() {
+    const depth = this.options.recoveryDip ?? 0;
+    const object = this.currentArmObject;
+    if (depth <= 0 || !object || this.isSwingHeld) return;
+    const recovered = THREE.MathUtils.clamp(this.recovery, 0, 1);
+    const shift = depth * (1 - recovered * recovered * recovered);
+    if (shift <= 0) return;
+    object.position.y -= shift;
+    this.dippedObject = object;
+    this.dipShift = shift;
+  }
+
+  /** Take last frame's recovery dip back off the object it was laid on. */
+  private liftRecoveryDip() {
+    const object = this.dippedObject;
+    if (!object) return;
+    this.dippedObject = null;
+    object.position.y += this.dipShift;
+    this.dipShift = 0;
+  }
+
+  /** Take last frame's idle sway back off the object it was laid on. */
+  private liftIdleSway() {
+    const object = this.swayedObject;
+    if (!object) return;
+    this.swayedObject = null;
+
+    swayInverse.copy(this.swayTurn).invert();
+    object.position
+      .sub(this.swayShift)
+      .sub(this.swayPivot)
+      .applyQuaternion(swayInverse)
+      .add(this.swayPivot);
+    object.quaternion.premultiply(swayInverse);
+  }
 }

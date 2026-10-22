@@ -1,29 +1,45 @@
+mod branch;
+#[cfg(test)]
+mod branch_tests;
+mod connected;
+#[cfg(test)]
+mod connected_tests;
 mod connectivity;
+mod coplanar;
 mod faces;
 mod fluid;
 mod greedy;
 mod lighting;
 mod space;
-mod types;
-mod vertex_light;
 #[cfg(test)]
 mod tests;
+mod tufts;
+mod types;
+mod vertex_light;
 
+pub use branch::{
+    branch_cell, branch_layout_at, BranchBeyond, BranchBlocks, BranchCell, BranchKind,
+    BranchLayout, BranchPart, BranchPartKind, BranchQuad, BranchSeat, BranchShape, BranchSide,
+    BranchSocket, BranchTexture, WideBranchBits, WideBranchSection, WideCell,
+};
 pub use connectivity::{
     compute_section_connectivity, connectivity_pair_bit, CONNECTIVITY_FACES, CONNECTIVITY_FULL,
     CONNECTIVITY_SEALED,
 };
 pub use greedy::mesh_space_greedy;
+pub use tufts::TUFTS_FACE_NAME;
 pub use types::*;
 pub use vertex_light::*;
 
+use branch::*;
+use connected::*;
 use connectivity::*;
+use coplanar::*;
 use faces::*;
 use fluid::*;
 use lighting::*;
 use space::*;
-
-
+use tufts::*;
 
 pub fn mesh_chunk(mut input: MeshInput) -> MeshOutput {
     input.registry.build_cache();

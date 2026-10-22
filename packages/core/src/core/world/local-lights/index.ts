@@ -9,6 +9,7 @@ import {
   WebGLRenderer,
 } from "three";
 
+import { LocalLightAirlight } from "./airlight";
 import { LightClusterGrid } from "./clustering";
 import { LocalLightsDebugOverlay } from "./debug";
 import { LightSourceRegistry } from "./registry";
@@ -52,6 +53,7 @@ export {
   BLOCK_LIGHT_OWNERSHIP_GAIN,
   blockLightFloodRemainder,
   EMISSIVE_LEVELS,
+  LAMBERT_WRAP,
   LOCAL_LIGHTS_DEBUG_FUNCTIONS,
   LOCAL_LIGHTS_FUNCTIONS,
   LOCAL_LIGHTS_UNIFORM_DECLARATIONS,
@@ -115,6 +117,13 @@ export class LocalLights {
   readonly shadows: LocalShadowScheduler;
   /** The per-frame face-unit budget CSM and local shadows share. */
   readonly shadowLedger = new ShadowFrameLedger();
+  /**
+   * The few lights the camera sees, lighting the air (a screen effect the
+   * game adds) and the room (the chunk shader's fill). The game drives its
+   * `update` once per drawn frame with the camera's daylight and sight
+   * lines; an empty set costs the shaders one integer compare.
+   */
+  readonly airlight = new LocalLightAirlight();
 
   /** Mutated in place; never reallocated. */
   readonly stats: LocalLightStats = {
@@ -130,6 +139,9 @@ export class LocalLights {
     scanMsPeak: 0,
     sectionsPendingScan: 0,
     selectionChurn: 0,
+    fadingSlots: 0,
+    fadingLights: 0,
+    highResolution: 0,
     gridTextureUploads: 0,
     dataTextureUploads: 0,
     shadowed: 0,
@@ -228,9 +240,14 @@ export class LocalLights {
     return {
       uLightGrid: u.lightGrid,
       uLightData: u.lightData,
+      uLightOverflow: u.lightOverflow,
       uLightGridOrigin: u.gridOrigin,
       uLightGridDims: u.gridDims,
       uLightGridCellSize: u.gridCellSize,
+      uLightGridStorageOffset: u.gridStorageOffset,
+      uLightGridCenter: u.gridCenter,
+      uLightGridHalf: u.gridHalf,
+      uLocalLightStable: u.stable,
       uClusteredLightCount: u.clusteredCount,
       uLocalMaskKnee: u.maskKnee,
       uLocalSpecularStrength: u.specularStrength,
@@ -240,6 +257,13 @@ export class LocalLights {
       uLocalShadowAtlas: this.shadowUniforms.atlas,
       uLocalShadowParams: this.shadowUniforms.params,
       uLocalShadowParams2: this.shadowUniforms.params2,
+      uAirCount: this.airlight.uniforms.count,
+      uAirPos: this.airlight.uniforms.positions,
+      uAirColor: this.airlight.uniforms.colors,
+      uRoomFillStrength: this.airlight.uniforms.fillStrength,
+      uRoomFillRangeScale: this.airlight.uniforms.fillRangeScale,
+      uRoomFillCoreScale: this.airlight.uniforms.fillCoreScale,
+      uRoomFillFloodMask: this.airlight.uniforms.fillFloodMask,
     };
   }
 
@@ -256,6 +280,15 @@ export class LocalLights {
     } else {
       this.declaredProfilesByName.set(block.toLowerCase(), profile);
     }
+    this.invalidateProfiles();
+  }
+
+  /**
+   * Re-resolve every block profile and rescan the loaded world through the
+   * bounded queue — for scan-time switches (`BLOCK_LIGHT_TUNING`'s
+   * `analyticHue`, `proxyEnergy`) flipped at runtime.
+   */
+  rebuildProfiles(): void {
     this.invalidateProfiles();
   }
 
@@ -379,6 +412,29 @@ export class LocalLights {
 
   getQualityTier(): LightQualityTier {
     return this.tier;
+  }
+
+  /**
+   * The drawing buffer's pixel count; the world feeds it every rendered
+   * frame. Past `highResolutionPixels` (with hysteresis) cells keep fewer
+   * steady lights, and the ones they drop fade out.
+   */
+  setRenderPixels(pixels: number): void {
+    this.grid.setRenderPixels(pixels);
+  }
+
+  /**
+   * On by default. Off renders the legacy frame — camera-ranked cells,
+   * popping selection, stepped window rim, shadows that blank on every
+   * nearby remesh — and exists only for A/B captures and measurements.
+   */
+  setTemporalStability(isStable: boolean): void {
+    this.grid.setTemporalStability(isStable);
+    this.shadows.setTemporalStability(isStable);
+  }
+
+  get isTemporallyStable(): boolean {
+    return this.grid.isTemporallyStable;
   }
 
   /**
@@ -537,6 +593,8 @@ export class LocalLights {
       position.y,
       position.z,
       stats,
+      this.grid.packedIndices,
+      this.grid.packedCount,
     );
     this.debugOverlay?.update();
   }

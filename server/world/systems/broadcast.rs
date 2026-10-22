@@ -1,11 +1,14 @@
+use std::time::Instant;
+
 use hashbrown::HashMap;
+use log::{debug, log_enabled, Level};
 use serde_json::{json, Map, Value};
 use specs::{ReadExpect, System, WriteExpect};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
     common::ClientFilter,
-    encode_message, fragment_message,
+    encode_message, fits_one_datagram,
     perf::{self, OutboundPerfKind},
     server::Message,
     state_flush_budget,
@@ -14,7 +17,7 @@ use crate::{
         Stats, WorldConfig,
     },
     EncodedMessage, EncodedMessageQueue, EntityOperation, MessageType, ReplicatedStateBuffer,
-    RtcSenders, Transports,
+    LogRateLimiter, Transports,
 };
 
 /// How often (wall-clock ms) each client's motion-gap distribution is
@@ -188,15 +191,26 @@ fn batch_messages(messages: Vec<(Message, ClientFilter)>) -> Vec<(Message, Clien
     result
 }
 
-/// Send encoded bytes to a client over its WebRTC data channel when one is
-/// available, otherwise over its WebSocket channel.
-fn send_to_client(client: &Client, rtc_sender: Option<&UnboundedSender<Vec<u8>>>, data: &[u8]) {
-    if let Some(rtc_sender) = rtc_sender {
-        for fragment in fragment_message(data) {
-            if rtc_sender.send(fragment).is_err() {
-                break;
-            }
+/// Hand `data` to the client's WebRTC data channel, whole. False when there
+/// is no open channel or the message is too big for one datagram: those go
+/// over the WebSocket instead. The channel's writer fragments anything it is
+/// given, so fragmenting here as well split every large message twice, and
+/// the client, which undoes one level, decoded the inner fragments as
+/// messages ("invalid wire type 4").
+fn send_rtc(rtc_sender: Option<&UnboundedSender<Vec<u8>>>, data: &[u8]) -> bool {
+    match rtc_sender {
+        Some(rtc_sender) if fits_one_datagram(data.len()) => {
+            rtc_sender.send(data.to_vec()).is_ok()
         }
+        _ => false,
+    }
+}
+
+/// Send encoded bytes to a client over its WebRTC data channel when one is
+/// available and the message fits one datagram, otherwise over its
+/// WebSocket channel.
+fn send_to_client(client: &Client, rtc_sender: Option<&UnboundedSender<Vec<u8>>>, data: &[u8]) {
+    if send_rtc(rtc_sender, data) {
         return;
     }
     let _ = client.sender.send(data.to_vec());
@@ -213,7 +227,6 @@ impl<'a> System<'a> for BroadcastSystem {
         WriteExpect<'a, EncodedMessageQueue>,
         WriteExpect<'a, ReplicatedStateBuffer>,
         WriteExpect<'a, Profiler>,
-        Option<ReadExpect<'a, RtcSenders>>,
     );
 
     fn run(&mut self, data: Self::SystemData) {
@@ -227,7 +240,6 @@ impl<'a> System<'a> for BroadcastSystem {
             mut encoded_queue,
             mut replicated_state,
             _profiler,
-            rtc_senders_opt,
         ) = data;
         let world_name = &*timing.world_name;
 
@@ -249,11 +261,19 @@ impl<'a> System<'a> for BroadcastSystem {
             .map(|(message, filter)| {
                 let msg_type = message.r#type;
                 let outbound_perf = perf::outbound(&message);
+                let chunk_count = message.chunks.len();
+                let queued_at = Instant::now();
+                let data = encode_message(&message);
+                let encoded_at = Instant::now();
                 let encoded = EncodedMessage {
-                    data: encode_message(&message),
+                    data,
                     msg_type,
                     is_rtc_eligible: false,
                     perf: outbound_perf,
+                    chunk_count,
+                    queued_at,
+                    encode_ms: (encoded_at - queued_at).as_secs_f32() * 1000.0,
+                    encoded_at,
                 };
                 (encoded, filter)
             })
@@ -267,8 +287,6 @@ impl<'a> System<'a> for BroadcastSystem {
         let async_messages = encoded_queue.receive();
         let mut done_messages = immediate_encoded;
         done_messages.extend(async_messages);
-
-        let rtc_map = rtc_senders_opt.as_ref().and_then(|rtc| rtc.try_lock().ok());
 
         // ---- Reliable ordered events (must-deliver, FIFO) -----------------
         //
@@ -285,19 +303,49 @@ impl<'a> System<'a> for BroadcastSystem {
 
             if let ClientFilter::Direct(id) = &filter {
                 if let Some(client) = clients.get(id) {
-                    if use_rtc {
-                        if let Some(ref rtc_map) = rtc_map {
-                            if let Some(rtc_sender) = rtc_map.get(id) {
-                                for fragment in fragment_message(&encoded.data) {
-                                    if rtc_sender.send(fragment).is_err() {
-                                        break;
-                                    }
-                                }
-                                continue;
-                            }
+                    if use_rtc && send_rtc(client.sender.rtc().as_ref(), &encoded.data) {
+                        continue;
+                    }
+                    if log_enabled!(Level::Debug)
+                        && MessageType::try_from(encoded.msg_type) == Ok(MessageType::Load)
+                    {
+                        // The number a slow chunk window gets blamed on: how
+                        // long the chunks sat between the tick that decided
+                        // to send them and the tick that reached the socket.
+                        // One line per client per chunk batch, so rate-limited.
+                        static CHUNK_SEND_LOG: LogRateLimiter = LogRateLimiter::new();
+                        if let Some(suppressed) = CHUNK_SEND_LOG.allow(250) {
+                            debug!(
+                                "[chunk-send] {} chunk(s), {}KB to {}: {:.1}ms from queue to \
+                                 socket hand-off ({:.1}ms of it encoding), {} bulk message(s) \
+                                 already waiting on the lane (+{} similar line(s) suppressed)",
+                                encoded.chunk_count,
+                                encoded.data.len() / 1024,
+                                id,
+                                encoded.queued_at.elapsed().as_secs_f32() * 1000.0,
+                                encoded.encode_ms,
+                                client.sender.bulk_len(),
+                                suppressed,
+                            );
                         }
                     }
-                    send_lane_routed(client, encoded.msg_type, encoded.data.clone());
+                    // A join in flight is timed to its first LOAD's socket write.
+                    let first_load_of_join = if encoded.msg_type == MessageType::Load as i32 {
+                        client.sender.join_trace().first_load_sent(
+                            world_name,
+                            encoded.queued_at,
+                            encoded.encoded_at,
+                            encoded.chunk_count,
+                            encoded.data.len(),
+                        )
+                    } else {
+                        None
+                    };
+                    if let Some(join) = first_load_of_join {
+                        let _ = client.sender.send_first_load(encoded.data.clone(), join);
+                    } else {
+                        send_lane_routed(client, encoded.msg_type, encoded.data.clone());
+                    }
                     if is_entity_lifecycle {
                         *lifecycle_bytes_by_client.entry(id.clone()).or_default() +=
                             encoded.data.len();
@@ -324,17 +372,8 @@ impl<'a> System<'a> for BroadcastSystem {
                     _ => {}
                 };
 
-                if use_rtc {
-                    if let Some(ref rtc_map) = rtc_map {
-                        if let Some(rtc_sender) = rtc_map.get(id) {
-                            for fragment in fragment_message(&encoded.data) {
-                                if rtc_sender.send(fragment).is_err() {
-                                    break;
-                                }
-                            }
-                            return;
-                        }
-                    }
+                if use_rtc && send_rtc(client.sender.rtc().as_ref(), &encoded.data) {
+                    return;
                 }
 
                 send_lane_routed(client, encoded.msg_type, encoded.data.clone());
@@ -379,18 +418,15 @@ impl<'a> System<'a> for BroadcastSystem {
         let mut gated_clients = 0;
 
         for (client_id, client) in clients.iter() {
-            let rtc_sender = rtc_map.as_ref().and_then(|rtc_map| rtc_map.get(client_id));
+            let rtc_sender = client.sender.rtc();
 
             // Gate on the CONTROL lane only: bulk chunk streaming must never
             // stall live state — that starvation is what made a newcomer
-            // invisible to an existing client while it loaded chunks. RTC
-            // channels are unreliable/unordered and expose no backlog, so
-            // they are never gated.
-            let backlog = if rtc_sender.is_none() {
-                client.sender.control_len()
-            } else {
-                0
-            };
+            // invisible to an existing client while it loaded chunks. An RTC
+            // channel exposes no backlog, but a flush too big for one of its
+            // datagrams still goes down the control lane, so that lane's
+            // backlog gates every client.
+            let backlog = client.sender.control_len();
             let Some(budget_bytes) =
                 state_flush_budget(config.entity_flush_base_bytes_per_tick, tick_ms, backlog)
             else {
@@ -426,7 +462,7 @@ impl<'a> System<'a> for BroadcastSystem {
                     message = message.json(&json!({ "townPerfTraceId": trace_id }).to_string());
                 }
                 let data = encode_message(&message.build());
-                send_to_client(client, rtc_sender, &data);
+                send_to_client(client, rtc_sender.as_ref(), &data);
 
                 if perf::is_enabled() {
                     let mut depths = Map::new();
@@ -479,7 +515,7 @@ impl<'a> System<'a> for BroadcastSystem {
                     .tick(tick)
                     .build();
                 let data = encode_message(&message);
-                send_to_client(client, rtc_sender, &data);
+                send_to_client(client, rtc_sender.as_ref(), &data);
 
                 if perf::is_enabled() {
                     perf::log(
@@ -588,3 +624,98 @@ impl<'a> System<'a> for BroadcastSystem {
 //         profiler.time_end("broadcast");
 //     }
 // }
+
+#[cfg(test)]
+mod tests {
+    use specs::{Builder, WorldExt};
+    use tokio::sync::mpsc;
+
+    use super::*;
+    use crate::{fragment_message, WsSender};
+
+    /// A client whose socket and RTC channel are both observable.
+    fn client_with_rtc() -> (
+        Client,
+        mpsc::UnboundedReceiver<Vec<u8>>,
+        mpsc::UnboundedReceiver<Vec<u8>>,
+    ) {
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let (bulk_tx, _bulk_rx) = mpsc::unbounded_channel();
+        let (rtc_tx, rtc_rx) = mpsc::unbounded_channel();
+        let sender = WsSender::new(control_tx, bulk_tx);
+        sender.attach_rtc(rtc_tx);
+        let mut ecs = specs::World::new();
+        let client = Client {
+            id: "client".to_owned(),
+            username: "client".to_owned(),
+            entity: ecs.create_entity().build(),
+            sender,
+            motion_protocol: Default::default(),
+        };
+        (client, control_rx, rtc_rx)
+    }
+
+    fn drain(rx: &mut mpsc::UnboundedReceiver<Vec<u8>>) -> Vec<Vec<u8>> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    #[test]
+    fn a_small_message_rides_rtc_whole() {
+        let (client, mut control_rx, mut rtc_rx) = client_with_rtc();
+        let data = vec![7u8; 1200];
+
+        send_to_client(&client, client.sender.rtc().as_ref(), &data);
+
+        assert_eq!(drain(&mut rtc_rx), vec![data]);
+        assert!(drain(&mut control_rx).is_empty());
+    }
+
+    #[test]
+    fn a_message_too_big_for_one_datagram_goes_over_the_websocket() {
+        let (client, mut control_rx, mut rtc_rx) = client_with_rtc();
+        let data = vec![7u8; 40_000];
+        assert!(!fits_one_datagram(data.len()));
+
+        send_to_client(&client, client.sender.rtc().as_ref(), &data);
+
+        assert!(drain(&mut rtc_rx).is_empty());
+        assert_eq!(drain(&mut control_rx), vec![data]);
+    }
+
+    #[test]
+    fn what_rides_rtc_passes_the_channel_writer_unsplit() {
+        // The data channel's writer runs `fragment_message` over everything
+        // it is handed. Anything broadcast sends there must come out as the
+        // one unchanged datagram, or the client sees nested fragments.
+        let (client, _control_rx, mut rtc_rx) = client_with_rtc();
+        for len in [1, 4_000, 15_991] {
+            let data = vec![3u8; len];
+            send_to_client(&client, client.sender.rtc().as_ref(), &data);
+            for sent in drain(&mut rtc_rx) {
+                assert_eq!(fragment_message(&sent), vec![sent.clone()]);
+            }
+        }
+    }
+
+    #[test]
+    fn a_closed_rtc_channel_falls_back_to_the_websocket() {
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let (bulk_tx, _bulk_rx) = mpsc::unbounded_channel();
+        let (rtc_tx, rtc_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let sender = WsSender::new(control_tx, bulk_tx);
+        drop(rtc_rx);
+        let mut ecs = specs::World::new();
+        let client = Client {
+            id: "client".to_owned(),
+            username: "client".to_owned(),
+            entity: ecs.create_entity().build(),
+            sender,
+            motion_protocol: Default::default(),
+        };
+        let data = vec![1u8; 64];
+
+        send_to_client(&client, Some(&rtc_tx), &data);
+
+        assert_eq!(drain(&mut control_rx), vec![data]);
+    }
+}

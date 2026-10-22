@@ -13,6 +13,10 @@ pub const ROTATION_MASK: u32 = 0xFFF0FFFF;
 pub const Y_ROTATION_MASK: u32 = 0xFF0FFFFF;
 pub const STAGE_MASK: u32 = 0xF0FFFFFF;
 
+/// Bits 16-23 of the voxel word: the rotation and y-rotation nibbles, or the
+/// state of a block whose rotation bits are state.
+pub const ROTATION_BYTE_MASK: u32 = 0x00FF0000;
+
 /// Bit 28 of the voxel word: this voxel holds the world's waterlogging fluid
 /// in addition to its block.
 pub const WATERLOGGED_BIT: u32 = 1 << 28;
@@ -164,10 +168,7 @@ mod tests {
         assert!(BlockUtils::extract_waterlogged(logged));
         assert_eq!(BlockUtils::extract_id(logged), 65535);
         assert_eq!(BlockUtils::extract_stage(logged), 15);
-        assert_eq!(
-            BlockUtils::extract_rotation(logged),
-            BlockRotation::NZ(0.0)
-        );
+        assert_eq!(BlockUtils::extract_rotation(logged), BlockRotation::NZ(0.0));
 
         let unlogged = BlockUtils::insert_waterlogged(logged, false);
         assert_eq!(unlogged, voxel);

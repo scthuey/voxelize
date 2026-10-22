@@ -1,38 +1,69 @@
 import {
+  BackSide,
   CanvasTexture,
   ClampToEdgeWrapping,
   Color,
   DoubleSide,
   FrontSide,
+  type Material,
+  Matrix4,
   NearestFilter,
   ShaderLib,
   ShaderMaterial,
+  type Side,
   SRGBColorSpace,
   Texture,
   Uniform,
   UniformsUtils,
+  Vector2,
 } from "three";
 
 import { Coords3 } from "../../types";
 import { ThreeUtils } from "../../utils";
 
-import { Block } from "./block";
+import { Block, TUFTS_FACE_NAME } from "./block";
+import { BLOCK_LIGHT_TUNING } from "./block-light-transfer";
 import { ChunkRenderer } from "./chunk-renderer";
+import { forwardDraws } from "./forward-draws";
 import { LightCones } from "./light-cones";
 import { LocalLights } from "./local-lights";
+import { QUAD_LIGHT_TWIST_NEUTRAL } from "./quad-light";
 import { Registry } from "./registry";
 import {
   createSwayTableShader,
   SHADER_LIGHTING_CHUNK_SHADERS,
   SHADER_LIGHTING_FLUID_CHUNK_SHADERS,
   SHADER_LIGHTING_SEE_THROUGH_CHUNK_SHADERS,
+  WATER_DEPTH_SIDE_OFF,
 } from "./shaders";
-import { AtlasTexture } from "./textures";
+import { bindSkyGlowUniforms } from "./sky";
+import {
+  bindSurfaceWeatherUniforms,
+  SURFACE_OPEN_LIGHT,
+  SURFACE_RESPONSE,
+} from "./surface-weather";
+import { AtlasTexture, type AtlasFilteringMode } from "./textures";
 import { positionUnitsPerBlock } from "./vertex-quantization";
 
 export const SHARED_OPAQUE_MATERIAL_KEY = "shared-opaque";
 export const SHARED_CUTOUT_MATERIAL_KEY = "shared-cutout";
 export const SHARED_CUTOUT_PLANT_MATERIAL_KEY = "shared-cutout-plant";
+export const SHARED_CUTOUT_CUBE_MATERIAL_KEY = "shared-cutout-cube";
+/**
+ * Every tufted block's tufts ({@link Block.tufts}): one double-sided cutout
+ * material on the atlas, so the mesher lays each tuft quad once and a chunk's
+ * tufts of every species are one batch.
+ */
+export const SHARED_TUFTS_MATERIAL_KEY = "shared-tufts";
+
+const UNIT_CUBE_FACE_DIRECTIONS = [
+  "1,0,0",
+  "-1,0,0",
+  "0,1,0",
+  "0,-1,0",
+  "0,0,1",
+  "0,0,-1",
+];
 
 /**
  * Chunk geometry that is not main-thread sorted arrives with fixed-point
@@ -80,11 +111,129 @@ export interface ChunkMaterialHost {
     maxHeight: number;
     subChunks: number;
     swayProfileCapacity: number;
+    blockTextureFiltering: AtlasFilteringMode;
   };
 }
 
 export function isSharedOpaqueMaterialBlock(block: Block) {
-  return block.isOpaque && !block.isFluid && !block.isSeeThrough;
+  // isOpaque describes voxel-face occlusion, not material transparency.
+  // A stair, fence or thin spike leaves air in its voxel but its
+  // actual surfaces use the very same atlas shader as a solid cube.
+  return !block.isFluid && !block.isSeeThrough && blockCastsShadow(block);
+}
+
+/** Below this texel alpha a see-through chunk material discards the texel. */
+export const SEE_THROUGH_ALPHA_TEST = 0.1;
+
+/**
+ * How a shared cutout bucket draws its texels. A closed cutout cube (a leaf
+ * canopy, `isClosedCutoutCube`) draws in the opaque pass: a texel stands, at
+ * full alpha, once it clears half coverage, or it is cut. Blended, a far or
+ * grazing leaf face sampled a mip whose holes averaged its alpha down to a
+ * half, and that half-alpha film read as plastic wrap over the canopy, the
+ * sky pale through every side face. A tile's own texels are all 0 or 255,
+ * so up close the cut is the tile's; at a distance the half-coverage test
+ * keeps about as many texels as the tile has, so the canopy keeps its gaps.
+ * The other cutouts (plants, light-attenuating panes) keep blending at
+ * `SEE_THROUGH_ALPHA_TEST`.
+ */
+export function sharedCutoutBlending(isClosedCube: boolean): {
+  transparent: boolean;
+  alphaTest: number;
+} {
+  return isClosedCube
+    ? { transparent: false, alphaTest: 0.5 }
+    : { transparent: true, alphaTest: SEE_THROUGH_ALPHA_TEST };
+}
+
+/**
+ * Detach a customized block without cloning the world's live uniforms/atlas.
+ * `clone()` never sees the uniforms: three deep-copies them, and a render
+ * target's texture (the shadow maps, the scene colour the water refracts
+ * under order-independent transparency) cannot be copied, so every fork
+ * would warn, only to throw the copies away.
+ */
+export function forkChunkMaterial(material: CustomChunkShaderMaterial) {
+  const { uniforms } = material;
+  material.uniforms = {};
+  let own: CustomChunkShaderMaterial;
+  try {
+    own = material.clone() as CustomChunkShaderMaterial;
+  } finally {
+    material.uniforms = uniforms;
+  }
+  own.map = material.map;
+  own.uniforms = { ...uniforms };
+  return own;
+}
+
+/** The bucket materials many blocks draw with at once. */
+export const SHARED_CHUNK_MATERIAL_KEYS = [
+  SHARED_OPAQUE_MATERIAL_KEY,
+  SHARED_CUTOUT_MATERIAL_KEY,
+  SHARED_CUTOUT_PLANT_MATERIAL_KEY,
+  SHARED_CUTOUT_CUBE_MATERIAL_KEY,
+  SHARED_TUFTS_MATERIAL_KEY,
+] as const;
+
+/**
+ * Why a face-level shader customization must not go ahead, or null when it
+ * may. A face that is neither independent nor isolated draws with its
+ * block's material, and for a block in a shared bucket that is the bucket's:
+ * a shader set there replaces the shader of every block in the bucket. Per
+ * stage faces of one cross-plant block once rewrote the shared plant
+ * material that way, so every plant swayed with that one block's profile
+ * and the per-block sway table went unread.
+ */
+export function sharedFaceCustomizationError(
+  blockName: string,
+  faceName: string | null,
+  material: Material,
+  materials: ReadonlyMap<string, Material>,
+): Error | null {
+  if (faceName === null) return null;
+  const key = SHARED_CHUNK_MATERIAL_KEYS.find(
+    (shared) => materials.get(shared) === material,
+  );
+  if (!key) return null;
+  return new Error(
+    `Face "${faceName}" of ${blockName} draws with the shared "${key}" material, so a shader set on it would replace every block's in that bucket. Customize the whole block (faceName null), make the face independent, or give the block a sway profile with setBlockSway.`,
+  );
+}
+
+/**
+ * A voxel box's own copy of a chunk material: every live uniform and the
+ * atlas shared, so it draws with the program the chunks compiled, but its
+ * greedy faces read their texels through `frame` (`VoxelBoxTexelFrame`), so
+ * they ride the box. Its draws count as `material`'s, so a face texture
+ * animated from that material's draws still advances.
+ */
+export function forkVoxelBoxMaterial(
+  material: CustomChunkShaderMaterial,
+  frame: { readonly value: Matrix4 },
+) {
+  const own = forkChunkMaterial(material);
+  own.uniforms.uGreedyFrame = frame;
+  own.uniforms.uHasGreedyFrame = { value: 1 };
+  forwardDraws(own, material);
+  return own;
+}
+
+/**
+ * Whether a block's geometry is drawn into the sun's shadow maps. The block
+ * may say so itself (`castsShadow`); otherwise the rule of thumb: solids
+ * and light-attenuating cutouts (leaves) cast, fluids and clear see-through
+ * blocks (glass, barriers) do not.
+ */
+export function blockCastsShadow(
+  block: Pick<
+    Block,
+    "castsShadow" | "isFluid" | "isSeeThrough" | "lightAttenuation"
+  >,
+) {
+  if (typeof block.castsShadow === "boolean") return block.castsShadow;
+  if (block.isFluid) return false;
+  return !block.isSeeThrough || block.lightAttenuation > 0;
 }
 
 /**
@@ -102,7 +251,47 @@ export function sharedCutoutMaterialKeyFor(block: Block): string | null {
     block.transparentStandalone || block.lightAttenuation > 0;
   if (!isDepthWritingCutout) return null;
   if (block.isPlant) return SHARED_CUTOUT_PLANT_MATERIAL_KEY;
+  if (isClosedCutoutCube(block)) return SHARED_CUTOUT_CUBE_MATERIAL_KEY;
   return block.lightAttenuation > 0 ? SHARED_CUTOUT_MATERIAL_KEY : null;
+}
+
+/**
+ * Whether a cutout is a closed unit cube that meshes the faces between
+ * same-id neighbours to a depth (`standaloneFaceDepth`), like a leaf canopy
+ * whose inner layers show through its holes. Such a block draws
+ * single-sided: every plane between two of them carries two faces back to
+ * back, and drawn double-sided both would show from either side and fight
+ * over one depth. Single-sided, each side of the plane sees only the face
+ * turned toward it, and the voxel the camera stands in shows none of its
+ * own. The mesher lays an inward copy of every face such a block turns to
+ * empty space, so its surface still shows from inside (the mesher's
+ * `is_cutout_mass`; the two must agree).
+ */
+export function isClosedCutoutCube(block: Block): boolean {
+  if (!block.isSeeThrough || block.isFluid || block.isPlant) return false;
+  if (!block.transparentStandalone || !(block.standaloneFaceDepth > 0)) {
+    return false;
+  }
+  if (block.isDynamic) return false;
+
+  if (block.aabbs.length !== 1) return false;
+  const [box] = block.aabbs;
+  const isUnitCube =
+    box.minX === 0 &&
+    box.minY === 0 &&
+    box.minZ === 0 &&
+    box.maxX === 1 &&
+    box.maxY === 1 &&
+    box.maxZ === 1;
+  if (!isUnitCube) return false;
+
+  if (block.faces.length !== UNIT_CUBE_FACE_DIRECTIONS.length) return false;
+  const directions = new Set<string>();
+  for (const face of block.faces) {
+    if (face.independent || face.isolated) return false;
+    directions.add(face.dir.join(","));
+  }
+  return UNIT_CUBE_FACE_DIRECTIONS.every((dir) => directions.has(dir));
 }
 
 export function makeChunkMaterialKey(
@@ -116,10 +305,11 @@ export function makeChunkMaterialKey(
 ) {
   const block = world.getBlockById(id);
 
+  if (faceName === TUFTS_FACE_NAME) return SHARED_TUFTS_MATERIAL_KEY;
   if (voxel) return `${id}-${faceName}-${voxel.join("-")}`;
   if (faceName) return `${id}-${faceName}`;
-  if (isSharedOpaqueMaterialBlock(block)) return SHARED_OPAQUE_MATERIAL_KEY;
   if (!world.hasCustomBlockMaterial(id)) {
+    if (isSharedOpaqueMaterialBlock(block)) return SHARED_OPAQUE_MATERIAL_KEY;
     const sharedCutoutKey = sharedCutoutMaterialKeyFor(block);
     if (sharedCutoutKey) return sharedCutoutKey;
   }
@@ -144,6 +334,8 @@ export function makeChunkShaderMaterial(
 
   const shaderLightingUniforms = {
     uSunDirection: world.chunkRenderer.shaderLightingUniforms.sunDirection,
+    uCelestialDirection:
+      world.chunkRenderer.shaderLightingUniforms.celestialDirection,
     uSunColor: world.chunkRenderer.shaderLightingUniforms.sunColor,
     uAmbientColor: world.chunkRenderer.shaderLightingUniforms.ambientColor,
     uShadowMap0: world.chunkRenderer.shaderLightingUniforms.shadowMap0,
@@ -170,11 +362,37 @@ export function makeChunkShaderMaterial(
     uWaterTint: world.chunkRenderer.shaderLightingUniforms.waterTint,
     uWaterAbsorption:
       world.chunkRenderer.shaderLightingUniforms.waterAbsorption,
-    uWaterLevel: world.chunkRenderer.shaderLightingUniforms.waterLevel,
     uWaterStreakStrength:
       world.chunkRenderer.shaderLightingUniforms.waterStreakStrength,
     uWaterFresnelStrength:
       world.chunkRenderer.shaderLightingUniforms.waterFresnelStrength,
+    uBedCausticScale:
+      world.chunkRenderer.shaderLightingUniforms.bedCausticScale,
+    uDirectSunlight: world.chunkRenderer.shaderLightingUniforms.directSunlight,
+    uSurfaceUndersideScale:
+      world.chunkRenderer.shaderLightingUniforms.surfaceUndersideScale,
+    uSurfaceUndersideTuning:
+      world.chunkRenderer.shaderLightingUniforms.surfaceUndersideTuning,
+    uWaterSurfaceCrisp:
+      world.chunkRenderer.shaderLightingUniforms.waterSurfaceCrisp,
+    // Block-light model switches and their derived constants, shared with
+    // the CPU mirrors (block-light-transfer.ts).
+    uBlockLightCurve: BLOCK_LIGHT_TUNING.curve,
+    uBlockLightToneMap: BLOCK_LIGHT_TUNING.toneMap,
+    uBlockLightKernel: BLOCK_LIGHT_TUNING.kernel,
+    uBlockLightDiamond: BLOCK_LIGHT_TUNING.diamond,
+    uBlockLightGain: BLOCK_LIGHT_TUNING.gain,
+    uBlockLightDominanceKnee: BLOCK_LIGHT_TUNING.dominanceKnee,
+    uBlockLightKernelCore: BLOCK_LIGHT_TUNING.kernelCore,
+    uBlockLightKernelGain: BLOCK_LIGHT_TUNING.kernelGain,
+    uBlockLightAdaptation: BLOCK_LIGHT_TUNING.adaptation,
+    uBlockLightCeilingWeight: BLOCK_LIGHT_TUNING.ceilingWeight,
+    uBlockLightWarmFloor: BLOCK_LIGHT_TUNING.warmFloor,
+    uBlockLightHueLevels: BLOCK_LIGHT_TUNING.hueLevels,
+    uBlockLightMountFade: BLOCK_LIGHT_TUNING.mountFade,
+    uBlockLightHueRamp: BLOCK_LIGHT_TUNING.hueRamp,
+    uBlockLightHueFill: BLOCK_LIGHT_TUNING.hueFill,
+    uBlockLightBilinear: BLOCK_LIGHT_TUNING.bilinear,
     uSkyTopColor: world.chunkRenderer.shaderLightingUniforms.skyTopColor,
     uSkyMiddleColor: world.chunkRenderer.shaderLightingUniforms.skyMiddleColor,
     uShadowDebugMode:
@@ -190,6 +408,8 @@ export function makeChunkShaderMaterial(
       uLightIntensityAdjustment: chunksUniforms.lightIntensityAdjustment,
       uSunlightIntensity: chunksUniforms.sunlightIntensity,
       uAOTable: chunksUniforms.ao,
+      uStageTints: chunksUniforms.stageTints,
+      uPigmentTints: chunksUniforms.pigmentTints,
       uFaceShades: chunksUniforms.faceShades,
       uMinLightLevel: chunksUniforms.minLightLevel,
       uBaseAmbient: chunksUniforms.baseAmbient,
@@ -198,6 +418,7 @@ export function makeChunkShaderMaterial(
       uFogColor: chunksUniforms.fogColor,
       uFogHeightOrigin: chunksUniforms.fogHeightOrigin,
       uFogHeightDensity: chunksUniforms.fogHeightDensity,
+      uFogVerticalBlend: chunksUniforms.fogVerticalBlend,
       uSkyFogTopColor: chunksUniforms.skyFogTopColor,
       uSkyFogMiddleColor: chunksUniforms.skyFogMiddleColor,
       uSkyFogBottomColor: chunksUniforms.skyFogBottomColor,
@@ -207,20 +428,55 @@ export function makeChunkShaderMaterial(
       uSkyFogExponent2: chunksUniforms.skyFogExponent2,
       uSkyFogDimension: chunksUniforms.skyFogDimension,
       uSkyFogStrength: chunksUniforms.skyFogStrength,
+      ...bindSkyGlowUniforms({
+        sunDirection: chunksUniforms.skyGlowSunDirection,
+        color: chunksUniforms.skyGlowColor,
+        sunHaloColor: chunksUniforms.skySunHaloColor,
+        moonHaloColor: chunksUniforms.skyMoonHaloColor,
+        sunDiscColor: chunksUniforms.skySunDiscColor,
+        moonDiscColor: chunksUniforms.skyMoonDiscColor,
+        discRadii: chunksUniforms.skyDiscRadii,
+      }),
       uSceneColor: chunksUniforms.sceneColor,
       uSceneTextureSize: chunksUniforms.sceneTextureSize,
       uWaterRefractionReady: chunksUniforms.waterRefractionReady,
+      uWaterDepth: chunksUniforms.waterDepth,
+      uWaterDepthState: chunksUniforms.waterDepthState,
+      uWaterDepthViewport: chunksUniforms.waterDepthViewport,
+      uWaterDepthClip: chunksUniforms.waterDepthClip,
+      uWaterExitDepth: chunksUniforms.waterExitDepth,
+      uWaterExitReady: chunksUniforms.waterExitReady,
+      uSceneDepth: chunksUniforms.sceneDepth,
+      uSceneDepthReady: chunksUniforms.sceneDepthReady,
+      // Both depths are drawn with the camera the pass reads its planes from.
+      uPaneDepthClip: chunksUniforms.waterDepthClip,
+      // Per material: only a pane's two forks take a side.
+      uWaterDepthSide: { value: WATER_DEPTH_SIDE_OFF },
       uWaterRefractionStrength: chunksUniforms.waterRefractionStrength,
+      uWaterNormalMap: chunksUniforms.waterNormalMap,
       uCameraSubmersion: chunksUniforms.cameraSubmersion,
       uCameraWaterPlaneY: chunksUniforms.cameraWaterPlaneY,
       uUnderwaterAmbient: chunksUniforms.underwaterAmbient,
+      uUnderwaterViewScale: chunksUniforms.underwaterViewScale,
       uWindDirection: chunksUniforms.windDirection,
       uWindOffset: chunksUniforms.windOffset,
       uWindSpeed: chunksUniforms.windSpeed,
       uTime: chunksUniforms.time,
       uAtlasSize: chunksUniforms.atlasSize,
       uShowGreedyDebug: chunksUniforms.showGreedyDebug,
+      uFarCoverMask: chunksUniforms.farCoverMask,
+      uFarCover: chunksUniforms.farCover,
+      uFarSeam: chunksUniforms.farSeam,
+      ...bindSurfaceWeatherUniforms(chunksUniforms),
+      // Per material: how it takes the weather (SURFACE_RESPONSE). Forks
+      // share it with the material they draw for.
+      uSurfaceResponse: { value: SURFACE_RESPONSE.solid as number },
+      uSurfaceOpenLight: { value: new Vector2(...SURFACE_OPEN_LIGHT.solid) },
       uChunkReveal: { value: 1 },
+      // Per material: a chunk's greedy faces take their texels from where
+      // they are drawn; a voxel box's forks turn on a frame of their own.
+      uGreedyFrame: { value: new Matrix4() },
+      uHasGreedyFrame: { value: 0 },
       ...world.lightCones.uniformBindings,
       ...world.localLights.uniformBindings,
       ...shaderLightingUniforms,
@@ -243,6 +499,12 @@ export function makeChunkShaderMaterial(
   );
   material.uniforms.map = { value: material.map };
 
+  // A geometry without a light twist (a held block, a preview) keeps the
+  // per-triangle light: the neutral bytes carry no twist and no corner.
+  Object.assign(material.defaultAttributeValues, {
+    biomeTint: [0, 0, 0],
+    lightTwist: [...QUAD_LIGHT_TWIST_NEUTRAL],
+  });
   return material;
 }
 
@@ -325,6 +587,31 @@ function makeSolidColorCanvas(color: Color) {
   return canvas;
 }
 
+/**
+ * Turns each fluid chunk material to the side the camera sees it from: the
+ * back while the camera is under water, so the water's surface shows from
+ * below, the front otherwise. Only a fluid that counts as water turns. Lava
+ * seen from under water is still the top of a lava pool, and drawn by its
+ * back it vanished, leaving the floor under it.
+ */
+export function setFluidMaterialSides(
+  materials: Iterable<Material>,
+  isCameraUnderwater: boolean,
+  isWater: (blockId: number) => boolean,
+) {
+  for (const material of materials) {
+    if (!material.userData.isFluid) continue;
+    const blockId: number | undefined = material.userData.fluidBlockId;
+    const side =
+      isCameraUnderwater && (blockId === undefined || isWater(blockId))
+        ? BackSide
+        : FrontSide;
+    if (material.side === side) continue;
+    material.side = side;
+    material.needsUpdate = true;
+  }
+}
+
 export async function loadChunkMaterials(
   world: ChunkMaterialHost & {
     registry: Registry;
@@ -350,14 +637,15 @@ export async function loadChunkMaterials(
     isFluid: boolean,
     lightAttenuation: number,
     transparentStandalone: boolean,
+    castsShadow: boolean,
   ) => {
     const mat = makeChunkShaderMaterial(
       world,
       isFluid
         ? SHADER_LIGHTING_FLUID_CHUNK_SHADERS.fragment
         : transparent
-        ? SHADER_LIGHTING_SEE_THROUGH_CHUNK_SHADERS.fragment
-        : undefined,
+          ? SHADER_LIGHTING_SEE_THROUGH_CHUNK_SHADERS.fragment
+          : undefined,
     );
 
     mat.side = isFluid ? FrontSide : transparent ? DoubleSide : FrontSide;
@@ -370,17 +658,29 @@ export async function loadChunkMaterials(
       // capture can see them — blends its tint straight over canopies,
       // and same-order foliage meshes wash over each other by sort luck.
       // Glass keeps attenuation 0 and stays non-writing so stacked panes
-      // still layer.
+      // still layer; the part of a pane in front of the water draws after it
+      // instead (WaterDepthPass). Drawn order-independently, every
+      // see-through mesh is split by its texels instead (SeeThroughTexelSplit).
       mat.depthWrite =
         !isFluid && (transparentStandalone || lightAttenuation > 0);
-      mat.alphaTest = 0.1;
-      mat.uniforms.alphaTest.value = 0.1;
+      mat.alphaTest = SEE_THROUGH_ALPHA_TEST;
+      mat.uniforms.alphaTest.value = SEE_THROUGH_ALPHA_TEST;
     }
     mat.map = map;
     mat.uniforms.map.value = map;
-    mat.userData.skipShadow =
-      isFluid || (transparent && lightAttenuation === 0);
+    mat.userData.skipShadow = !castsShadow;
     mat.userData.isFluid = isFluid;
+    mat.uniforms.uSurfaceResponse.value = isFluid
+      ? SURFACE_RESPONSE.fluid
+      : transparent
+        ? SURFACE_RESPONSE.seeThrough
+        : SURFACE_RESPONSE.solid;
+    // A see-through block's faces carry its own voxel's light.
+    if (transparent) {
+      mat.uniforms.uSurfaceOpenLight.value.set(
+        ...SURFACE_OPEN_LIGHT.seeThrough,
+      );
+    }
 
     // Sorted-transparent meshes (the depth-non-writing ones the main-thread
     // sorter rewrites) keep full-float positions; everything else is
@@ -409,8 +709,13 @@ export async function loadChunkMaterials(
   }
   const totalSlots = textureGroups.size + ungroupedFaces;
   const countPerSide = perSide(totalSlots);
-  const atlas = new AtlasTexture(countPerSide, textureUnitDimension);
-  const sharedOpaqueMaterial = make(false, atlas, false, 1, false);
+  const atlas = new AtlasTexture(
+    countPerSide,
+    textureUnitDimension,
+    undefined,
+    world.options.blockTextureFiltering,
+  );
+  const sharedOpaqueMaterial = make(false, atlas, false, 1, false, true);
   world.chunkRenderer.materials.set(
     SHARED_OPAQUE_MATERIAL_KEY,
     sharedOpaqueMaterial,
@@ -420,21 +725,28 @@ export async function loadChunkMaterials(
     SHADER_LIGHTING_CHUNK_SHADERS,
     world.options.swayProfileCapacity,
   );
-  const makeSharedCutout = (isShadowCasting: boolean) => {
+  const makeSharedCutout = (
+    isShadowCasting: boolean,
+    side: Side = DoubleSide,
+    isClosedCube = false,
+  ) => {
     const mat = makeChunkShaderMaterial(
       world,
       swayShaders.fragmentShader,
       swayShaders.vertexShader,
       { uSwayParams: world.swayProfileTable },
     );
-    mat.side = DoubleSide;
-    mat.transparent = true;
+    const blending = sharedCutoutBlending(isClosedCube);
+    mat.side = side;
+    mat.transparent = blending.transparent;
     mat.depthWrite = true;
-    mat.alphaTest = 0.1;
-    mat.uniforms.alphaTest.value = 0.1;
+    mat.alphaTest = blending.alphaTest;
+    mat.uniforms.alphaTest.value = blending.alphaTest;
     mat.map = atlas;
     mat.uniforms.map.value = atlas;
     mat.userData.skipShadow = !isShadowCasting;
+    mat.uniforms.uSurfaceResponse.value = SURFACE_RESPONSE.cutout;
+    mat.uniforms.uSurfaceOpenLight.value.set(...SURFACE_OPEN_LIGHT.seeThrough);
     applyQuantizedPositionDefine(mat, positionUnits);
     return mat;
   };
@@ -443,8 +755,16 @@ export async function loadChunkMaterials(
     makeSharedCutout(true),
   );
   world.chunkRenderer.materials.set(
+    SHARED_CUTOUT_CUBE_MATERIAL_KEY,
+    makeSharedCutout(true, FrontSide, true),
+  );
+  world.chunkRenderer.materials.set(
     SHARED_CUTOUT_PLANT_MATERIAL_KEY,
     makeSharedCutout(false),
+  );
+  world.chunkRenderer.materials.set(
+    SHARED_TUFTS_MATERIAL_KEY,
+    makeSharedCutout(true),
   );
 
   world.chunkRenderer.uniforms.atlasSize.value = countPerSide;
@@ -458,7 +778,10 @@ export async function loadChunkMaterials(
           block.isFluid,
           block.lightAttenuation,
           block.transparentStandalone,
+          blockCastsShadow(block),
         );
+    if (isClosedCutoutCube(block)) mat.side = FrontSide;
+    if (block.isFluid) mat.userData.fluidBlockId = block.id;
     // Keyed per id, not through makeChunkMaterialKey: a block that collapses
     // into a shared cutout bucket still needs its own material reachable so
     // customizeMaterialShaders can opt it out into a bespoke shader.
@@ -478,7 +801,9 @@ export async function loadChunkMaterials(
         block.isFluid,
         block.lightAttenuation,
         block.transparentStandalone,
+        blockCastsShadow(block),
       );
+      if (block.isFluid) ownTextureMat.userData.fluidBlockId = block.id;
       const ownTextureKey = makeChunkMaterialKey(world, block.id, face.name);
       world.chunkRenderer.materials.set(ownTextureKey, ownTextureMat);
     });

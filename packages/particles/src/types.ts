@@ -22,10 +22,38 @@ export interface ParticleWorld {
     vy: number,
     vz: number,
   ): ParticleLightValues | null;
+  /**
+   * The water column over a point, or null out of water. Water does not dim
+   * the light grid, so this is where a particle learns how deep it is.
+   */
+  measureWaterColumnAt(
+    x: number,
+    y: number,
+    z: number,
+  ): { depth: number } | null;
+  /**
+   * Whether a voxel holds water, its own or a waterlogged block's: which
+   * side of the surface a soft particle there draws on. Without it the
+   * system asks `getBlockAt`, which misses waterlogging.
+   */
+  isFluidOrWaterloggedAt?(vx: number, vy: number, vz: number): boolean;
   registry: { blocksById: Map<number, ParticleBlock> };
   chunkRenderer: { uniforms: ParticleLightUniforms };
   options: { maxLightLevel: number };
   physics: Engine;
+  /**
+   * Seconds on a clock every client of the world agrees on. Ambient sites
+   * count their beats on it, so every player sees the same emission at the
+   * same moment. Optional: without it beats run on local time.
+   */
+  readonly sharedClock?: number;
+  /**
+   * Called on every voxel change, so ambient sites can recheck themselves
+   * the moment a block is placed or broken. Returns the unsubscribe.
+   */
+  addBlockUpdateListener?(
+    listener: (args: { voxel: [number, number, number] }) => void,
+  ): () => void;
 }
 
 export interface ParticleBlock {
@@ -133,6 +161,9 @@ export interface ParticleConfig {
   turbulence: number;
   /** Tumble speed. */
   spinRadPerSec: number;
+  /** Initial angle in the particle plane. Omit for a random orientation;
+   * use zero for upright directional sprites such as flame tongues. */
+  initialSpinRad?: number;
   /**
    * Hard-edged particles made of opaque texels — a leaf, a chip of stone —
    * as opposed to soft ones like smoke.
@@ -156,6 +187,29 @@ export interface ParticleConfig {
    */
   isSettlingOnGround?: boolean;
   physics?: ParticlePhysics;
+  /**
+   * Matter, not light: tint each spawn's color by the light where it is
+   * released (`computeVoxelLightColor` — sun, block light, and the water
+   * column above), so smoke at night is dark and dust in a cave is dim.
+   * Sampled once per burst. Flames, sparks and embers are their own light
+   * and leave this off.
+   */
+  isLit?: boolean;
+  /**
+   * Keep this look out of a post-process bloom. Its layer's mesh joins
+   * {@link ParticleSystemOptions.bloomExemptLayer} and is flagged
+   * `userData.isBloomExempt`, so a selective bloom can mask it out: pixel
+   * art that must stay crisp next to a light that is allowed its halo.
+   * Part of the layer's identity, like the blend.
+   */
+  isBloomExempt?: boolean;
+  /**
+   * A layer group of the config's own. Configs share a layer (one draw call,
+   * one capacity) only when their groups match too, so a feature that
+   * bursts hundreds of particles at once can take its own pool instead of
+   * starving every other effect of the same blend and shape.
+   */
+  layerGroup?: string;
 }
 
 export interface SpawnMotion {
@@ -181,6 +235,15 @@ export interface SpawnMotion {
    * also making the scatter bigger.
    */
   velocityBias?: { x: number; y: number; z: number };
+  /**
+   * Where the spawn's choices come from: jitter, direction, speed, lifetime,
+   * size, palette pick, spin, sway axis and texture patch. Omitted, they use
+   * `Math.random` and every client scatters differently. Pass a seeded
+   * source (`seededRandom(hashSeed(...))`) for an effect every client must
+   * draw alike. Turbulence is per-frame wander and stays unseeded: configs
+   * for shared effects set it to 0.
+   */
+  random?: () => number;
 }
 
 export interface BurstOptions extends SpawnMotion {
@@ -208,4 +271,32 @@ export interface ParticleSystemOptions {
   capacityPerLayer: number;
   /** Pooled point lights for explosion flashes (lights are precious). */
   maxFlashLights: number;
+  /**
+   * The three.js layer channel every bloom-exempt particle mesh joins (see
+   * {@link ParticleConfig.isBloomExempt}). The meshes stay on layer 0 as
+   * well, so they still draw in the main pass.
+   */
+  bloomExemptLayer: number;
+  /**
+   * Draw double-sided quads in one pass (true), or let three draw every
+   * transparent double-sided layer twice, back faces then front faces
+   * (false). The two-pass trick orders a closed shape's own faces; a flat
+   * quad cannot cover itself, so for quads it only doubles the draw calls
+   * and makes three rebuild each layer's program parameters twice a frame,
+   * idle layers included (a material update per pass).
+   */
+  isQuadSinglePass: boolean;
+  /**
+   * The render order of every soft (non-depth-writing) layer. Each soft
+   * layer's two meshes also name their medium (`TRANSPARENT_MEDIUM_KEY`),
+   * and a host whose transparent sort reads it (`@voxelize/core`'s does)
+   * places them by that instead, around its water, keeping this order only
+   * to rank them among other effects. A sort that ignores the medium draws
+   * transparent objects in render-order order before distance, so at 0 a
+   * soft layer draws before any higher-ordered see-through geometry that
+   * writes depth (leaf-like cutouts, say), which then paints over particles
+   * in front of it; set it just above those. Cutout layers write depth
+   * themselves and keep 0.
+   */
+  softLayerRenderOrder: number;
 }

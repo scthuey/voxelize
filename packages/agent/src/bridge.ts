@@ -1,8 +1,19 @@
+import type { MethodOutcome } from "./method-outcome";
+
+export type { MethodOutcome } from "./method-outcome";
+
 export type Vec3 = { x: number; y: number; z: number };
 
 export type ChunkCoord = { cx: number; cz: number };
 
-export type YawPitch = { yaw: number; pitch: number };
+export type YawPitch = {
+  yaw: number;
+  pitch: number;
+  /** Roll about the view axis in radians. Zero while alive; the
+   *  first-person death tip-over rolls the view onto its right side (a
+   *  negative roll) and rights it again on the wake. */
+  roll: number;
+};
 
 export type ChunkState = "loaded" | "pending" | "unloaded";
 
@@ -21,10 +32,43 @@ export type BlockInfo = {
   yRotation: number;
   sunlight: number;
   torchLight: number;
-  /** Replicated block-entity JSON for `is_entity` blocks (signs, baskets,
-   * wave makers), null when the voxel carries none. Lets tests assert on
-   * replicated state (e.g. a basketball basket's scores). */
+  /** Replicated block-entity JSON for `is_entity` blocks (signs, scoreboards,
+   * machines), null when the voxel carries none. Lets tests assert on
+   * replicated state (e.g. a scoreboard's scores). */
   entityData?: Record<string, string | number | boolean | object | null> | null;
+};
+
+/** A box a census reads, and the block it should hold. */
+export type VoxelCensusBox = {
+  min: [number, number, number];
+  max: [number, number, number];
+  /** A block name, any casing, or "air". */
+  block: string;
+};
+
+/**
+ * One box of voxels read against the block a fill wrote there.
+ */
+export type VoxelCensus = {
+  /** Voxels in the box. */
+  volume: number;
+  /** Voxels holding the block now; for air, a fluid counts (`refilled`). */
+  matching: number;
+  /** Of `matching`, air asked and a fluid there: water flows back into a
+   * wipe, and a waterlogged block it clears leaves its water. */
+  refilled: number;
+  /** Voxels in chunks the page has not loaded: unknown here. */
+  unloaded: number;
+  /**
+   * One bit per voxel, set where it matches, base64. Bit `i` is byte
+   * `i >> 3`, bit `i & 7`, for the voxel at index `i` of the box walked x
+   * outermost, then y, then z (z fastest), from its low corner. A caller
+   * can keep a voxel that matched once as landed after the world changes
+   * it again.
+   */
+  matched: string;
+  /** A few loaded voxels that do not match, with the block they hold. */
+  mismatches: { pos: Vec3; name: string }[];
 };
 
 export type EntitySnapshot = {
@@ -37,6 +81,12 @@ export type EntitySnapshot = {
 };
 
 export type PeerSnapshot = {
+  /** Replicated rope state, for multiplayer traversal checks. */
+  grappleAnchor?: [number, number, number] | null;
+  grappleLatched?: boolean;
+  holdingObjectId?: number;
+  /** Actual rendered hook socket, including the character's animated arm. */
+  heldHookTip?: Vec3 | null;
   id: string;
   username: string;
   position: Vec3;
@@ -51,6 +101,12 @@ export type PeerSnapshot = {
   // False until this peer's role claim has replicated from its own client
   // through the server; the window where nametags render role-less.
   isRoleClaimed: boolean;
+  /** Roll of the death tip-over on this body in radians (0 upright, π/2
+   *  lying on its right side), or null while the body is alive. */
+  deathTipAngle: number | null;
+  /** Uniform render scale of the body: 1 standing, 0.4 as a spectator
+   *  ghost, shrinking to 0 as a dead body vanishes. */
+  renderScale: number;
 };
 
 export type RaycastHit = {
@@ -58,6 +114,27 @@ export type RaycastHit = {
   entity: EntitySnapshot | null;
   position: Vec3;
   distance: number;
+  /**
+   * Clickable regions painted on the targeted block's face (tabs, buttons):
+   * which one the crosshair rests on, and where each one is in the world.
+   * `null` when the block registers no face surface.
+   */
+  faceRegions?: {
+    faceName: string;
+    hovered: string | null;
+    regions: { id: string; center: Vec3 }[];
+    /**
+     * The client's own hover pane, as it is right now: which region it is
+     * laid over and where it sits. `hovered` above is the harness's math;
+     * this is what the player would see, so the two can be compared.
+     */
+    highlight: {
+      isVisible: boolean;
+      regionId: string | null;
+      center: Vec3;
+      size: { width: number; height: number };
+    } | null;
+  } | null;
 };
 
 export type ChunkSnapshot = {
@@ -66,9 +143,29 @@ export type ChunkSnapshot = {
 };
 
 export type Snapshot = {
+  /** Local hotbar selection, zero-based; absent on clients without a hotbar. */
+  activeSlot?: number;
   position: Vec3;
   facing: YawPitch;
+  /**
+   * The world the page is on now. A host that names worlds by URL reports
+   * its path's last segment (`worldFromPath` in client-url.ts), the segment
+   * the daemon opens a world by, so `POST /world` can see it arrive.
+   */
   world: string;
+  /**
+   * Which bridge in this page answered: bumps each time the host installs a
+   * bridge, so a world switched inside one page (no new document, and a
+   * fresh network whose join generation starts over) is still a new join.
+   * Absent on hosts that install one bridge per page.
+   */
+  joinSerial?: number;
+  /**
+   * The host's join has finished: the player is in and the world can be
+   * played and set up (view radius, field of view). A live connection whose
+   * join is still placing the player is not ready yet; the daemon puts a
+   * remembered pose back only once this is true.
+   */
   isReady: boolean;
   raycast: RaycastHit | null;
   nearbyEntities: EntitySnapshot[];
@@ -104,6 +201,10 @@ export type ConnectionSnapshot = {
   pendingCommandCount: number;
   droppedCommandCount: number;
   serverUrl: string | null;
+  /** The world the page is on now (`Snapshot.world`), when the host says. */
+  world?: string;
+  /** `Snapshot.joinSerial`: which bridge in this page answered. */
+  joinSerial?: number;
 };
 
 export type CommandQueueReason = "disconnected" | "rejoining" | "retrying";
@@ -113,11 +214,15 @@ export type CommandQueueReason = "disconnected" | "rejoining" | "retrying";
  * socket (`isSent`), or it is queued client-side and goes out automatically
  * once the session is connected and joined again (`isQueued` plus a reason).
  * At most one is true; both false means there was nothing to send.
+ *
+ * `outcome` is what the server did with a sent command, when the bridge
+ * confirmed it; the daemon turns `unhandled` and `rejected` into an error.
  */
 export type CommandDispatch = {
   isSent: boolean;
   isQueued: boolean;
   queuedReason?: CommandQueueReason;
+  outcome?: MethodOutcome;
 };
 
 export type PaintSettleReport = {
@@ -130,6 +235,8 @@ export type PaintSettleReport = {
 
 export type CaptureFrameOptions = {
   isPure?: boolean;
+  /** First-person viewmodel. Off unless a held-item shot asks for it. */
+  isIncludingArm?: boolean;
 };
 
 export type VideoRecordingRequest = {
@@ -245,6 +352,8 @@ export type FaceInput =
 export type WalkDirection = "forward" | "back" | "left" | "right";
 
 export type WalkOptions = {
+  /** Hold jump/swim-up through ordinary movement physics. */
+  isJumping?: boolean;
   durationMs?: number;
   isSprinting?: boolean;
 };
@@ -352,6 +461,26 @@ export type FrameRateMeasurement = {
   p95FrameMs: number;
   p99FrameMs: number;
   maxFrameMs: number;
+  /** What the page's draw cap was through the window; see `frame-rate-guard.ts`. */
+  drawThrottle: FrameRateDrawRecord;
+};
+
+/**
+ * The draw cap as the page itself reported it on every frame of a
+ * measurement, warmup included. A measurement whose window ran capped, or
+ * whose host drew fewer frames than rAF delivered, is refused rather than
+ * reported.
+ */
+export type FrameRateDrawRecord = {
+  /** False when the page's bridge cannot report a cap at all. */
+  isReported: boolean;
+  intervalAtStartMs: number | null;
+  intervalAtEndMs: number | null;
+  /** Warmup and measured frames seen with a cap on, and the widest cap. */
+  cappedFrames: number;
+  maxIntervalMs: number | null;
+  /** Frames the host drew over the measured frames, when it counts them. */
+  drawnFrames: number | null;
 };
 
 export type AgentEventMap = {
@@ -408,6 +537,29 @@ export type MemoryPressureStatus = {
   shedCount: number;
 };
 
+/**
+ * What the debug bar's `mem` segment shows, read from the same sampler:
+ * the JS heap, its post-collection floor, and the rate that floor is rising
+ * by (a Theil-Sen slope over the floors of the last few minutes; null until
+ * enough buckets have completed). `null` as a whole where the client has no
+ * debug UI installed or the browser exposes no heap counters.
+ */
+export type MemoryTrend = {
+  usedBytes: number;
+  totalBytes: number;
+  limitBytes: number;
+  /** used / limit, 0..1. */
+  pressure: number;
+  floorBytes: number;
+  growthBytesPerMinute: number | null;
+  trendSpanMs: number;
+  bucketMs: number;
+  /** Per-bucket floors, oldest first: the bars the debug bar draws. */
+  floorHistory: number[];
+  /** The browser's own page total incl. workers, when it offers one. */
+  detailed: { totalBytes: number; workerBytes: number; workers: number } | null;
+};
+
 export type WorldMemoryCounters = {
   blockUpdatesQueue: number;
   blockUpdatesToEmit: number;
@@ -431,6 +583,10 @@ export type WorldMemoryCounters = {
   meshInFlightJobs: number;
   loadedChunks: number;
   lightJobHighWaterChunks: number;
+  /** Cumulative since world init; difference two reads for a window. */
+  blockUpdatesApplied: number;
+  lightSeedsAnalyzed: number;
+  lightJobsScheduled: number;
 };
 
 /**
@@ -440,6 +596,81 @@ export type WorldMemoryCounters = {
  * every node the per-frame matrix and culling traversals visit, and
  * `visibleChunkGroups` how many of the chunk subtrees survive culling.
  */
+/**
+ * One block surface not wearing its own art. `unknown` is the
+ * magenta-and-black checker; `default` an isolated face on its face's blank
+ * default while it waits for the voxel's paint; `fallback` a stand-in colour
+ * put there by `fillUnpaintedSurfaces`.
+ */
+export type UnpaintedSurface = {
+  kind: "atlas-slot" | "own-face" | "isolated-face";
+  state: "unknown" | "default" | "fallback";
+  blockId: number;
+  blockName: string;
+  faceName: string;
+  textureGroup: string | null;
+  voxel?: [number, number, number];
+  ageMs?: number;
+};
+
+export type SurfaceTally = {
+  total: number;
+  painted: number;
+  default: number;
+  fallback: number;
+  unknown: number;
+};
+
+export type TextureCensus = {
+  atlasSlots: SurfaceTally;
+  ownFaces: SurfaceTally;
+  isolatedFaces: SurfaceTally;
+  /** Worst first: checker, then fallbacks, then defaults still waiting. */
+  unpainted: UnpaintedSurface[];
+};
+
+export type TextureFillResult = {
+  color: string;
+  filled: { atlasSlots: number; ownFaces: number; isolatedFaces: number };
+};
+
+/**
+ * What `world.blockAnimations` knows: the block names with a declared
+ * motion, and every tracked animated voxel with the pose it is showing.
+ * `angle` is radians about the block's hinge from its stage-0 pose;
+ * `progress` is 1 at rest. Mirrors `BlockAnimationsSnapshot` in core.
+ */
+export type BlockAnimationsSnapshot = {
+  registered: string[];
+  trackedCount: number;
+  activeCount: number;
+  voxels: {
+    voxel: Vec3;
+    block: string;
+    stage: number;
+    angle: number;
+    restAngle: number;
+    progress: number;
+    isMoving: boolean;
+  }[];
+};
+
+export type DrawThrottleStatus = {
+  /** Minimum ms between drawn frames; null when drawing every frame. */
+  intervalMs: number | null;
+  /** False on a client whose frame loop predates the throttle. */
+  isSupported: boolean;
+  /**
+   * Frames the host's loop has drawn since the page loaded, when the host
+   * counts them. A frame-rate measurement times rAF callbacks, and every
+   * cap a host can apply (this throttle, a slow cadence while loading, a
+   * loop that stops while the window is unfocused) skips draws without
+   * slowing rAF: this count is what tells a measured frame from one that
+   * was never drawn.
+   */
+  drawnFrames?: number;
+};
+
 export type RenderStats = {
   drawCalls: number;
   /** The part of `drawCalls` spent filling the shadow cascades. */
@@ -450,6 +681,17 @@ export type RenderStats = {
   textures: number;
   sceneObjects: number;
   chunkGroups: number;
+  /** The world's far-terrain layer counters, when it has one. */
+  farTerrain?: Record<string, unknown> | null;
+  /** Loaded columns that have produced terrain geometry, including arenas.
+   * Missing columns may be truly empty; useful alongside drained mesh queues
+   * to diagnose terrain that was loaded but never scheduled for meshing. */
+  chunkGeometry?: {
+    columns: number;
+    missingCount: number;
+    /** At most 32 coordinates, regardless of missingCount. */
+    missing: ChunkCoord[];
+  };
   visibleChunkGroups: number;
   chunkMeshes: number;
   visibleChunkMeshes: number;
@@ -481,10 +723,61 @@ export type RenderStats = {
   };
   /** The twelve biggest material buckets among chunk meshes, largest first. */
   meshBuckets: { bucket: string; total: number; visible: number }[];
+  /**
+   * Everything past those twelve, summed, so the long tail of one-mesh
+   * buckets (a per-voxel isolated face is one bucket each) is not invisible
+   * in the report just because no single bucket is large.
+   */
+  meshBucketTail: {
+    buckets: number;
+    total: number;
+    visible: number;
+    /** Buckets keyed per voxel: one material and one draw per placed face. */
+    isolatedFaces: number;
+  };
+  /**
+   * Subtree node counts for every top-level scene child that was given a
+   * name, unconditionally: a named system (an effects group, a manager) can
+   * always be checked here even when it is too small for the list above.
+   */
+  namedSceneNodes: Record<string, number>;
   /** Non-terrain scene subtrees, worst visible-mesh count first. */
-  otherSceneNodes: { label: string; total: number; visibleMeshes: number }[];
+  otherSceneNodes: {
+    label: string;
+    total: number;
+    visibleMeshes: number;
+    /** Direct children by label, most numerous first, e.g. `ChestMesh x12`. */
+    children: string;
+  }[];
   loadedChunks: number;
   renderRadius: number;
+  /**
+   * The ratio the renderer is actually drawing at, against the display's
+   * own. When the two disagree the frame is being upscaled by the browser,
+   * which is what "the game looks soft" reduces to.
+   */
+  renderPixelRatio: number;
+  devicePixelRatio: number;
+  drawingBufferWidth: number;
+  drawingBufferHeight: number;
+  /**
+   * Rolling window (recent frames) of frame cost, read from the client's
+   * own frame loop: the interval between frames and the main-thread time
+   * each frame's JS took. `renderScale` is the adaptive multiplier the
+   * client is applying on top of the display's pixel ratio (1 = native).
+   * The interval is capped by the tab's refresh rate, so on a 60Hz display
+   * it reads ~16.7ms for a cheap frame too; main-thread time is the number
+   * that still says what the frame cost. Null when the client does not
+   * report it.
+   */
+  frameCost: {
+    samples: number;
+    frameIntervalAvgMs: number;
+    mainThreadAvgMs: number;
+    mainThreadP95Ms: number;
+    mainThreadMaxMs: number;
+    renderScale: number;
+  } | null;
   /**
    * Cumulative main-thread cost of applying finished mesh results
    * (`World.buildChunkMesh`): call count, total/max milliseconds, and the
@@ -508,13 +801,19 @@ export type RenderStats = {
     faces: number;
   };
   /**
-   * Region-arena batching state for the shared-opaque bucket: live
-   * `BatchedMesh` regions and the chunk sections slotted into them. Both
-   * zero when batching is disabled or nothing opaque is loaded.
+   * Region-arena batching state: live regions, their `BatchedMesh` pages
+   * (one draw each per pass) and the chunk sections slotted into them, in
+   * all and per batched material bucket (opaque terrain, leaves, plants).
+   * Zero when batching is disabled or nothing batched is loaded.
    */
   regionArenas: {
     regions: number;
+    pages: number;
     sections: number;
+    buckets: Record<
+      string,
+      { regions: number; pages: number; sections: number }
+    >;
   };
   /**
    * Occlusion-walk state: graph size, sections reporting real (non-full)
@@ -536,6 +835,10 @@ export type RenderStats = {
     cascadeNeedsRender: boolean[];
     currentShadowStrength: number;
     lastFrameLightSwing: number;
+    /** That swing over the time since the previous update. */
+    lastLightSwingPerSecond: number;
+    /** Angle between the live light and the one the cascades are fitted to. */
+    lightLagRadians: number;
   } | null;
 };
 
@@ -553,6 +856,20 @@ export interface AgentBridge {
   following(): FollowStatus | null;
   setFlying(isFlying: boolean): Promise<void>;
   setRenderRadius(radius: number): Promise<number>;
+  /**
+   * Overrides the world's fog distance in blocks, independent of render
+   * radius (`World.fogDistance`) — a vista capture can raise the render
+   * radius without fog being pushed out to match. `null` reverts to fog
+   * derived from the radius. Returns the value actually applied (clamped to
+   * the current render distance).
+   */
+  setFogDistance(blocks: number | null): Promise<number | null>;
+  /**
+   * Sends one server method. A result that carries a {@link CommandDispatch}
+   * `outcome` (confirm the call through `Method.confirm`) lets the daemon
+   * fail a call the world has no handler for, or turned down, instead of
+   * reporting it sent.
+   */
   call(method: string, payload: unknown): Promise<unknown>;
   /**
    * Local break prediction plus one transactional `break-block` command.
@@ -564,6 +881,40 @@ export interface AgentBridge {
       afterId: number;
     } & CommandDispatch
   >;
+  /**
+   * The player's own placement path: an optimistic client-sourced
+   * `updateVoxels` (local relight + remesh, then the UPDATE packet the
+   * server echoes back), exactly what a right-click in creative does. A
+   * server-side fill method never exercises this path, so this is the one
+   * that reproduces prediction-side light and mesh bugs. `block` is a name
+   * or id.
+   */
+  placeVoxel(
+    pos: Vec3,
+    block: string | number,
+  ): Promise<{ beforeId: number; afterId: number; blockId: number }>;
+  /**
+   * The player's own click on whatever the crosshair targets: a mouse press
+   * dispatched where the client's input layer listens, so every bound
+   * handler runs as it would for a person — placement, block-entity menus,
+   * clickable regions painted on a face. Reports the targeted voxel and
+   * block so a test can assert it aimed where it meant to.
+   * `holdMs` (0..15000, default 0) exercises sustained input such as mining.
+   * `isShift` holds Shift through the click (the deliberate modifier:
+   * forced placement, a creature's staff panel or hat trade).
+   * Always releases the mouse button before resolving.
+   */
+  /** Select hotbar slot 0..8 through the normal local focus/change path. */
+  selectHotbar(slot: number): void;
+  interact(
+    button?: "left" | "right",
+    holdMs?: number,
+    isShift?: boolean,
+  ): Promise<{
+    button: "left" | "right";
+    target: Vec3 | null;
+    block: string | null;
+  }>;
   /**
    * Raw per-voxel light channels as the client currently holds them —
    * sunlight plus the three torch colors, with the voxel id for context.
@@ -613,13 +964,63 @@ export interface AgentBridge {
   ): Promise<MeshTransferBenchmarkResult>;
   /** Pipeline queue/in-flight sizes from `World.getMemoryCounters`. */
   memoryCounters(): WorldMemoryCounters;
+  /** The debug bar's heap reading and leak trend; see {@link MemoryTrend}. */
+  memoryTrend(): MemoryTrend | null;
   /** Per-frame renderer and scene-graph load; see {@link RenderStats}. */
   renderStats(): RenderStats;
+  /**
+   * Cap how often the frame loop draws (shadows, composer, arm) while the
+   * world keeps updating every frame. `null` lifts the cap. The daemon
+   * applies it to a session nobody has spoken to for a while: an idle
+   * headless tab drawing at 60fps costs about a core plus the GPU process,
+   * and five of them was most of the box. Any command lifts it first, and
+   * the returned promise resolves after the next drawn frame so a capture
+   * issued right after waking never reads a frame from the throttled era.
+   */
+  setDrawThrottle(intervalMs: number | null): Promise<DrawThrottleStatus>;
+  drawThrottle(): DrawThrottleStatus;
+  /**
+   * Every animated voxel the world is tracking and the pose it shows right
+   * now; see {@link BlockAnimationsSnapshot}. A door that should be
+   * swinging and is not shows up here as `isMoving: false` at its new rest
+   * angle (the swing never started) or as a voxel missing altogether (the
+   * mesher did not split it out).
+   */
+  blockAnimations(): BlockAnimationsSnapshot;
+  /**
+   * What every block surface is wearing: atlas slots, own-texture face
+   * defaults, and each voxel's isolated face, with everything not yet in its
+   * own art listed worst first. `unpainted` empty of `unknown` entries is
+   * the "no magenta anywhere" assertion.
+   */
+  textureCensus(): TextureCensus;
+  /**
+   * Dress every surface still on the unknown checker — an isolated face in
+   * its default where that exists, everything else in the world's fallback
+   * colour — so a stage is presentable while its real textures are on the
+   * way. The census keeps reporting them as `fallback`.
+   */
+  fillUnpaintedSurfaces(options?: { color?: string }): TextureFillResult;
 
   position(): Vec3;
   facing(): YawPitch;
   raycast(): RaycastHit | null;
   blockAt(pos: Vec3): BlockInfo | null;
+  /**
+   * Reads whole boxes against the blocks they should hold, in one call: a
+   * `blockAt` per voxel is a page round trip each, about a second apiece
+   * on a loaded software-GL page. What confirms a fill landed. Optional: a
+   * bridge without it cannot read a fill back. Throws on a block name the
+   * registry does not know.
+   */
+  voxelCensus?(boxes: VoxelCensusBox[]): VoxelCensus[];
+  /**
+   * Fault injection for gates: the next `count` calls of `method` are
+   * swallowed whole, the way a socket the core drops swallows them — each
+   * reports sent, goes unanswered, and never reaches the server. 0 clears
+   * it. Returns how many are left to swallow. Optional.
+   */
+  loseCalls?(method: string, count: number): number;
   entitiesNear(radius: number, traceId?: string): EntitySnapshot[];
   peers(): PeerSnapshot[];
   chunks: ChunkBridge;
@@ -633,11 +1034,38 @@ export interface AgentBridge {
    */
   reconnectNow(): boolean;
 
+  /**
+   * Ask the host to switch this page to another world in place (no new
+   * document). True when the host started a switch; false when it has no
+   * in-page switch, and the daemon navigates the page instead. Optional.
+   */
+  switchWorld?(world: string): boolean | Promise<boolean>;
+
+  /**
+   * Why a frame captured now would not show the world as a player standing
+   * there sees it, empty when nothing is wrong. The capture routes pass
+   * these on loudly, so a tipped or covered frame is never taken for proof.
+   * A bridge without it reports nothing.
+   */
+  captureCaveats?(): CaptureCaveat[];
+
   on<E extends AgentEventName>(
     event: E,
     cb: (data: AgentEventMap[E]) => void,
   ): Unsubscribe;
 }
+
+/** The response header `/sc` and `/screenshot` list a capture's caveats in,
+ * as JSON: present, `[]`, when there are none. */
+export const CAPTURE_CAVEATS_HEADER = "x-agent-capture-caveats";
+
+/** Something that makes a frame captured now mislead. */
+export type CaptureCaveat = {
+  /** A short name scripts can test for, such as `rolled`. */
+  code: string;
+  /** What is wrong, in plain ASCII words. */
+  message: string;
+};
 
 declare global {
   interface Window {

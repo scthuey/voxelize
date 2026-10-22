@@ -2,6 +2,7 @@ import { AABB } from "@voxelize/aabb";
 
 import { Coords3 } from "../../types";
 
+import type { BranchShape, BranchSocket } from "./branch";
 import { UV } from "./uv";
 
 /**
@@ -46,6 +47,16 @@ export interface BlockConditionalPart {
 export interface BlockDynamicPattern {
   parts: BlockConditionalPart[];
 }
+
+/**
+ * One other voxel a coupled block is stored together with: where it sits
+ * in this block's unrotated local frame, and the block id it must hold. Mirrors the
+ * server `CoupledPart`.
+ */
+export type CoupledPart = {
+  offset: Coords3;
+  id: number;
+};
 
 /**
  * A block type in the world. This is defined by the server.
@@ -110,6 +121,13 @@ export type Block = {
   groundFrictionMultiplier: number;
 
   /**
+   * Multiplier applied to an entity's swim speed while this block is the
+   * fluid at its feet. 1 is normal swim speed; a viscous fluid (lava) should
+   * be lower.
+   */
+  swimSpeedMultiplier: number;
+
+  /**
    * Whether this block can hold the world's waterlogging fluid alongside
    * itself. Whether a given voxel actually does is per-voxel state, read with
    * `World.getVoxelWaterloggedAt`.
@@ -155,11 +173,58 @@ export type Block = {
   transparentStandalone: boolean;
 
   /**
+   * With `transparentStandalone`, how many voxels in from either side of a
+   * mass of this block the faces between its voxels are still meshed, along
+   * each face's axis; 0 meshes every layer. A depth also makes a see-through
+   * cube a cutout mass, drawn single-sided with inward copies of its surface
+   * (see `isClosedCutoutCube`).
+   */
+  standaloneFaceDepth: number;
+
+  /**
    * Whether this block is plant decoration — a grass tuft, a flower, a crop.
    * The mesher uses it to jitter diagonal faces; the renderer uses it to decide
    * what {@link WorldClientOptions.plantDetailDistance} may stop drawing.
    */
   isPlant: boolean;
+
+  /**
+   * Vertical-run id shared by blocks that should shade/sway as one column
+   * (peony bottom+top, kelp+lantern). Zero means the block never stacks.
+   * Mirrors the server `stack_group` field.
+   */
+  stackGroup: number;
+
+  /**
+   * Whether every voxel of this block is meshed as its own geometry (never
+   * merged into the chunk's shared buffers) so `World.blockAnimations` can
+   * move one voxel's faces on their own — a door leaf swinging on its hinge.
+   * Mirrors the server `is_animated` field.
+   */
+  isAnimated: boolean;
+
+  /**
+   * Whether this block is drawn into the sun's shadow maps. `null` defers
+   * to {@link blockCastsShadow}'s rule of thumb; a block the rule gets wrong
+   * (a door: see-through to the mesher, a plank slab to the eye) says so
+   * here. Mirrors the server `casts_shadow` field.
+   */
+  castsShadow: boolean | null;
+
+  /**
+   * The other voxels of the multi-voxel unit this block is one part of — a
+   * door's other leaf, a tall flower's other half. Empty for an ordinary
+   * block. The server keeps such units whole at update intake; the client
+   * mirrors that in `World.updateVoxels` so predictions land on the same
+   * voxels. Mirrors the server `coupled_parts` field.
+   */
+  coupledParts: CoupledPart[];
+
+  /**
+   * Whether this part is its unit's anchor: the part that is placed, picked
+   * and dropped, and whose rotation and stage the other parts follow.
+   */
+  isCoupledAnchor: boolean;
 
   /**
    * A list of block face data that this block has.
@@ -177,12 +242,34 @@ export type Block = {
      * with the block and rendered full-bright by the chunk shader.
      */
     emissive?: number;
+    stageTintMask?: number;
+    /**
+     * Stage bits that pick this face's colour-table entry. `0` (or
+     * absent) means the face is never tinted from the table.
+     */
+    pigmentMask?: number;
+    /**
+     * Shade with the chunk's regional colour on the neutral palette, never
+     * reading the stage. Mirrors the server face's `regional_tint`.
+     */
+    regionalTint?: boolean;
   }[];
 
   /**
    * A list of axis-aligned bounding boxes that this block has.
    */
   aabbs: AABB[];
+
+  /**
+   * How high, in blocks above its voxel's floor, the bodies the server
+   * simulates find this block standing (each of its boxes raised to it).
+   * Absent for a block with no barrier. The client's own body still collides
+   * with the declared boxes; the physics engine reads it through
+   * `World.getBarrierTopAt` only to keep automatic moves (auto-jump,
+   * auto-step) from carrying the body over. Mirrors the server
+   * `barrier_height` field.
+   */
+  barrierHeight?: number;
 
   /**
    * Optical density for Beer-Lambert light transmission through this block.
@@ -197,6 +284,55 @@ export type Block = {
   isDynamic: boolean;
 
   dynamicPatterns: BlockDynamicPattern[];
+
+  /**
+   * Draws every voxel of this block as a branch of the radius its stage
+   * holds, joined to its neighbours. `null` for an ordinary block. Mirrors
+   * the server `branch` field; collision and picking follow the drawn shape
+   * through {@link branchAABBsAt}.
+   */
+  branch: BranchShape | null;
+
+  /** The branches this block takes without being one (a leaf, a soil). */
+  branchSockets: BranchSocket[];
+
+  /**
+   * Draws every voxel of this block as a cell of a wide branch section: its
+   * slice of the tube of the core its raw bits point at, wearing that core's
+   * faces. Mirrors the server `branch_shell`.
+   */
+  branchShell: boolean;
+
+  /**
+   * The faces a voxel wears instead of {@link faces} while its stage holds
+   * any of `mask`'s bits: the same cube in another look, each face standing
+   * in for the face toward the same side. `null` (or absent) for a block
+   * with one look. Mirrors the server `stage_faces`.
+   */
+  stageFaces?: { mask: number; faces: Block["faces"] } | null;
+
+  /**
+   * Loose quads a voxel wears over its cube while one of its six neighbours
+   * is empty, turned, leant by up to `tilt` radians and nudged by up to
+   * `jitter` blocks per voxel;
+   * `stageFaces` (when not empty) are worn instead while the stage picks
+   * {@link stageFaces}. They share the atlas. `null` (or absent) for a
+   * block without them. Mirrors the server `tufts`.
+   */
+  tufts?: {
+    faces: Block["faces"];
+    stageFaces?: Block["faces"];
+    jitter: number;
+    tilt?: number;
+  } | null;
+
+  /**
+   * Raw bits 16-23 of this block's voxels hold the block's own state, not a
+   * rotation: {@link World.getVoxelRotationAt} reads the identity rotation
+   * for it, and its rotation cannot be set. Mirrors the server
+   * `rotation_bits_are_state`.
+   */
+  rotationBitsAreState: boolean;
 
   /**
    * If this block is dynamic, this function will be called to generate the faces and AABB's. By default, this
@@ -220,7 +356,48 @@ export type Block = {
   isolatedFaces: Set<string>;
 
   isEntity: boolean;
+
+  /** Server-authored initial data for this block's entity. */
+  defaultEntityJson?: string | null;
 };
+
+/**
+ * The face name of a chunk geometry holding a block's tufts
+ * ({@link Block.tufts}), apart from its cube. Mirrors the mesher's
+ * `TUFTS_FACE_NAME`.
+ */
+export const TUFTS_FACE_NAME = "voxelize:tufts";
+
+/**
+ * Every face a block can draw: its own, then its stage faces
+ * ({@link Block.stageFaces}), then its tufts ({@link Block.tufts}), all of
+ * which share its atlas.
+ */
+export function everyFaceOf(
+  block: Pick<Block, "faces" | "stageFaces" | "tufts">,
+) {
+  if (!block.stageFaces && !block.tufts) return block.faces;
+  return [
+    ...block.faces,
+    ...(block.stageFaces?.faces ?? []),
+    ...(block.tufts?.faces ?? []),
+    ...(block.tufts?.stageFaces ?? []),
+  ];
+}
+
+/**
+ * The faces a voxel of `block` at `stage` wears: its stage faces while the
+ * stage holds any of their bits, its own otherwise (the mesher's
+ * `Block::faces_at`).
+ */
+export function facesAt(
+  block: Pick<Block, "faces" | "stageFaces">,
+  stage: number,
+): Block["faces"] {
+  return block.stageFaces && (stage & block.stageFaces.mask) !== 0
+    ? block.stageFaces.faces
+    : block.faces;
+}
 
 /**
  * A block update to make on the server.
@@ -255,6 +432,14 @@ export type BlockUpdate = {
    * The optional y-rotation of the updated block.
    */
   yRotation?: number;
+
+  /**
+   * Bits 16-23 of the word for a block whose rotation bits are state
+   * ({@link Block.rotationBitsAreState}), written exactly as they are and
+   * never decoded as a rotation. Only the server authors them; a client
+   * update leaves them zero.
+   */
+  stateBits?: number;
 
   /**
    * The optional stage of the updated block.
@@ -533,8 +718,13 @@ export class BlockRotation {
     this.rotateNode(min, yRotate, translate);
     this.rotateNode(max, yRotate, translate);
 
+    // Rotation leaves float dust (1e-17) where a coordinate should be exactly
+    // zero; snap only that. A genuinely negative bound is real geometry: a
+    // wall panel's box runs from -1 to 2 so it can span three voxels, and
+    // clamping its negative side to 0 silently cut a third off every rotated
+    // panel's raycast target, highlight, and footprint.
     const EPSILON = 0.0001;
-    const justify = (num: number) => (num < EPSILON ? 0 : num);
+    const justify = (num: number) => (Math.abs(num) < EPSILON ? 0 : num);
 
     min[0] = justify(min[0]);
     min[1] = justify(min[1]);

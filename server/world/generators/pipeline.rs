@@ -5,6 +5,7 @@ use hashbrown::{HashMap, HashSet};
 use rayon::prelude::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 
 use crate::{
+    world::shared_pools::{worldgen_pool, InflightJob, WORLDGEN_INFLIGHT},
     Chunk, ChunkStatus, Registry, Space, SpaceData, Terrain, Vec2, Vec3, VoxelAccess, VoxelUpdate,
     WorldConfig,
 };
@@ -27,6 +28,13 @@ impl MetaStage {
 }
 
 impl ChunkStage for MetaStage {
+    fn restore(&self, mut chunk: Chunk, resources: Resources) -> Chunk {
+        for stage in &self.stages {
+            chunk = stage.restore(chunk, resources.clone());
+        }
+        chunk
+    }
+
     fn name(&self) -> String {
         self.stages
             .iter()
@@ -59,6 +67,14 @@ impl ChunkStage for MetaStage {
 pub trait ChunkStage {
     /// The name of the stage, e.g. "Soiling"
     fn name(&self) -> String;
+
+    /// Optional idempotent migration of an existing save, before meshing.
+    /// Defaults to preserving the save. Never rerun generation here: player
+    /// construction and block state must survive. Runs on the loading worker;
+    /// neighbor space and ECS resources are intentionally unavailable.
+    fn restore(&self, chunk: Chunk, _: Resources) -> Chunk {
+        chunk
+    }
 
     /// The radius neighbor from the center chunk that are required before
     /// being processed in this chunk. Defaults to 0 blocks.
@@ -244,8 +260,27 @@ pub struct Pipeline {
     /// A map of leftover changes from processing chunk stages.
     pub(crate) leftovers: HashMap<Vec2<i32>, Vec<VoxelUpdate>>,
 
+    /// Stage writes aimed at a chunk whose Load pass is in flight. The pass
+    /// lit a clone taken at dispatch, so a write landing now would be baked
+    /// in raw, unlit and unsent (a leftover); these are replayed through
+    /// the updating lane once that pass lands and the chunk is ready.
+    pub(crate) deferred: HashMap<Vec2<i32>, Vec<VoxelUpdate>>,
+
     /// Chunks that received requests while being processed - need regeneration after current processing completes.
     pub(crate) pending_regenerate: HashSet<Vec2<i32>>,
+
+    /// Chunks an unload released while one of their stages was running. The
+    /// stage is left to land; the chunk then parks at the stage it reached
+    /// unless something wants it again by then ([`Pipeline::parks_released`]).
+    released: HashSet<Vec2<i32>>,
+
+    /// Chunks parked partway through the pipeline because nobody wants them
+    /// any more: an unload dropped their queued stages, or a released
+    /// chunk's running stage landed. Their status still reads `Generating`,
+    /// so a chunk that later waits on one as a neighbor puts it back on the
+    /// queue ([`Pipeline::revive_dropped`]) instead of waiting on a stage
+    /// nothing will run.
+    dropped: HashSet<Vec2<i32>>,
 
     /// Sender of processed chunks from other threads to main thread.
     sender: Arc<Sender<(Chunk, Vec<VoxelUpdate>)>>,
@@ -264,7 +299,10 @@ impl Pipeline {
             receiver: Arc::new(receiver),
             chunks: HashSet::new(),
             leftovers: HashMap::new(),
+            deferred: HashMap::new(),
             pending_regenerate: HashSet::new(),
+            released: HashSet::new(),
+            dropped: HashSet::new(),
             demanded: HashSet::new(),
             queue: VecDeque::new(),
             stages: Vec::new(),
@@ -277,7 +315,10 @@ impl Pipeline {
         self.chunks.clear();
         self.queue.clear();
         self.leftovers.clear();
+        self.deferred.clear();
         self.pending_regenerate.clear();
+        self.released.clear();
+        self.dropped.clear();
         self.demanded.clear();
     }
 
@@ -317,6 +358,8 @@ impl Pipeline {
             return;
         }
 
+        self.dropped.remove(coords);
+
         // A generation queue this deep means something is conscripting chunks
         // far faster than any client could ask for them (an unbounded world's
         // mesh-prerequisite expansion once filled it with hundreds of
@@ -348,7 +391,60 @@ impl Pipeline {
             return;
         }
 
+        self.dropped.remove(coords);
         self.queue.push_back(coords.to_owned());
+    }
+
+    /// Stop carrying a chunk nobody wants any more. Its demand is forgotten,
+    /// and unless a neighbor is already waiting on it (`is_awaited`) its
+    /// queued stages are dropped (remembered in `dropped`), or, with a stage
+    /// running, it is marked `released` so that stage lands and the chunk
+    /// parks there. Pulling a running stage out of the pipeline used to throw
+    /// its result away and leave the chunk at the stage before, with every
+    /// neighbor waiting on it waiting forever.
+    pub(crate) fn release_unwanted(&mut self, coords: &Vec2<i32>, is_awaited: bool) {
+        self.demanded.remove(coords);
+        if is_awaited {
+            return;
+        }
+        if self.has_chunk(coords) {
+            self.released.insert(coords.to_owned());
+            return;
+        }
+        let queued = self.queue.len();
+        self.queue.retain(|c| c != coords);
+        if self.queue.len() < queued {
+            self.dropped.insert(coords.to_owned());
+        }
+    }
+
+    /// A stage landed for `coords` and the chunk has another one to go.
+    /// Returns whether it parks instead: an unload released it while the
+    /// stage ran and nothing (`is_wanted`) asked for it since. A parked
+    /// chunk is remembered as dropped, so waiting on it revives it.
+    pub(crate) fn parks_released(&mut self, coords: &Vec2<i32>, is_wanted: bool) -> bool {
+        if !self.released.remove(coords) || is_wanted {
+            return false;
+        }
+        self.dropped.insert(coords.to_owned());
+        true
+    }
+
+    /// A released chunk finished its last stage; parking at `Meshing` is the
+    /// mesher's call, so only the mark goes.
+    pub(crate) fn forget_released(&mut self, coords: &Vec2<i32>) {
+        self.released.remove(coords);
+    }
+
+    /// Put a chunk whose queued stages an unload dropped back at the front of
+    /// the queue, because a neighbor is about to wait on it. Returns whether
+    /// it had been dropped.
+    pub(crate) fn revive_dropped(&mut self, coords: &Vec2<i32>) -> bool {
+        if !self.dropped.contains(coords) {
+            return false;
+        }
+        self.requeue_chunk(coords, true);
+        true
     }
 
     /// Whether anything has deliberately asked for these coords. Read-only:
@@ -417,19 +513,27 @@ impl Pipeline {
             .collect();
 
         let sender = Arc::clone(&self.sender);
-        let registry = registry.to_owned();
-        let config = config.to_owned();
+        // One copy per batch, shared by its stage jobs: each job used to
+        // deep-clone the whole Registry and config for itself.
+        let registry = Arc::new(registry.to_owned());
+        let config = Arc::new(config.to_owned());
 
-        rayon::spawn(move || {
+        // Stage jobs run on the worldgen pool, never on the global pool the
+        // tick path once shared: a tick must not queue behind this backlog.
+        let pool = worldgen_pool();
+        let stage_pool = Arc::clone(&pool);
+        InflightJob::queue(&WORLDGEN_INFLIGHT, processes.len());
+        pool.spawn(move || {
             processes
                 .into_par_iter()
                 .enumerate()
                 .for_each(|(_, (chunk, space, stage))| {
                     let sender = Arc::clone(&sender);
-                    let registry = registry.clone();
-                    let config = config.clone();
+                    let registry = Arc::clone(&registry);
+                    let config = Arc::clone(&config);
 
-                    rayon::spawn_fifo(move || {
+                    stage_pool.spawn_fifo(move || {
+                        let _inflight = InflightJob::adopt(&WORLDGEN_INFLIGHT);
                         let mut changes = vec![];
 
                         let started = std::time::Instant::now();
@@ -466,6 +570,14 @@ impl Pipeline {
             if self.chunks.contains(&result.0.coords) {
                 self.remove_chunk(&result.0.coords);
                 results.push(result);
+            } else {
+                // Only a world wipe forgets a chunk mid-stage. A result thrown
+                // away for any other reason leaves the chunk at its previous
+                // stage with nothing left to advance it.
+                log::warn!(
+                    "[pipeline] discarding a finished stage for {:?}: no longer tracked (expected only after a world wipe)",
+                    result.0.coords
+                );
             }
         }
 
@@ -503,5 +615,122 @@ impl Pipeline {
         }
 
         self.stages = new_stages;
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::*;
+
+    #[test]
+    fn an_unload_drops_queued_stages_and_waiting_on_the_chunk_revives_them() {
+        let mut pipeline = Pipeline::new();
+        let coords = Vec2(3, 4);
+        pipeline.add_chunk(&coords, false);
+
+        pipeline.release_unwanted(&coords, false);
+
+        assert!(!pipeline.queue.contains(&coords));
+        assert!(!pipeline.is_demanded(&coords));
+        assert!(pipeline.revive_dropped(&coords));
+        assert_eq!(pipeline.queue.front(), Some(&coords));
+        assert!(
+            !pipeline.revive_dropped(&coords),
+            "a revived chunk is no longer dropped"
+        );
+    }
+
+    #[test]
+    fn an_unload_lets_a_running_stage_land_then_parks_the_chunk() {
+        let mut pipeline = Pipeline::new();
+        let coords = Vec2(1, 0);
+        // What `process` records when the stage starts.
+        pipeline.chunks.insert(coords.clone());
+
+        pipeline.release_unwanted(&coords, false);
+
+        assert!(pipeline.has_chunk(&coords), "the running stage still lands");
+        assert!(pipeline.parks_released(&coords, false));
+        assert!(pipeline.revive_dropped(&coords));
+    }
+
+    #[test]
+    fn a_released_chunk_that_is_wanted_again_goes_on() {
+        let mut pipeline = Pipeline::new();
+        let coords = Vec2(1, 0);
+        pipeline.chunks.insert(coords.clone());
+        pipeline.release_unwanted(&coords, false);
+
+        assert!(!pipeline.parks_released(&coords, true));
+        assert!(!pipeline.revive_dropped(&coords));
+    }
+
+    #[test]
+    fn a_chunk_a_neighbor_waits_on_keeps_its_stages() {
+        let mut pipeline = Pipeline::new();
+        let coords = Vec2(0, 1);
+        pipeline.add_chunk(&coords, false);
+
+        pipeline.release_unwanted(&coords, true);
+
+        assert!(pipeline.queue.contains(&coords));
+        assert!(!pipeline.revive_dropped(&coords));
+    }
+}
+
+#[cfg(test)]
+mod restore_tests {
+    use super::*;
+    use crate::{BlockUtils, ChunkOptions};
+
+    struct SavedAppearance;
+    impl ChunkStage for SavedAppearance {
+        fn name(&self) -> String {
+            "saved appearance".into()
+        }
+        fn process(&self, _: Chunk, _: Resources, _: Option<Space>) -> Chunk {
+            panic!("loading a save must never run generation");
+        }
+        fn restore(&self, mut chunk: Chunk, _: Resources) -> Chunk {
+            let raw = chunk.get_raw_voxel(0, 2, 0);
+            chunk.set_raw_voxel(0, 2, 0, BlockUtils::insert_stage(raw, 8));
+            chunk
+        }
+    }
+
+    #[test]
+    fn merged_stages_restore_only_opted_in_metadata() {
+        let mut pipeline = Pipeline::new();
+        // This would destroy the player's stone if process ran while loading.
+        pipeline.add_stage(FlatlandStage::new().add_soiling(1, 12));
+        pipeline.add_stage(SavedAppearance);
+        pipeline.merge_stages();
+        let registry = Registry::new();
+        let config = WorldConfig::default();
+        let mut chunk = Chunk::new(
+            "saved",
+            0,
+            0,
+            &ChunkOptions {
+                size: 16,
+                max_height: 32,
+                sub_chunks: 2,
+            },
+        );
+        chunk.set_voxel(0, 2, 0, 7);
+        chunk.set_voxel(1, 2, 0, 11);
+        for stage in &pipeline.stages {
+            chunk = stage.restore(
+                chunk,
+                Resources {
+                    registry: &registry,
+                    config: &config,
+                },
+            );
+        }
+        assert_eq!(chunk.get_voxel(0, 2, 0), 7);
+        assert_eq!(chunk.get_voxel_stage(0, 2, 0), 8);
+        assert_eq!(chunk.get_raw_voxel(1, 2, 0), 11);
+        assert_eq!(chunk.get_voxel(0, 3, 0), 0);
     }
 }

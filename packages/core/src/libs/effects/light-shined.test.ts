@@ -1,16 +1,44 @@
-import { Color, Object3D, Vector3 } from "three";
+import {
+  BoxGeometry,
+  Color,
+  type Material,
+  Mesh,
+  MeshBasicMaterial,
+  Object3D,
+  Scene,
+  Vector3,
+} from "three";
 import { describe, expect, it } from "vitest";
 
 import type { World } from "../../core";
 
 import { LightShined } from "./light-shined";
 
-const makeWorld = () => {
+type LightValues = {
+  red: number;
+  green: number;
+  blue: number;
+  sunlight: number;
+};
+type LocalLightOut = {
+  color: [number, number, number];
+  count: number;
+  claim: number;
+  windowFade: number;
+};
+
+const makeWorld = (
+  over: {
+    light?: LightValues;
+    sunlightIntensity?: number;
+    localLight?: { color: [number, number, number]; claim: number };
+  } = {},
+) => {
   const counter = { raycasts: 0 };
   const world = {
     chunkRenderer: {
       uniforms: {
-        sunlightIntensity: { value: 1 },
+        sunlightIntensity: { value: over.sunlightIntensity ?? 1 },
         minLightLevel: { value: 0.1 },
         baseAmbient: { value: 0.1 },
       },
@@ -25,18 +53,38 @@ const makeWorld = () => {
     csmRenderer: {} as World["csmRenderer"],
     localLights: {
       options: { maskKnee: 0.25 } as World["localLights"]["options"],
-      blockLightOwnership: 0,
-      queryLocalLights: () => undefined,
+      blockLightOwnership: over.localLight ? 1 : 0,
+      queryLocalLights: (_pos: Vector3, out: LocalLightOut) => {
+        if (!over.localLight) return;
+        out.color[0] = over.localLight.color[0];
+        out.color[1] = over.localLight.color[1];
+        out.color[2] = over.localLight.color[2];
+        out.count = 1;
+        out.claim = over.localLight.claim;
+        out.windowFade = 1;
+      },
     } as Partial<World["localLights"]> as World["localLights"],
-    getLightValuesAt: () => ({ red: 0, green: 0, blue: 0, sunlight: 15 }),
-    getVoxelWaterloggedAt: () => false,
-    getBlockAt: () => null,
+    getLightValuesAt: () =>
+      over.light ?? { red: 0, green: 0, blue: 0, sunlight: 15 },
+    measureWaterColumnAt: () => null,
     raycastVoxels: () => {
       counter.raycasts += 1;
       return null;
     },
   };
   return { counter, world: world as Partial<World> as World };
+};
+
+/** The multiplier a mesh under the effect ends up with after one update. */
+const litColorOf = (shined: LightShined) => {
+  const parent = new Object3D();
+  const mesh = new Mesh(new BoxGeometry(), new MeshBasicMaterial());
+  parent.add(mesh);
+  shined.add(mesh);
+  shined.update();
+  const uniforms = mesh.userData.lightUniforms as { value: Color }[];
+  expect(uniforms).toHaveLength(1);
+  return uniforms[0].value;
 };
 
 const makeShinedObject = (shined: LightShined) => {
@@ -101,5 +149,389 @@ describe("LightShined sampling cadence", () => {
     obj.position.set(3, 0, 0);
     shined.update();
     expect(counter.raycasts).toBe(1);
+  });
+});
+
+describe("LightShined brightness", () => {
+  it("keeps an object in open noon sun at the terrain's brightness, under 1", () => {
+    const { world } = makeWorld();
+    const lit = litColorOf(new LightShined(world));
+    // The additive composition put this at ~1.2; the shader's own curve
+    // lands open sun around 0.8–0.9.
+    expect(Math.max(lit.r, lit.g, lit.b)).toBeLessThan(0.95);
+    expect(Math.min(lit.r, lit.g, lit.b)).toBeGreaterThan(0.6);
+  });
+
+  it("does not blow out on a level-15 emitter under a bank of analytic lights", () => {
+    // The lantern plinth at night: full flood, a lit-floor proxy carrying
+    // four emitters' intensity in the cell, and the flood fully claimed.
+    const { world } = makeWorld({
+      light: { red: 15, green: 15, blue: 15, sunlight: 15 },
+      sunlightIntensity: 0.085,
+      localLight: { color: [4, 4, 4], claim: 4 },
+    });
+    const lit = litColorOf(new LightShined(world));
+    expect(Math.max(lit.r, lit.g, lit.b)).toBeLessThanOrEqual(1);
+    expect(Math.max(lit.r, lit.g, lit.b)).toBeGreaterThan(0.7);
+  });
+
+  it("honours a lower explicit brightness cap", () => {
+    const { world } = makeWorld({
+      light: { red: 15, green: 15, blue: 15, sunlight: 15 },
+    });
+    const lit = litColorOf(new LightShined(world, { maxBrightness: 0.5 }));
+    expect(Math.max(lit.r, lit.g, lit.b)).toBeLessThanOrEqual(0.5);
+  });
+});
+
+describe("LightShined change detection", () => {
+  const lightUniformsOf = (obj: Object3D) =>
+    (obj.userData.lightUniforms ?? []) as { value: Color }[];
+
+  it("sets up equipment added after registration, before its first draw", () => {
+    const { world } = makeWorld();
+    const shined = new LightShined(world);
+    const parent = new Object3D();
+    const character = new Object3D();
+    parent.add(character);
+    shined.add(character);
+    shined.update();
+    expect(lightUniformsOf(character)).toHaveLength(0);
+
+    const hat = new Object3D();
+    const brim = new Mesh(new BoxGeometry(), new MeshBasicMaterial());
+    hat.add(brim);
+    character.add(hat);
+    expect(brim.material.userData.lightEffectSetup).toBe(true);
+    expect(lightUniformsOf(character)).toHaveLength(1);
+    expect(character.userData.justChanged).toBe(true);
+
+    // A grandchild added under the late child is covered too.
+    const feather = new Mesh(new BoxGeometry(), new MeshBasicMaterial());
+    hat.add(feather);
+    expect(lightUniformsOf(character)).toHaveLength(2);
+  });
+
+  it("leaves children arrays and materials as plain objects", () => {
+    const { world } = makeWorld();
+    const shined = new LightShined(world);
+    const parent = new Object3D();
+    const material = new MeshBasicMaterial();
+    const mesh = new Mesh(new BoxGeometry(), material);
+    const children = mesh.children;
+    parent.add(mesh);
+    shined.add(mesh);
+    expect(mesh.material).toBe(material);
+    expect(mesh.children).toBe(children);
+  });
+
+  it("stops setting up a subtree once removed from the shined object", () => {
+    const { world } = makeWorld();
+    const shined = new LightShined(world);
+    const parent = new Object3D();
+    const character = new Object3D();
+    const cape = new Object3D();
+    character.add(cape);
+    parent.add(character);
+    shined.add(character);
+    character.remove(cape);
+    cape.add(new Mesh(new BoxGeometry(), new MeshBasicMaterial()));
+    expect(lightUniformsOf(character)).toHaveLength(0);
+
+    shined.remove(character);
+    character.add(new Mesh(new BoxGeometry(), new MeshBasicMaterial()));
+    expect(lightUniformsOf(character)).toHaveLength(0);
+  });
+
+  it("keeps the old Proxy path available for A/B measurement", () => {
+    const { world } = makeWorld();
+    const shined = new LightShined(world, { useProxyChangeDetection: true });
+    const parent = new Object3D();
+    const character = new Object3D();
+    parent.add(character);
+    shined.add(character);
+    character.add(new Mesh(new BoxGeometry(), new MeshBasicMaterial()));
+    expect(lightUniformsOf(character)).toHaveLength(1);
+  });
+});
+
+describe("LightShined shared materials", () => {
+  const uniformsOf = (obj: Object3D) =>
+    (obj.userData.lightUniforms ?? []) as { value: Color }[];
+
+  /** Two display copies of one cached block mesh: meshes sharing a material. */
+  const twoRootsSharing = (material: MeshBasicMaterial) => {
+    const scene = new Scene();
+    const first = new Object3D();
+    const second = new Object3D();
+    const firstMesh = new Mesh(new BoxGeometry(), material);
+    const secondMesh = new Mesh(new BoxGeometry(), material);
+    first.add(firstMesh);
+    second.add(secondMesh);
+    scene.add(first, second);
+    return { first, second, firstMesh, secondMesh };
+  };
+
+  it("gives a second root sharing a material its own light", () => {
+    const { world } = makeWorld();
+    const shined = new LightShined(world);
+    const material = new MeshBasicMaterial();
+    const { first, second, firstMesh, secondMesh } = twoRootsSharing(material);
+    shined.add(first);
+    shined.add(second);
+
+    expect(firstMesh.material).toBe(material);
+    expect(secondMesh.material).not.toBe(material);
+    expect(uniformsOf(first)).toHaveLength(1);
+    expect(uniformsOf(second)).toHaveLength(1);
+    expect(uniformsOf(second)[0]).not.toBe(uniformsOf(first)[0]);
+    expect(
+      (secondMesh.material as MeshBasicMaterial).userData.lightEffectSetup,
+    ).toBe(true);
+  });
+
+  it("keeps lighting the second root after the first is removed", () => {
+    const light = { red: 0, green: 0, blue: 0, sunlight: 15 };
+    const { world } = makeWorld({ light });
+    const shined = new LightShined(world, { sampleIntervalFrames: 1 });
+    const { first, second } = twoRootsSharing(new MeshBasicMaterial());
+    shined.add(first);
+    shined.add(second);
+    shined.update();
+    const frozen = uniformsOf(first)[0].value.clone();
+
+    shined.remove(first);
+    light.sunlight = 0;
+    second.position.set(10, 0, 0);
+    for (let i = 0; i < 4; i++) shined.update();
+
+    expect(uniformsOf(first)[0].value.equals(frozen)).toBe(true);
+    expect(uniformsOf(second)[0].value.r).toBeLessThan(frozen.r);
+  });
+
+  it("starts the copy from the material's own compile hook", () => {
+    const { world } = makeWorld();
+    const shined = new LightShined(world);
+    const material = new MeshBasicMaterial();
+    const calls: string[] = [];
+    material.onBeforeCompile = () => {
+      calls.push("own");
+    };
+    const { first, second, secondMesh } = twoRootsSharing(material);
+    shined.add(first);
+    shined.add(second);
+
+    const shader = {
+      uniforms: {},
+      vertexShader: "void main() {}",
+      fragmentShader: "void main() {\n#include <color_fragment>\n}",
+    };
+    const copy = secondMesh.material as MeshBasicMaterial;
+    copy.onBeforeCompile(shader as never, {} as never);
+    expect(calls).toEqual(["own"]);
+    expect(shader.fragmentShader).toContain("diffuseColor.rgb *= lightEffect");
+    expect((shader.uniforms as Record<string, unknown>).lightEffect).toBe(
+      uniformsOf(second)[0],
+    );
+  });
+
+  it("makes one copy per root however many of its meshes share the material", () => {
+    const { world } = makeWorld();
+    const shined = new LightShined(world);
+    const material = new MeshBasicMaterial();
+    const { first, second, secondMesh } = twoRootsSharing(material);
+    const secondTwin = new Mesh(new BoxGeometry(), material);
+    second.add(secondTwin);
+    shined.add(first);
+    shined.add(second);
+
+    expect(secondMesh.material).not.toBe(material);
+    expect(secondTwin.material).toBe(secondMesh.material);
+    expect(uniformsOf(second)).toHaveLength(1);
+  });
+
+  it("lets go of a removed root, and the next root adopts its material", () => {
+    const light = { red: 0, green: 0, blue: 0, sunlight: 15 };
+    const { world } = makeWorld({ light });
+    const shined = new LightShined(world, { sampleIntervalFrames: 1 });
+    const owners = (
+      shined as unknown as {
+        materialOwners: WeakMap<Material, { root: Object3D | null }>;
+      }
+    ).materialOwners;
+    const material = new MeshBasicMaterial();
+    const { first, second, secondMesh } = twoRootsSharing(material);
+    shined.add(first);
+    const firstUniform = uniformsOf(first)[0];
+    shined.remove(first);
+    expect(owners.get(material)?.root).toBeNull();
+
+    // A later root meets the released material: no copy, one uniform.
+    shined.add(second);
+    expect(secondMesh.material).toBe(material);
+    expect(uniformsOf(second)).toEqual([firstUniform]);
+    expect(owners.get(material)?.root).toBe(second);
+    light.sunlight = 0;
+    second.position.set(10, 0, 0);
+    for (let i = 0; i < 4; i++) shined.update();
+    expect(firstUniform.value.r).toBeLessThan(0.5);
+
+    // While that root lives, another still gets its own copy.
+    const scene = second.parent as Scene;
+    const third = new Object3D();
+    const thirdMesh = new Mesh(new BoxGeometry(), material);
+    third.add(thirdMesh);
+    scene.add(third);
+    shined.add(third);
+    expect(thirdMesh.material).not.toBe(material);
+  });
+
+  it("disposes a root's copy on remove and reuses it if the root returns", () => {
+    const { world } = makeWorld();
+    const shined = new LightShined(world);
+    const material = new MeshBasicMaterial();
+    const { first, second, secondMesh } = twoRootsSharing(material);
+    shined.add(first);
+    shined.add(second);
+    const copy = secondMesh.material as MeshBasicMaterial;
+    let disposed = 0;
+    copy.addEventListener("dispose", () => {
+      disposed += 1;
+    });
+
+    shined.remove(second);
+    expect(disposed).toBe(1);
+    shined.add(second);
+    expect(secondMesh.material).toBe(copy);
+    expect(uniformsOf(second)).toHaveLength(1);
+    shined.remove(second);
+    expect(disposed).toBe(2);
+  });
+
+  it("keeps sharing inside the owning root's own subtree", () => {
+    const { world } = makeWorld();
+    const shined = new LightShined(world);
+    const material = new MeshBasicMaterial();
+    const scene = new Scene();
+    const outer = new Object3D();
+    const inner = new Object3D();
+    const mesh = new Mesh(new BoxGeometry(), material);
+    inner.add(mesh);
+    outer.add(inner);
+    scene.add(outer);
+    shined.add(outer);
+    shined.add(inner);
+    expect(mesh.material).toBe(material);
+  });
+});
+
+describe("LightShined detached subtrees", () => {
+  /**
+   * The entity manager releases an entity by detaching its root, so a lit
+   * character inside it keeps a parent. With `skipDetached` the effect stops
+   * paying for it (perf audit fix 1); without it the old cost remains.
+   */
+  const releasedCharacter = (shined: LightShined) => {
+    const scene = new Scene();
+    const entity = new Object3D();
+    const character = new Object3D();
+    entity.add(character);
+    scene.add(entity);
+    shined.add(character);
+    return { scene, entity, character };
+  };
+
+  it("skips a lit child once its root is detached from the scene", () => {
+    const { counter, world } = makeWorld();
+    const shined = new LightShined(world, {
+      sampleIntervalFrames: 1,
+      skipDetached: true,
+    });
+    const { scene, entity } = releasedCharacter(shined);
+    shined.update();
+    expect(counter.raycasts).toBe(1);
+
+    scene.remove(entity);
+    for (let i = 0; i < 5; i++) shined.update();
+    expect(counter.raycasts).toBe(1);
+
+    // Streamed back in under a scene: lit again.
+    scene.add(entity);
+    shined.update();
+    expect(counter.raycasts).toBe(2);
+  });
+
+  it("keeps the old per-frame cost when off", () => {
+    const { counter, world } = makeWorld();
+    const shined = new LightShined(world, { sampleIntervalFrames: 1 });
+    const { scene, entity } = releasedCharacter(shined);
+    scene.remove(entity);
+    for (let i = 0; i < 5; i++) shined.update();
+    expect(counter.raycasts).toBe(5);
+  });
+});
+
+describe("LightShined across worlds", () => {
+  const compile = (material: Material) => {
+    const shader = {
+      uniforms: {} as Record<string, unknown>,
+      vertexShader: "void main() {}",
+      fragmentShader: "void main() {\n#include <color_fragment>\n}",
+    };
+    material.onBeforeCompile(shader as never, {} as never);
+    return shader;
+  };
+
+  it("lights art shared page-wide again in the next world, from its own hook", () => {
+    // Item art outlives a world switched away from in place: the next
+    // world's effect lights it with its own uniform, wrapping the art's own
+    // hook once, not the dead effect's wrapper.
+    const material = new MeshBasicMaterial();
+    const calls: string[] = [];
+    material.onBeforeCompile = () => {
+      calls.push("own");
+    };
+    const first = new LightShined(makeWorld().world);
+    const firstRoot = new Object3D();
+    firstRoot.add(new Mesh(new BoxGeometry(), material));
+    first.add(firstRoot);
+    first.dispose();
+
+    const second = new LightShined(makeWorld().world);
+    const secondRoot = new Object3D();
+    secondRoot.add(new Mesh(new BoxGeometry(), material));
+    second.add(secondRoot);
+
+    const shader = compile(material);
+    expect(calls).toEqual(["own"]);
+    expect(shader.uniforms.lightEffect).toBe(
+      (secondRoot.userData.lightUniforms as { value: Color }[])[0],
+    );
+    expect(shader.fragmentShader.match(/uniform vec3 lightEffect/g)).toHaveLength(
+      1,
+    );
+  });
+
+  it("still skips a material another system lights itself", () => {
+    const material = new MeshBasicMaterial();
+    material.userData.lightEffectSetup = true;
+    const shined = new LightShined(makeWorld().world);
+    const root = new Object3D();
+    root.add(new Mesh(new BoxGeometry(), material));
+    shined.add(root);
+    expect(root.userData.lightUniforms).toBeUndefined();
+  });
+
+  it("lets go of every shined object on dispose", () => {
+    const shined = new LightShined(makeWorld().world);
+    const root = new Object3D();
+    const mesh = new Mesh(new BoxGeometry(), new MeshBasicMaterial());
+    root.add(mesh);
+    shined.add(root);
+    shined.dispose();
+    // No longer hooked: a child added later is not set up.
+    const late = new Mesh(new BoxGeometry(), new MeshBasicMaterial());
+    root.add(late);
+    expect(late.material.userData.lightEffectSetup).toBeUndefined();
   });
 });

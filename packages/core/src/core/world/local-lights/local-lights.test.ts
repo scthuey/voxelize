@@ -1,6 +1,16 @@
 import { Vector3 } from "three";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import {
+  BLOCK_LIGHT_TRANSFER,
+  BLOCK_LIGHT_TUNING,
+  blockLightAdapt,
+  blockLightCurve,
+  blockLightCurveRGB,
+  localLightFalloff,
+  maskedWindowDistance,
+  setBlockLightTuning,
+} from "../block-light-transfer";
 import {
   SHADER_LIGHTING_CHUNK_SHADERS,
   SHADER_LIGHTING_CROSS_CHUNK_SHADERS,
@@ -63,6 +73,9 @@ const makeStats = (): LocalLightStats => ({
   scanMsPeak: 0,
   sectionsPendingScan: 0,
   selectionChurn: 0,
+  fadingSlots: 0,
+  fadingLights: 0,
+  highResolution: 0,
   gridTextureUploads: 0,
   dataTextureUploads: 0,
   shadowed: 0,
@@ -86,6 +99,8 @@ const makeGrid = (
     maxClusteredLights: number;
     maxLightsPerCell: number;
     analyticRadius: number;
+    temporalStability: boolean;
+    highResolutionLightsPerCell: number;
   }> = {},
 ) =>
   new LightClusterGrid(registry, {
@@ -97,7 +112,47 @@ const makeGrid = (
     selectionHysteresis: 1.2,
     maskKnee: 2 / 15,
     fluidSpecularStrength: 1,
+    temporalStability: overrides.temporalStability ?? true,
+    slotFadeMs: 320,
+    ...(overrides.highResolutionLightsPerCell !== undefined && {
+      highResolutionLightsPerCell: overrides.highResolutionLightsPerCell,
+    }),
   });
+
+type GridInternals = {
+  gridData: Uint16Array;
+  storageIndex(cellX: number, cellY: number, cellZ: number): number;
+  gridBaseOf(cell: number): number;
+};
+
+/** The lights a world cell's slot list holds, with their weight bytes. */
+const cellSlots = (
+  grid: LightClusterGrid,
+  cellX: number,
+  cellY: number,
+  cellZ: number,
+) => {
+  const internals = grid as unknown as GridInternals;
+  const base = internals.gridBaseOf(
+    internals.storageIndex(cellX, cellY, cellZ),
+  );
+  const slots: { index: number; weight: number }[] = [];
+  for (let s = 0; s < 8; s++) {
+    const value = internals.gridData[base + s];
+    const row = value & 0xff;
+    if (row === 0) break;
+    slots.push({ index: grid.packedIndices[row - 1], weight: value >> 8 });
+  }
+  return slots;
+};
+
+/** The registry indices a world cell's slot list holds. */
+const cellSlotIndices = (
+  grid: LightClusterGrid,
+  cellX: number,
+  cellY: number,
+  cellZ: number,
+) => cellSlots(grid, cellX, cellY, cellZ).map((slot) => slot.index);
 
 describe("LightSourceRegistry", () => {
   it("issues stable generation-checked handles", () => {
@@ -262,7 +317,7 @@ describe("LightClusterGrid selection", () => {
     expect(stats.gridTextureUploads).toBe(uploads + 1);
   });
 
-  it("drops the lowest-importance light in a full cell, deterministically", () => {
+  it("slots the eight strongest lights of a full cell and overflows the rest, deterministically", () => {
     const registry = new LightSourceRegistry(16);
     // Ten lights stacked on the same spot: one cell, eight slots.
     for (let i = 0; i < 10; i++) {
@@ -275,16 +330,20 @@ describe("LightClusterGrid selection", () => {
     expect(stats.cellsOverflowed).toBeGreaterThan(0);
 
     // The overflow victims must be the two weakest lights: ranks 8 and 9.
+    const slots = cellSlotIndices(grid, 0, 0, 0);
+    expect(slots).toHaveLength(8);
+    expect(slots).not.toContain(8);
+    expect(slots).not.toContain(9);
     const sample = {
       color: [0, 0, 0] as [number, number, number],
       count: 0,
       claim: 0,
       windowFade: 1,
     };
-    // The CPU sample mirrors the fragment gate: only the eight cell-held
-    // lights contribute; the two overflow victims neither tint nor claim.
+    // The CPU sample mirrors the fragment: the eight slots, then the two
+    // victims through the cell's overflow.
     const contributors = grid.sampleIrradiance([4, 4, 4], sample);
-    expect(contributors).toBe(8);
+    expect(contributors).toBe(10);
     expect(sample.claim).toBeGreaterThan(0);
   });
 
@@ -344,6 +403,15 @@ describe("LightClusterGrid selection", () => {
 });
 
 describe("block-light ownership", () => {
+  // These pin the legacy model's numbers (smoothstep flood, 1.2 gain,
+  // (1 - n^2)^2 kernel); the new transfer has its own suite below.
+  beforeEach(() =>
+    setBlockLightTuning({ curve: false, toneMap: false, kernel: false }),
+  );
+  afterEach(() =>
+    setBlockLightTuning({ curve: true, toneMap: true, kernel: true }),
+  );
+
   const makeSample = () => ({
     color: [0, 0, 0] as [number, number, number],
     count: 0,
@@ -425,12 +493,12 @@ describe("block-light ownership", () => {
     // tint on top of unsuppressed flood: exactly the double-lighting the
     // ownership blend removes.
     const registry = new LightSourceRegistry(8);
-    registry.add(pointLight({ range: 10 }), 90, 4, 4);
+    registry.add(pointLight({ range: 16 }), 90, 4, 4);
     const grid = makeGrid(registry, { analyticRadius: 96 });
     grid.update(0, 0, 0, makeStats());
 
     const inside = makeSample();
-    grid.sampleIrradiance([88, 4, 4], inside);
+    grid.sampleIrradiance([76, 4, 4], inside);
     expect(inside.color[0]).toBeGreaterThan(0);
 
     const outside = makeSample();
@@ -451,11 +519,11 @@ describe("block-light ownership", () => {
     grid.update(0, 0, 0, makeStats());
 
     const deep = makeSample();
-    grid.sampleIrradiance([60, 4, 4], deep); // edge distance 4.5 cells: fade 1
+    grid.sampleIrradiance([60, 4, 4], deep); // 28 inside the 88 half: fade 1
     const rim = makeSample();
-    grid.sampleIrradiance([88, 4, 4], rim); // 1 cell from the +X edge: fade 0.5
+    grid.sampleIrradiance([80, 4, 4], rim); // 8 inside, 16-block band: 0.5
 
-    const dist = 28;
+    const dist = 20;
     const norm = dist / 32;
     const falloff = (1 - norm * norm) ** 2;
     expect(deep.windowFade).toBe(1);
@@ -569,10 +637,10 @@ describe("block-light ownership", () => {
     }
   });
 
-  it("claims only the lights the point's cell actually holds (overflow)", () => {
+  it("claims every light that reaches the point, overflow included", () => {
     // Ten equal-position lights, eight cell slots: the shader lights the
-    // fragment from the eight held ranks and keeps the flood look for the
-    // dropped two — the CPU claim must agree or entities darken where
+    // fragment from the eight held ranks and the cell's overflow (the
+    // dropped two) — the CPU claim must agree or entities darken where
     // blocks do not.
     const registry = new LightSourceRegistry(16);
     for (let i = 0; i < 10; i++) {
@@ -584,9 +652,9 @@ describe("block-light ownership", () => {
     const sample = makeSample();
     grid.sampleIrradiance([4, 4, 4], sample);
     const luma = 0.2126 * 1 + 0.7152 * 0.8 + 0.0722 * 0.5;
-    // Held ranks are the eight strongest: intensities 10..3 sum to 52; the
-    // dropped two (2 and 1) would push the total to 55.
-    expect(sample.claim).toBeCloseTo(52 * luma, 4);
+    // Held ranks are the eight strongest (intensities 10..3, 52); the
+    // overflow brings the dropped two (2 and 1), 55 in all.
+    expect(sample.claim).toBeCloseTo(55 * luma, 4);
   });
 
   it("mirrors the shader's flood-remainder curve on the CPU", () => {
@@ -694,8 +762,10 @@ describe("block-light ownership", () => {
     // unscaled legacy expression must be gone: covered fragments cannot
     // receive both the flood term and the analytic term.
     const fragment = SHADER_LIGHTING_CHUNK_SHADERS.fragment;
-    expect(fragment).toContain("smoothTorch * (1.2 * llFloodRemainder)");
-    expect(fragment).not.toContain("smoothTorch * 1.2;");
+    expect(fragment).toContain(
+      "smoothTorch * (uBlockLightGain * llFloodRemainder)",
+    );
+    expect(fragment).not.toContain("smoothTorch * uBlockLightGain;");
     // The cluster blend is guarded for bit-exactness at zero lights:
     // 1.0 - (1.0 - t) is not an IEEE identity, so the blend must not run
     // at all when nothing is clustered.
@@ -719,11 +789,13 @@ describe("block-light ownership", () => {
       cross: SHADER_LIGHTING_CROSS_CHUNK_SHADERS,
     };
     const forbidden =
-      /uLightGrid|uLightData|uLocalOwnership|uLocalMaskKnee|uLocalShadow|uLocalSpecularStrength|uLocalLightDebugMode|uClusteredLightCount|localLight|llFlood|llClaim|llWindowFade|clusterLight/;
+      /uLightGrid|uLightData|uLocalOwnership|uLocalMaskKnee|uLocalShadow|uLocalSpecularStrength|uLocalLightDebugMode|uClusteredLightCount|uAir|uRoomFill|localLight|llFlood|llClaim|llWindowFade|clusterLight/;
     for (const [name, variant] of Object.entries(variants)) {
       const stripped = stripLocalLightsFromFragment(variant.fragment);
       expect(stripped, name).not.toMatch(forbidden);
-      expect(stripped, name).toContain("vec3 torchLight = smoothTorch * 1.2;");
+      expect(stripped, name).toContain(
+        "vec3 torchLight = smoothTorch * uBlockLightGain;",
+      );
       expect(stripped, name).toContain(
         "float torchBrightness = max(max(smoothTorch.r, smoothTorch.g), smoothTorch.b);",
       );
@@ -781,6 +853,68 @@ const makeTable = (profiles: [number, BlockLightProfile][] = []) =>
     MAX_LIGHT_LEVEL,
   );
 
+describe("tight analytic kernel", () => {
+  afterEach(() => setBlockLightTuning({ tightKernel: true }));
+
+  it("falls off across a small room instead of lighting it evenly", () => {
+    // A warm fixed light of range 14: the floor beside it against a far
+    // corner of a small room.
+    const near = localLightFalloff(1, 14);
+    const far = localLightFalloff(6, 14);
+    setBlockLightTuning({ tightKernel: false });
+    const wideNear = localLightFalloff(1, 14);
+    const wideFar = localLightFalloff(6, 14);
+    expect(near / far).toBeGreaterThan(1.5 * (wideNear / wideFar));
+    // Darker across the room, with no hot disc beside the source.
+    expect(far).toBeLessThan(wideFar);
+    expect(near).toBeLessThan(wideNear * 1.05);
+  });
+});
+
+describe("lamplight white balance", () => {
+  afterEach(() => setBlockLightTuning({ adaptation: true }));
+
+  it("leaves daylight alone and turns a flame's orange toward warm", () => {
+    const out: [number, number, number] = [0, 0, 0];
+    expect(blockLightAdapt(1, 0.485, 0, 0, out)).toEqual([1, 0.485, 0]);
+    const [r, g, b] = blockLightAdapt(1, 0.485, 0, 1, out);
+    // A light touch: warm amber, not grey (0.485 -> about 0.52).
+    expect(g / r).toBeGreaterThan(0.5);
+    expect(g / r).toBeLessThan(0.56);
+    expect(b / r).toBeGreaterThan(0.05);
+    // Luminance is kept: only the colour moves.
+    expect(0.2126 * r + 0.7152 * g + 0.0722 * b).toBeCloseTo(
+      0.2126 + 0.7152 * 0.485,
+      5,
+    );
+    setBlockLightTuning({ adaptation: false });
+    expect(blockLightAdapt(1, 0.485, 0, 1, out)).toEqual([1, 0.485, 0]);
+  });
+});
+
+describe("masked window distance", () => {
+  it("reaches the flood's L1 diamond, not the Euclidean sphere", () => {
+    // (6, 6, 0): 8.49 blocks away but 12 flood steps — the flood's edge
+    // for a 12-level light, so the window must already be zero there.
+    const dist = Math.hypot(6, 6);
+    expect(maskedWindowDistance(dist, 6, -6, 0)).toBeCloseTo(12);
+    expect(localLightFalloff(maskedWindowDistance(dist, 6, 6, 0), 12)).toBe(0);
+    // Along an axis the two distances agree and nothing changes.
+    expect(maskedWindowDistance(5, 0, 5, 0)).toBe(5);
+  });
+
+  it("falls back to the Euclidean window behind the diamond switch", () => {
+    setBlockLightTuning({ diamond: false });
+    try {
+      expect(maskedWindowDistance(Math.hypot(6, 6), 6, 6, 0)).toBeCloseTo(
+        Math.hypot(6, 6),
+      );
+    } finally {
+      setBlockLightTuning({ diamond: true });
+    }
+  });
+});
+
 describe("BlockProfileTable", () => {
   it("derives a default profile from flood levels", () => {
     const table = makeTable();
@@ -795,7 +929,38 @@ describe("BlockProfileTable", () => {
     const color = profile.descriptor.color;
     if (!color) throw new Error("expected a derived color");
     expect(color[0]).toBeCloseTo(1);
-    expect(color[1]).toBeCloseTo(9 / 14);
+    // The flood's own hue (see hueLevels), so the core's hue matches
+    // the flood's: green sits five levels under red.
+    expect(color[1]).toBeCloseTo(1 - 5 / BLOCK_LIGHT_TRANSFER.hueLevels);
+  });
+
+  it("gives the flood a light's hue from its level gaps, brightness from its peak", () => {
+    const out: [number, number, number] = [0, 0, 0];
+    // A red-heavy 12/7/2 colour at its source: amber, not salmon.
+    blockLightCurveRGB(12 / 15, 7 / 15, 2 / 15, out);
+    expect(out[0]).toBeCloseTo(blockLightCurve(12 / 15), 5);
+    expect(out[1] / out[0]).toBeCloseTo(7 / 12, 3);
+    expect(out[2] / out[0]).toBeCloseTo(2 / 12, 3);
+    // A dead channel stays dead.
+    blockLightCurveRGB(5 / 15, 0, 0, out);
+    expect(out[1]).toBe(0);
+    // The per-channel curve behind the switch.
+    setBlockLightTuning({});
+    BLOCK_LIGHT_TUNING.hueLevels.value = 0;
+    blockLightCurveRGB(12 / 15, 7 / 15, 2 / 15, out);
+    expect(out[1]).toBeCloseTo(blockLightCurve(7 / 15), 5);
+    BLOCK_LIGHT_TUNING.hueLevels.value = BLOCK_LIGHT_TRANSFER.hueLevels;
+  });
+
+  it("keeps the legacy channel ratio behind the analyticHue switch", () => {
+    setBlockLightTuning({ analyticHue: false });
+    try {
+      const color = makeTable().profileFor(TORCH.id)?.descriptor.color;
+      if (!color) throw new Error("expected a derived color");
+      expect(color[1]).toBeCloseTo(9 / 14);
+    } finally {
+      setBlockLightTuning({ analyticHue: true });
+    }
   });
 
   it("lets a declared profile override the defaults", () => {
@@ -1014,5 +1179,672 @@ describe("setBlockProfile timing", () => {
       LIGHT_FLAG_SHADOW_REQUEST,
     );
     lights.dispose();
+  });
+});
+
+describe("block-light transfer (new model)", () => {
+  const makeSample = () => ({
+    color: [0, 0, 0] as [number, number, number],
+    count: 0,
+    claim: 0,
+    windowFade: 1,
+  });
+
+  it("keeps the rim seamless and hands back exactly the flood outside", () => {
+    const registry = new LightSourceRegistry(8);
+    registry.add(pointLight({ range: 32, intensity: 1 }), 80, 4, 4);
+    const grid = makeGrid(registry, { analyticRadius: 96 });
+    grid.update(0, 0, 0, makeStats());
+    const floodLevel = 0.6;
+    const floodVisible = blockLightCurve(floodLevel);
+    const combinedAt = (x: number) => {
+      const sample = makeSample();
+      grid.sampleIrradiance([x, 4, 4], sample);
+      const remainder = blockLightFloodRemainder({
+        scaledClaim: sample.claim,
+        floodLevel,
+        windowFade: sample.windowFade,
+      });
+      const lum =
+        0.2126 * sample.color[0] +
+        0.7152 * sample.color[1] +
+        0.0722 * sample.color[2];
+      return lum + remainder * floodVisible;
+    };
+    // The hard window boundary, and the pure-flood far side.
+    expect(Math.abs(combinedAt(95.9) - combinedAt(96.1))).toBeLessThan(0.02);
+    expect(combinedAt(100)).toBeCloseTo(floodVisible, 6);
+    // And the analytic light never rises moving away from its source.
+    const line = [80, 84, 88, 92, 95.9];
+    const combined = line.map(combinedAt);
+    for (let n = 1; n < combined.length; n++)
+      expect(combined[n]).toBeLessThanOrEqual(combined[n - 1] + 1e-9);
+  });
+
+  it("decays geometrically per flood level, so a coloured light keeps its hue", () => {
+    // Glowberry R12 G7 B2: the G/R ratio stays put while both channels live.
+    const ratioAt = (d: number) =>
+      blockLightCurve((7 - d) / 15) / blockLightCurve((12 - d) / 15);
+    // Modelled in the plan: G/R .35, .31, .25 at d = 0, 2, 4 (legacy .59,
+    // .37, .14) — the hue walk is roughly halved.
+    expect(ratioAt(2) / ratioAt(0)).toBeGreaterThan(0.85);
+    expect(ratioAt(4) / ratioAt(0)).toBeGreaterThan(0.65);
+    setBlockLightTuning({ curve: false });
+    const legacyWalk = ratioAt(4) / ratioAt(0);
+    setBlockLightTuning({ curve: true });
+    expect(ratioAt(4) / ratioAt(0)).toBeGreaterThan(legacyWalk * 1.6);
+    // Even steps: no plateau then cliff. Each level loses a similar share.
+    const levels = [15, 13, 11, 9, 7, 5].map((l) => blockLightCurve(l / 15));
+    for (let n = 1; n < levels.length; n++)
+      expect(levels[n] / levels[n - 1]).toBeGreaterThan(0.55);
+    expect(blockLightCurve(0)).toBe(0);
+    expect(blockLightCurve(1)).toBeCloseTo(1, 9);
+  });
+
+  it("gives the analytic kernel a hot core and the same zero at range", () => {
+    expect(localLightFalloff(0, 12)).toBeGreaterThan(1.5);
+    expect(localLightFalloff(12, 12)).toBe(0);
+    let previous = Infinity;
+    for (let d = 0; d < 12; d += 0.5) {
+      const f = localLightFalloff(d, 12);
+      expect(f).toBeLessThanOrEqual(previous);
+      previous = f;
+    }
+  });
+});
+
+describe("temporal stability (lights never pop as the camera moves)", () => {
+  const FRAME_MS = 16;
+
+  // Six equal lamps around one 8-block cell, more than its four slots: the
+  // corner of a lantern-lit room.
+  const crowdCell = (registry: LightSourceRegistry) => {
+    const spots: [number, number, number][] = [
+      [1, 4, 1],
+      [7, 4, 1],
+      [1, 4, 7],
+      [7, 4, 7],
+      [4, 4, -5],
+      [4, 4, 13],
+    ];
+    return spots.map(([x, y, z]) =>
+      registry.add(pointLight({ range: 12, isStatic: true }), x, y, z),
+    );
+  };
+
+  const walk = (
+    grid: LightClusterGrid,
+    fromX: number,
+    toX: number,
+    onFrame: (frame: number) => void,
+  ) => {
+    const stats = makeStats();
+    let now = 0;
+    const steps = Math.abs(toX - fromX) * 4;
+    for (let n = 0; n <= steps; n++) {
+      now += FRAME_MS;
+      const x = fromX + ((toX - fromX) * n) / steps;
+      grid.update(x, 4, 4, stats, now);
+      onFrame(n);
+    }
+  };
+
+  const fullWeightSet = (grid: LightClusterGrid) =>
+    cellSlots(grid, 0, 0, 0)
+      .filter((slot) => slot.weight === 255)
+      .map((slot) => slot.index)
+      .sort((a, b) => a - b)
+      .join(",");
+
+  it("keeps a crowded cell's lights while the camera walks past", () => {
+    const registry = new LightSourceRegistry(16);
+    crowdCell(registry);
+    const grid = makeGrid(registry, { maxLightsPerCell: 4 });
+    const seen = new Set<string>();
+    walk(grid, -40, 40, () => seen.add(fullWeightSet(grid)));
+    expect(seen.size).toBe(1);
+    expect([...seen][0].split(",")).toHaveLength(4);
+  });
+
+  it("reproduces the legacy pop: camera-ranked cells change as it walks", () => {
+    const registry = new LightSourceRegistry(16);
+    crowdCell(registry);
+    const grid = makeGrid(registry, {
+      maxLightsPerCell: 4,
+      temporalStability: false,
+    });
+    const seen = new Set<string>();
+    walk(grid, -40, 40, () => seen.add(fullWeightSet(grid)));
+    expect(seen.size).toBeGreaterThan(1);
+  });
+
+  it("fades a light out of the selection instead of dropping it", () => {
+    const registry = new LightSourceRegistry(8);
+    const near = registry.add(
+      pointLight({ range: 12, isStatic: true }),
+      4,
+      4,
+      4,
+    );
+    registry.add(pointLight({ range: 12, isStatic: true }), 60, 4, 4);
+    const nearIndex = registry.resolve(near);
+    const weightOfNear = (grid: LightClusterGrid) =>
+      cellSlots(grid, 0, 0, 0).find((slot) => slot.index === nearIndex)
+        ?.weight ?? 0;
+
+    const stable = makeGrid(registry, { maxClusteredLights: 1 });
+    let previous = -1;
+    let largestStep = 0;
+    let sawPartial = false;
+    walk(stable, -10, 90, () => {
+      const weight = weightOfNear(stable);
+      if (previous >= 0) {
+        largestStep = Math.max(largestStep, Math.abs(weight - previous));
+      }
+      if (weight > 0 && weight < 255) sawPartial = true;
+      previous = weight;
+    });
+    expect(sawPartial).toBe(true);
+    // A 320 ms fade at 16 ms frames, smoothstepped: well under a fifth of
+    // the range in any one frame — never 255 to 0.
+    expect(largestStep).toBeLessThan(40);
+
+    const legacy = makeGrid(registry, {
+      maxClusteredLights: 1,
+      temporalStability: false,
+    });
+    previous = -1;
+    largestStep = 0;
+    walk(legacy, -10, 90, () => {
+      const weight = weightOfNear(legacy);
+      if (previous >= 0) {
+        largestStep = Math.max(largestStep, Math.abs(weight - previous));
+      }
+      previous = weight;
+    });
+    expect(largestStep).toBe(255);
+  });
+
+  it("crossfades the lights a cell sheds when the resolution gate engages", () => {
+    const registry = new LightSourceRegistry(16);
+    crowdCell(registry);
+    const grid = makeGrid(registry, {
+      maxLightsPerCell: 4,
+      highResolutionLightsPerCell: 2,
+    });
+    const stats = makeStats();
+    let now = 0;
+    const frame = () => grid.update(4, 4, 4, stats, (now += FRAME_MS));
+    frame();
+    expect(cellSlots(grid, 0, 0, 0)).toHaveLength(4);
+
+    const sample = {
+      color: [0, 0, 0] as [number, number, number],
+      count: 0,
+      claim: 0,
+      windowFade: 1,
+    };
+    const claimAt = () => {
+      grid.sampleIrradiance([4, 4, 4], sample);
+      return sample.claim;
+    };
+    let previousClaim = claimAt();
+    const fullClaim = previousClaim;
+
+    // A Retina buffer, well past the gate's hysteresis band.
+    grid.setRenderPixels(5_000_000);
+    frame();
+    const shedding = cellSlots(grid, 0, 0, 0);
+    expect(shedding.filter((slot) => slot.weight === 255)).toHaveLength(2);
+    expect(shedding.filter((slot) => slot.weight < 255)).toHaveLength(2);
+    let largestClaimStep = 0;
+    for (let n = 0; n < 40; n++) {
+      frame();
+      const claim = claimAt();
+      largestClaimStep = Math.max(
+        largestClaimStep,
+        Math.abs(claim - previousClaim),
+      );
+      previousClaim = claim;
+    }
+    expect(cellSlots(grid, 0, 0, 0)).toHaveLength(2);
+    expect(largestClaimStep).toBeLessThan(fullClaim * 0.15);
+
+    // Hovering just under the threshold does not flip it back.
+    grid.setRenderPixels(2_000_000);
+    frame();
+    expect(grid.isHighResolutionGate).toBe(true);
+    grid.setRenderPixels(1_000_000);
+    frame();
+    expect(grid.isHighResolutionGate).toBe(false);
+  });
+
+  it("carries a moving light into new cells without fading it in", () => {
+    // A held torch walks with its holder: the cells it reaches must light
+    // at once, or its leading edge would lag a fade behind it.
+    const registry = new LightSourceRegistry(8);
+    const held = registry.add(pointLight({ range: 6 }), 4, 4, 4);
+    const heldIndex = registry.resolve(held);
+    const grid = makeGrid(registry);
+    const stats = makeStats();
+    let now = 0;
+    grid.update(0, 4, 0, stats, (now += FRAME_MS));
+    for (let x = 4; x <= 40; x += 1) {
+      registry.setPosition(held, x, 4, 4);
+      grid.update(0, 4, 0, stats, (now += FRAME_MS));
+      const cellX = Math.floor(x / 8);
+      const slot = cellSlots(grid, cellX, 0, 0).find(
+        (entry) => entry.index === heldIndex,
+      );
+      expect(slot?.weight).toBe(255);
+    }
+  });
+
+  it("never steps the window rim when the window scrolls a cell", () => {
+    const registry = new LightSourceRegistry(8);
+    registry.add(pointLight({ range: 32 }), 80, 4, 4);
+    const sample = {
+      color: [0, 0, 0] as [number, number, number],
+      count: 0,
+      claim: 0,
+      windowFade: 1,
+    };
+    const largestFadeStep = (temporalStability: boolean) => {
+      const grid = makeGrid(registry, {
+        analyticRadius: 96,
+        temporalStability,
+      });
+      const stats = makeStats();
+      let previous = -1;
+      let largest = 0;
+      // A quarter block per frame, across the camera-cell boundary at x=8,
+      // sampling a point in the rim band.
+      for (let x = 4; x <= 12; x += 0.25) {
+        grid.update(x, 4, 4, stats);
+        grid.sampleIrradiance([88, 4, 4], sample);
+        if (previous >= 0) {
+          largest = Math.max(largest, Math.abs(sample.windowFade - previous));
+        }
+        previous = sample.windowFade;
+      }
+      return largest;
+    };
+    expect(largestFadeStep(true)).toBeLessThanOrEqual(0.25 / 16 + 1e-9);
+    expect(largestFadeStep(false)).toBeGreaterThanOrEqual(0.4);
+  });
+});
+
+describe("switching the stable layer on and off", () => {
+  it("leaves no texel behind that a later pass would hand to another light", () => {
+    // Legacy then stable (and back): every nonzero slot after a switch must
+    // be one this layer wrote for a cell the light really reaches.
+    const registry = new LightSourceRegistry(64);
+    for (let i = 0; i < 24; i++) {
+      registry.add(
+        pointLight({ range: 10 + (i % 4) * 4, isStatic: true }),
+        (i % 6) * 9 - 20,
+        4,
+        Math.floor(i / 6) * 9 - 10,
+      );
+    }
+    const grid = makeGrid(registry, { maxLightsPerCell: 4 });
+    const stats = makeStats();
+    const internals = grid as unknown as {
+      gridData: Uint16Array;
+    } & GridInternals;
+    const assertEveryTexelReaches = () => {
+      const { positions, ranges } = registry;
+      const origin = grid.uniforms.gridOrigin.value;
+      const originCell = [origin.x / 8, origin.y / 8, origin.z / 8];
+      for (let rx = 0; rx < 24; rx++) {
+        for (let ry = 0; ry < 12; ry++) {
+          for (let rz = 0; rz < 24; rz++) {
+            const cx = originCell[0] + rx;
+            const cy = originCell[1] + ry;
+            const cz = originCell[2] + rz;
+            for (const slot of cellSlots(grid, cx, cy, cz)) {
+              const i = slot.index;
+              const dx = Math.max(
+                cx * 8 - positions[i * 3],
+                0,
+                positions[i * 3] - cx * 8 - 8,
+              );
+              const dy = Math.max(
+                cy * 8 - positions[i * 3 + 1],
+                0,
+                positions[i * 3 + 1] - cy * 8 - 8,
+              );
+              const dz = Math.max(
+                cz * 8 - positions[i * 3 + 2],
+                0,
+                positions[i * 3 + 2] - cz * 8 - 8,
+              );
+              expect(Math.hypot(dx, dy, dz)).toBeLessThan(ranges[i] + 1e-6);
+            }
+          }
+        }
+      }
+      expect(internals.gridData.length).toBeGreaterThan(0);
+    };
+    let now = 0;
+    const walk = (fromX: number, toX: number) => {
+      for (let x = fromX; x <= toX; x += 2) {
+        grid.update(x, 4, 0, stats, (now += 16));
+      }
+    };
+    grid.setTemporalStability(false);
+    walk(-60, 0);
+    grid.setTemporalStability(true);
+    walk(0, 60);
+    assertEveryTexelReaches();
+    grid.setTemporalStability(false);
+    walk(60, 120);
+    assertEveryTexelReaches();
+  });
+});
+
+describe("toroidal cell storage", () => {
+  it("finds the packed slots from the shader's integer lookup, anywhere", () => {
+    // localLightCell: in-window cell + the origin's storage offset, wrapped
+    // once. It must land on the storage cell the packer wrote for the same
+    // world cell, at negative coordinates and after the window scrolls.
+    const registry = new LightSourceRegistry(8);
+    const spots: Vec3Tuple[] = [
+      [-205.5, -3.5, -77.25],
+      [-199.5, 12.25, -90.5],
+      [-212.75, 4.5, -70.5],
+    ];
+    for (const [x, y, z] of spots) {
+      registry.add(pointLight({ range: 6, isStatic: true }), x, y, z);
+    }
+    const grid = makeGrid(registry);
+    const stats = makeStats();
+    const sample = {
+      color: [0, 0, 0] as [number, number, number],
+      count: 0,
+      claim: 0,
+      windowFade: 1,
+    };
+    for (const camera of [
+      [-190, 2, -60],
+      [-205, 4, -80],
+      [-230, -10, -95],
+    ] as Vec3Tuple[]) {
+      grid.update(camera[0], camera[1], camera[2], stats);
+      for (const [x, y, z] of spots) {
+        grid.sampleIrradiance([x + 0.5, y, z], sample);
+        expect(sample.count).toBeGreaterThan(0);
+        expect(sample.claim).toBeGreaterThan(0);
+      }
+    }
+  });
+});
+
+type Vec3Tuple = [number, number, number];
+
+describe("SectionTracker proxy identity", () => {
+  it("keeps a rescanned proxy's handle when nothing about it changed", () => {
+    const registry = new LightSourceRegistry(64);
+    const tracker = new SectionTracker(registry, CHUNK_SIZE, MAX_HEIGHT, 2);
+    const table = makeTable();
+    const chunk = makeChunk(0, 0);
+    // A dense lava field in one corner: aggregated into proxies.
+    for (let x = 0; x < 6; x++) {
+      for (let z = 0; z < 6; z++) setVoxel(chunk, x, 2, z, LAVA.id);
+    }
+    const key = tracker.sectionKey(0, 0, 0);
+    tracker.rescanSection(key, chunk, 0, table);
+    const handles = () =>
+      [...registry.aliveIndices.slice(0, registry.aliveCount)]
+        .map((i) => registry.handleAt(i))
+        .sort((a, b) => a - b);
+    const before = handles();
+    expect(before.length).toBeGreaterThan(0);
+
+    // Re-arrived, unchanged: every proxy is the same light.
+    tracker.rescanSection(key, chunk, 0, table);
+    expect(handles()).toEqual(before);
+
+    // An edit far from the field leaves its proxies alone too.
+    setVoxel(chunk, 12, 2, 12, STONE.id);
+    tracker.rescanSection(key, chunk, 0, table);
+    expect(handles()).toEqual(before);
+  });
+});
+
+describe("a dynamic light keeps a slot past the cell cap", () => {
+  // A held torch is a dynamic light with no flood behind it: a cell whose
+  // capped list leaves it out gets none of its light at all, a hard line on
+  // the 8-block cell border. On a Retina buffer the high tier keeps two
+  // lights a cell, so two placed torches were enough.
+  const FRAME_MS = 16;
+  const HELD: [number, number, number] = [4.3, 4.5, 4.3];
+  // Placed torches shine red and the held one blue, so the held torch's
+  // own light reads straight off the blue channel.
+  const placedTorch = () =>
+    pointLight({ isStatic: true, intensity: 1.1, range: 13, color: [1, 0, 0] });
+  const heldTorch = () =>
+    pointLight({ intensity: 1, range: 12, color: [0, 0, 1] });
+
+  const settle = (placed: [number, number, number][], withHeld: boolean) => {
+    const registry = new LightSourceRegistry(16);
+    for (const [x, y, z] of placed) registry.add(placedTorch(), x, y, z);
+    const held = withHeld ? registry.add(heldTorch(), ...HELD) : null;
+    const grid = makeGrid(registry, {
+      maxLightsPerCell: 4,
+      highResolutionLightsPerCell: 2,
+    });
+    grid.setRenderPixels(5_000_000);
+    const stats = makeStats();
+    let now = 0;
+    for (let n = 0; n < 40; n++) {
+      grid.update(HELD[0], HELD[1] + 1, HELD[2], stats, (now += FRAME_MS));
+    }
+    return { grid, heldIndex: held === null ? -1 : registry.resolve(held) };
+  };
+
+  /** The held torch's own light on the floor at x. */
+  const heldLightAlong = (placed: [number, number, number][]) => {
+    const { grid } = settle(placed, true);
+    return (x: number) => {
+      const sample = {
+        color: [0, 0, 0] as [number, number, number],
+        count: 0,
+        claim: 0,
+        windowFade: 1,
+      };
+      grid.sampleIrradiance([x, 4.01, 4.5], sample);
+      return sample.color[2];
+    };
+  };
+
+  /** Its light along the floor must not care who else lights the cells. */
+  const expectUncrowded = (placed: [number, number, number][]) => {
+    const held = heldLightAlong(placed);
+    const alone = heldLightAlong([]);
+    for (const x of [2.5, 4.5, 7.5, 8.5, 9.5, 12.5]) {
+      expect(alone(x)).toBeGreaterThan(0);
+      expect(held(x), `held light at x=${x}`).toBeCloseTo(alone(x), 4);
+    }
+  };
+
+  it("crosses into a cell two placed torches fill", () => {
+    expectUncrowded([
+      [12.5, 5.7, 2.5],
+      [13.5, 5.7, 6.5],
+    ]);
+  });
+
+  it("lights its own cell when placed torches share it", () => {
+    // Inside one cell every light's falloff is 1, so a placed torch (1.1)
+    // outranked the held one (1.0) however far away it stood.
+    expectUncrowded([
+      [1.5, 5.7, 1.5],
+      [6.5, 5.7, 6.5],
+    ]);
+  });
+
+  it("takes an extra slot instead of evicting a placed light", () => {
+    const placed: [number, number, number][] = [
+      [12.5, 5.7, 2.5],
+      [13.5, 5.7, 6.5],
+    ];
+    const { grid, heldIndex } = settle(placed, true);
+    const slots = cellSlots(grid, 1, 0, 0);
+    expect(slots).toHaveLength(3);
+    expect(slots.every((slot) => slot.weight === 255)).toBe(true);
+    expect(slots.map((slot) => slot.index)).toContain(heldIndex);
+
+    // Static lights alone still keep the cap.
+    const alone = settle(placed.concat([[10.5, 5.7, 1.5]]), false).grid;
+    expect(
+      cellSlots(alone, 1, 0, 0).filter((slot) => slot.weight === 255),
+    ).toHaveLength(2);
+  });
+});
+
+describe("high-resolution buffers", () => {
+  it("keep the tier's lights per cell by default, so no lamp is shed at a cell edge", () => {
+    // Three lamps sharing cells, as on a lit floor: at the old high-res cap
+    // of 2 one of them dropped back to its flood in some cells and drew a
+    // straight line along the cell edge on every Retina screen.
+    const registry = new LightSourceRegistry(16);
+    for (const [x, z] of [
+      [186.5, 2.5],
+      [188.5, 8.5],
+      [190.5, 2.5],
+    ]) {
+      registry.add(pointLight({ range: 12, isStatic: true }), x, 64.5, z);
+    }
+    const grid = makeGrid(registry, { maxLightsPerCell: 4 });
+    grid.setRenderPixels(5_000_000);
+    grid.update(188, 70, 5, makeStats(), 0);
+    expect(grid.isHighResolutionGate).toBe(true);
+    for (const [cellX, cellZ] of [
+      [23, 0],
+      [24, 0],
+      [23, 1],
+      [24, 1],
+    ]) {
+      expect(cellSlots(grid, cellX, 8, cellZ)).toHaveLength(3);
+    }
+  });
+});
+
+describe("a cell's overflow lights what its slots cannot", () => {
+  const FRAME_MS = 16;
+  const sampleAt = (
+    grid: LightClusterGrid,
+    x: number,
+    y: number,
+    z: number,
+  ) => {
+    const sample = {
+      color: [0, 0, 0] as [number, number, number],
+      count: 0,
+      claim: 0,
+      windowFade: 1,
+    };
+    grid.sampleIrradiance([x, y, z], sample);
+    return sample;
+  };
+  const luma = ([r, g, b]: [number, number, number]) =>
+    0.2126 * r + 0.7152 * g + 0.0722 * b;
+
+  it("lights both sides of a cell edge alike when a cell has to drop a lamp", () => {
+    // The floor from the 16 Oct report: three lamps, two slots a cell. The
+    // cell past x=192 slots lamps 1 and 2 and dropped lamp 0, which then
+    // fell back to its flood: a straight line along x=192.
+    const registry = new LightSourceRegistry(8);
+    for (const [x, z] of [
+      [186.5, 2.5],
+      [188.5, 8.5],
+      [190.5, 2.5],
+    ]) {
+      registry.add(pointLight({ range: 12, isStatic: true }), x, 64.5, z);
+    }
+    const grid = makeGrid(registry, { maxLightsPerCell: 2 });
+    grid.update(188, 70, 5, makeStats(), 0);
+    expect(cellSlotIndices(grid, 24, 8, 0)).toHaveLength(2);
+    for (const z of [1.5, 4.5, 7.5]) {
+      const west = sampleAt(grid, 191.999, 64.01, z);
+      const east = sampleAt(grid, 192.001, 64.01, z);
+      expect(luma(east.color)).toBeCloseTo(luma(west.color), 2);
+      expect(east.claim).toBeCloseTo(west.claim, 2);
+    }
+  });
+
+  it("fades a newly placed light in where it overflows instead of popping", () => {
+    const registry = new LightSourceRegistry(8);
+    registry.add(
+      pointLight({ range: 12, isStatic: true, intensity: 3 }),
+      4,
+      4,
+      4,
+    );
+    registry.add(
+      pointLight({ range: 12, isStatic: true, intensity: 3 }),
+      5,
+      4,
+      4,
+    );
+    const grid = makeGrid(registry, { maxLightsPerCell: 2 });
+    let now = 0;
+    const stats = makeStats();
+    grid.update(4, 4, 4, stats, now);
+    for (let n = 0; n < 40; n++) grid.update(4, 4, 4, stats, (now += FRAME_MS));
+    const before = luma(sampleAt(grid, 6, 4, 4).color);
+
+    // Weaker than both, so the cell's two slots stay theirs: the new lamp
+    // only ever lights this cell through the overflow.
+    registry.add(
+      pointLight({ range: 12, isStatic: true, intensity: 1 }),
+      6,
+      4,
+      6,
+    );
+    grid.update(4, 4, 4, stats, (now += FRAME_MS));
+    const added = luma(sampleAt(grid, 6, 4, 4).color) - before;
+    let previous = added;
+    for (let n = 0; n < 40; n++) {
+      grid.update(4, 4, 4, stats, (now += FRAME_MS));
+      const current = luma(sampleAt(grid, 6, 4, 4).color) - before;
+      expect(current).toBeGreaterThanOrEqual(previous - 1e-9);
+      previous = current;
+    }
+    expect(added).toBeLessThan(0.2 * previous);
+    expect(previous).toBeGreaterThan(0);
+  });
+
+  it("hands a light from its slot to the overflow without a dip", () => {
+    const registry = new LightSourceRegistry(8);
+    registry.add(
+      pointLight({ range: 12, isStatic: true, intensity: 2 }),
+      4,
+      4,
+      4,
+    );
+    const grid = makeGrid(registry, { maxLightsPerCell: 1 });
+    let now = 0;
+    const stats = makeStats();
+    grid.update(4, 4, 4, stats, now);
+    for (let n = 0; n < 40; n++) grid.update(4, 4, 4, stats, (now += FRAME_MS));
+    const alone = luma(sampleAt(grid, 6, 4, 4).color);
+
+    // A brighter lamp on the same spot takes the cell's one slot; the first
+    // lamp's slot fades out while the overflow takes it up.
+    registry.add(
+      pointLight({ range: 12, isStatic: true, intensity: 4 }),
+      4,
+      4,
+      4,
+    );
+    for (let n = 0; n < 40; n++) {
+      grid.update(4, 4, 4, stats, (now += FRAME_MS));
+      expect(luma(sampleAt(grid, 6, 4, 4).color)).toBeGreaterThanOrEqual(
+        alone - 1e-6,
+      );
+    }
+    expect(luma(sampleAt(grid, 6, 4, 4).color)).toBeCloseTo(3 * alone, 4);
   });
 });

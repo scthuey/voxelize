@@ -1,4 +1,5 @@
 mod bookkeeping;
+mod chat_log;
 mod clients;
 mod components;
 mod config;
@@ -6,13 +7,16 @@ pub mod cpu_profiler;
 mod entities;
 mod entity_ids;
 mod events;
+mod far_terrain;
 mod fixed_step;
 mod generators;
+mod init_registry;
 mod interests;
 pub mod items;
 mod lag_comp;
 mod messages;
 mod metadata;
+pub mod perf_toggles;
 mod physics;
 mod profiler;
 mod registry;
@@ -21,6 +25,7 @@ pub(crate) mod shared_pools;
 mod stats;
 pub mod system_profiler;
 mod systems;
+pub(crate) mod tick_stats;
 mod types;
 mod utils;
 mod voxels;
@@ -35,6 +40,7 @@ use metadata::WorldMetadata;
 use nanoid::nanoid;
 use profiler::Profiler;
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use serde_json::{json, Value};
 use specs::{
     shred::{Fetch, FetchMut, Resource},
@@ -55,12 +61,14 @@ use crate::{
     perf::{self, WorldPerfMetrics},
     protocols::Peer,
     server::{Message, MessageType, WsSender},
-    EntityOperation, EntityProtocol, MethodProtocol, PeerProtocol, Server, Vec2, Vec3,
+    EntityOperation, EntityProtocol, MethodProtocol, PeerProtocol, Server, SessionIdentity, Vec2,
+    Vec3,
 };
 
 use super::common::ClientFilter;
 
 pub use bookkeeping::*;
+pub use chat_log::*;
 pub use clients::*;
 pub use components::*;
 pub use config::*;
@@ -68,21 +76,38 @@ pub use cpu_profiler::*;
 pub use entities::*;
 pub use entity_ids::*;
 pub use events::*;
+pub use far_terrain::*;
 pub use fixed_step::*;
 pub use generators::*;
+pub use init_registry::*;
 pub use interests::*;
 pub use items::*;
 pub use lag_comp::*;
 pub use messages::*;
+pub use perf_toggles::{perf_toggle, perf_toggles, set_perf_toggle, PerfToggle, PerfToggleState};
 pub use physics::*;
 pub use registry::*;
 pub use replication::*;
 pub use stats::*;
 pub use system_profiler::*;
+pub use shared_pools::{
+    pool_inflight, run_on_tick_pool, tick_split, PoolInflight, TICK_SPLIT_MIN_BODIES,
+    TICK_SPLIT_MIN_SEARCHES,
+};
 pub use systems::*;
+pub use tick_stats::{
+    get_tick_stats, get_tick_stats_all, thread_cpu_time, Percentiles, TickStatsBrief,
+    TickStatsReport, TickWindowReport, TICK_STATS_CAPACITY,
+};
 pub use types::*;
 pub use utils::*;
 pub use voxels::*;
+
+mod client_events;
+pub use client_events::{
+    RelayedEvent, RELAY_BURST, RELAY_PER_SECOND, RELAY_POSITION_REACH,
+    VOXELIZE_BUILTIN_ARM_SWING_EVENT, VOXELIZE_BUILTIN_RELAY_EVENT,
+};
 
 pub type Transports = HashMap<String, WsSender>;
 
@@ -96,12 +121,18 @@ mod lag_comp_wiring_tests;
 mod lifecycle;
 #[cfg(test)]
 mod mesher_readiness_tests;
+#[cfg(test)]
+mod unload_readiness_tests;
+mod method_guard;
 mod sessions;
 mod spawning;
 mod sync;
 
 pub use client_body::*;
 use dispatcher::dispatcher;
+pub use method_guard::{
+    MethodGuard, MethodIndex, MethodVerdict, METHOD_REJECTED_REPLY, UNHANDLED_METHOD_REPLY,
+};
 pub use sync::*;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -188,6 +219,16 @@ pub struct World {
 
     extra_init_data: HashMap<String, serde_json::Value>,
 
+    /// The block registry exactly as the INIT packet carries it, serialized
+    /// once on the first join and shared by every world of the server (see
+    /// [`SharedInitRegistry`]). The registry is fixed when the server is built
+    /// (`ServerBuilder::registry`) and cloned into every world, so the string
+    /// cannot go stale; before this, every join re-walked every block
+    /// definition into a `Value` tree and back into text - megabytes of
+    /// allocation on the world thread, per player, for an answer that never
+    /// changes.
+    init_registry: SharedInitRegistry,
+
     items: Option<ItemRegistry>,
 
     addr: Option<Addr<SyncWorld>>,
@@ -206,12 +247,43 @@ pub struct World {
     /// a sim-state input: the sim's time is `step_count * DT`. `None` until the
     /// first tick, and unused entirely when `fixed_timestep` is `None`.
     last_fixed_tick_at: Option<Instant>,
+
+    /// Per-tick timing ring and slow-tick flight recorder, served at
+    /// `/tick/stats`. Touched only by this world's thread.
+    tick_recorder: tick_stats::TickRecorder,
+
+    /// Paces dispatches while no client is in the world
+    /// (`WorldConfig::hibernation_interval_ms`).
+    hibernation: tick_stats::Hibernation,
 }
 
 // Define messages for the World actor
 #[derive(ActixMessage)]
 #[rtype(result = "()")]
-pub(crate) struct Tick;
+pub(crate) struct Tick {
+    /// The timer slot this tick was scheduled for; the world measures its
+    /// lateness against it.
+    pub(crate) scheduled_at: Instant,
+    /// The Server's tick period, the budget slow ticks are judged against.
+    pub(crate) period: Duration,
+}
+
+impl Tick {
+    /// A tick due now at the default period (tests, preload nudges).
+    pub(crate) fn now() -> Self {
+        Self {
+            scheduled_at: Instant::now(),
+            period: tick_stats::DEFAULT_TICK_PERIOD,
+        }
+    }
+
+    pub(crate) fn scheduled(scheduled_at: Instant, period: Duration) -> Self {
+        Self {
+            scheduled_at,
+            period,
+        }
+    }
+}
 
 #[derive(ActixMessage)]
 #[rtype(result = "()")]
@@ -272,6 +344,12 @@ pub(crate) struct ClientJoinRequest {
     pub sender: WsSender,
     pub preferences: ClientPreferencesPatch,
     pub motion_protocol: MotionProtocol,
+    /// Verified session identity, published to the world's
+    /// `SessionIdentities` resource before the client entity is built.
+    pub identity: SessionIdentity,
+    /// Digest of the block registry the client already holds, from its
+    /// JOIN. An INIT answering a matching digest leaves the registry out.
+    pub registry_digest: Option<String>,
 }
 
 #[derive(ActixMessage)]
@@ -388,9 +466,13 @@ impl World {
             config.default_time,
         ));
 
+        ecs.insert(ChatLog::from_config(config));
         ecs.insert(Mesher::new());
+        ecs.insert(RandomTickCatchUp::new());
         ecs.insert(Pipeline::new());
         ecs.insert(Clients::new());
+        ecs.insert(OnRequestMetadataClients::default());
+        ecs.insert(SessionIdentities::new());
         ecs.insert(MessageQueues::new());
         ecs.insert(Physics::new());
         ecs.insert(Events::new());
@@ -444,11 +526,14 @@ impl World {
             transport_handle: None,
             command_handle: None,
             extra_init_data: HashMap::default(),
+            init_registry: SharedInitRegistry::default(),
             items: None,
             addr: None,
             server_addr: None,
             inbound_state: Arc::new(InboundStateBuffer::new()),
             last_fixed_tick_at: None,
+            tick_recorder: tick_stats::TickRecorder::new(name),
+            hibernation: tick_stats::Hibernation::default(),
         };
 
         world.set_method_handle("vox-builtin:get-stats", |world, client_id, _| {
@@ -472,6 +557,37 @@ impl World {
                 ClientFilter::Direct(client_id.to_owned()),
             ));
         });
+
+        // `CHAT_HISTORY_METHOD`, spelled out so a source scan of registered
+        // method names can read it.
+        world.set_method_handle("vox-builtin:chat-history", |world, client_id, payload| {
+            world.reply_chat_history(client_id, payload);
+        });
+
+        // `ON_REQUEST_METADATA_METHOD`, spelled out so a source scan of
+        // registered method names can read it.
+        world.set_method_handle(
+            "vox-builtin:on-request-metadata",
+            |world, client_id, payload| {
+                let on = serde_json::from_str::<Value>(payload)
+                    .ok()
+                    .and_then(|value| value.get("on").and_then(Value::as_bool));
+                let Some(on) = on else {
+                    world.reject_method(
+                        client_id,
+                        ON_REQUEST_METADATA_METHOD,
+                        "payload must be {\"on\": true} or {\"on\": false}",
+                    );
+                    return;
+                };
+                let mut clients = world.write_resource::<OnRequestMetadataClients>();
+                if on {
+                    clients.0.insert(client_id.to_owned());
+                } else {
+                    clients.0.remove(client_id);
+                }
+            },
+        );
 
         world.set_method_handle("vox-builtin:set-time", |world, _, payload| {
             let payload: BuiltInSetTimeMethodPayload = serde_json::from_str(payload)
@@ -615,8 +731,19 @@ impl World {
         // self.prepare();
         // self.preload();
 
+        // One named thread per world, raised to the tick tier as it starts
+        // (the factory runs on the new thread) so it is not queued behind
+        // background work for a core.
+        let thread_name = format!("world-{}", self.name);
         let world = Arc::new(RwLock::new(self));
-        let addr = SyncArbiter::start(1, move || SyncWorld(world.clone()));
+        let addr = SyncArbiter::start_with_thread_builder(
+            1,
+            move || std::thread::Builder::new().name(thread_name.clone()),
+            move || {
+                shared_pools::raise_to_tick_tier();
+                SyncWorld(world.clone())
+            },
+        );
 
         addr
     }

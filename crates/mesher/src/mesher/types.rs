@@ -1,8 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use voxelize_core::{
-    BlockDynamicPattern, BlockFace, LightUtils, VoxelAccess, AABB, UV,
-};
+use voxelize_core::{BlockDynamicPattern, BlockFace, LightUtils, VoxelAccess, AABB, UV};
 
 use super::*;
 
@@ -25,6 +23,14 @@ pub struct Block {
     pub is_see_through: bool,
     pub is_transparent: [bool; 6],
     pub transparent_standalone: bool,
+    /// With `transparent_standalone`, how many voxels in from either side of
+    /// a mass of this block a face between two of its voxels is still meshed,
+    /// counted along the face's axis. A deeper face sits behind that many
+    /// layers of the block, which a cutout hides; 0 meshes every layer. A
+    /// depth also makes a see-through cube a cutout mass, drawn single-sided
+    /// with inward copies of its surface (`is_cutout_mass`).
+    #[serde(default)]
+    pub standalone_face_depth: u32,
     #[serde(default)]
     pub occludes_fluid: bool,
     #[serde(default)]
@@ -36,9 +42,121 @@ pub struct Block {
     /// column can span more than one block id.
     #[serde(default)]
     pub stack_group: u16,
+    /// Every voxel of this block gets a geometry of its own (keyed by its
+    /// position, reported through `GeometryProtocol::at`) instead of joining
+    /// the block's shared buffer, so the client can transform one voxel's
+    /// faces without touching the rest of the chunk. Never greedy-meshed.
+    #[serde(default)]
+    pub is_animated: bool,
     pub faces: Vec<BlockFace>,
     pub aabbs: Vec<AABB>,
     pub dynamic_patterns: Option<Vec<BlockDynamicPattern>>,
+    /// Joins this block's faces with coplanar faces of neighbours that share
+    /// the key, so the frame in its texture border is drawn only around the
+    /// outline of the joined sheet. Never greedy-meshed. See `connected`.
+    #[serde(default)]
+    pub connected: Option<ConnectedFrame>,
+    /// Draws every voxel of this block as a branch of the radius its stage
+    /// holds, joined to its neighbours. Never greedy-meshed. See `branch`.
+    #[serde(default)]
+    pub branch: Option<BranchShape>,
+    /// The branches this block takes without being one.
+    #[serde(default)]
+    pub branch_sockets: Vec<BranchSocket>,
+    /// Draws every voxel of this block as a cell of a wide branch section:
+    /// its slice of the tube of the core its raw bits point at, wearing that
+    /// core's faces. Never greedy-meshed. See `branch`.
+    #[serde(default)]
+    pub branch_shell: bool,
+    /// The faces a voxel wears instead of `faces` while its stage holds any
+    /// of the mask's bits. See [`Block::faces_at`].
+    #[serde(default)]
+    pub stage_faces: Option<StageFaces>,
+    /// Loose quads a voxel of this block wears where it meets the open air,
+    /// on top of its cube. See [`Tufts`].
+    #[serde(default)]
+    pub tufts: Option<Tufts>,
+}
+
+/// Loose quads drawn over a cube where it meets the open air: a mass of
+/// them reads as a soft, ragged outline instead of a stack of boxes. A voxel
+/// wears them only while one of its six neighbours is empty, so a buried
+/// voxel costs nothing, and its cube faces still greedy-mesh. Each voxel's
+/// set is turned about the vertical through its centre, leant by up to
+/// `tilt` radians about a level axis, and nudged by up to `jitter` blocks
+/// along each axis, all picked from its position, so no two neighbours
+/// repeat. Laid apart from the cube, in a geometry named
+/// [`TUFTS_FACE_NAME`] the client draws from both sides; lit by the voxel's
+/// own light and tinted as the block's first face is.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Tufts {
+    /// Quads in the voxel's frame; corners may reach past the cell.
+    pub faces: Vec<BlockFace>,
+    /// Worn instead of `faces` while the voxel's stage picks the block's
+    /// stage faces, one per face. Empty keeps `faces` in every look.
+    #[serde(default)]
+    pub stage_faces: Vec<BlockFace>,
+    /// Largest nudge of a voxel's set from its cell, in blocks per axis.
+    #[serde(default)]
+    pub jitter: f32,
+    /// Largest lean of a voxel's set from upright, in radians.
+    #[serde(default)]
+    pub tilt: f32,
+}
+
+impl Tufts {
+    /// The quads a voxel at `stage` wears on a block with `stage_mask`.
+    pub fn faces_at(&self, stage: u32, stage_mask: Option<u32>) -> &[BlockFace] {
+        match stage_mask {
+            Some(mask) if stage & mask != 0 && !self.stage_faces.is_empty() => &self.stage_faces,
+            _ => &self.faces,
+        }
+    }
+}
+
+/// Faces a block wears in place of its own on a voxel whose stage holds any
+/// of `mask`'s bits: the same cube in another look, each face standing in
+/// for the block's face toward the same side.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StageFaces {
+    pub mask: u32,
+    pub faces: Vec<BlockFace>,
+}
+
+/// A frame baked into the border of a block's face texture, drawn only where
+/// the face is not joined to the face of a neighbour sharing `key`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectedFrame {
+    /// Blocks sharing a key join; different glass kinds keep their frames.
+    pub key: u32,
+    /// Width of the frame in the texture border, in texels.
+    pub frame_texels: u32,
+    /// How far into each end of a frame band the texture shades toward its
+    /// corner. A band carried across a join samples past these texels, so a
+    /// long frame reads as one line instead of a row of block-long dashes.
+    #[serde(default)]
+    pub corner_texels: u32,
+    /// Texels per block the face texture is drawn at.
+    pub texels_per_block: u32,
+    /// The texture is clear inside its frame, so a joined border is left
+    /// undrawn instead of reflecting the glass beside it: a face joined on
+    /// every side is one quad rather than nine.
+    #[serde(default)]
+    pub clear_interior: bool,
+    /// With a clear interior, one joined face in this many keeps what its
+    /// texture draws inside the frame (glass glints), picked by world
+    /// position so a large sheet is not the same speck on every block. 1
+    /// keeps every face's, the default; 0 keeps none, so a sheet is clear
+    /// inside its outline. A face nothing joins always keeps its own.
+    #[serde(default = "every_interior")]
+    pub interior_one_in: u32,
+}
+
+fn every_interior() -> u32 {
+    1
 }
 
 impl Block {
@@ -54,6 +172,16 @@ impl Block {
                         face.compute_name_lower();
                     }
                 }
+            }
+        }
+        if let Some(alternate) = &mut self.stage_faces {
+            for face in &mut alternate.faces {
+                face.compute_name_lower();
+            }
+        }
+        if let Some(tufts) = &mut self.tufts {
+            for face in tufts.faces.iter_mut().chain(tufts.stage_faces.iter_mut()) {
+                face.compute_name_lower();
             }
         }
     }
@@ -73,6 +201,15 @@ impl Block {
             &self.name
         } else {
             &self.name_lower
+        }
+    }
+
+    /// The faces a voxel of this block at `stage` wears: its stage faces
+    /// while the stage holds any of their bits, its own otherwise.
+    pub fn faces_at(&self, stage: u32) -> &[BlockFace] {
+        match &self.stage_faces {
+            Some(alternate) if stage & alternate.mask != 0 => &alternate.faces,
+            _ => &self.faces,
         }
     }
 }
@@ -249,6 +386,7 @@ pub(super) struct FaceKey {
     pub(super) face_name: String,
     pub(super) independent: bool,
     pub(super) is_water_exposed: bool,
+    pub(super) tint_bits: i32,
     pub(super) ao: [i32; 4],
     pub(super) light: [i32; 4],
     pub(super) uv_start_u: u32,

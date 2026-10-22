@@ -3,8 +3,12 @@ use std::sync::Arc;
 use crate::{BlockFace, BlockFaces, FluidConfig, Registry, Vec3, VoxelAccess, VoxelUpdate, AABB};
 
 use super::super::fluids::create_fluid_active_fn;
+use super::coupled::coupled_guard_fns;
 use super::rules::{attached_support_fns, solid_below_support_fns};
-use super::{Block, BlockDynamicPattern, SupportRequirement, YRotatableSegments};
+use super::{
+    Block, BlockDynamicPattern, BranchKind, BranchSeat, BranchShape, BranchSocket, ConnectedFrame,
+    CoupledPart, StageFaces, SupportRequirement, Tufts, YRotatableSegments,
+};
 
 #[derive(Default)]
 pub struct BlockBuilder {
@@ -17,6 +21,7 @@ pub struct BlockBuilder {
     is_fluid: bool,
     fluid_flow_force: f32,
     ground_friction_multiplier: f32,
+    swim_speed_multiplier: f32,
     is_waterloggable: bool,
     is_waterlogging_fluid: bool,
     is_passable: bool,
@@ -25,14 +30,20 @@ pub struct BlockBuilder {
     green_light_level: u32,
     blue_light_level: u32,
     transparent_standalone: bool,
+    standalone_face_depth: u32,
     faces: Vec<BlockFace>,
     aabbs: Vec<AABB>,
+    barrier_height: Option<f32>,
     is_see_through: bool,
     occludes_fluid: bool,
     is_plant: bool,
     stack_group: u16,
+    is_animated: bool,
+    casts_shadow: Option<bool>,
     is_random_tickable: bool,
     requires_support: SupportRequirement,
+    coupled_parts: Vec<CoupledPart>,
+    is_coupled_anchor: bool,
     is_px_transparent: bool,
     is_py_transparent: bool,
     is_pz_transparent: bool,
@@ -43,8 +54,18 @@ pub struct BlockBuilder {
     default_entity_json: Option<String>,
     light_attenuation: u8,
     emissive: f32,
+    stage_tint_mask: u32,
+    regional_tint: bool,
+    face_pigments: Vec<(String, u32)>,
     face_emissives: Vec<(String, f32)>,
     dynamic_patterns: Option<Vec<BlockDynamicPattern>>,
+    connected: Option<ConnectedFrame>,
+    branch: Option<BranchShape>,
+    branch_sockets: Vec<BranchSocket>,
+    branch_shell: bool,
+    rotation_bits_are_state: bool,
+    stage_faces: Option<(u32, Vec<BlockFace>)>,
+    tufts: Option<(Vec<BlockFace>, Vec<BlockFace>, f32, f32)>,
     dynamic_fn: Option<
         Arc<
             dyn Fn(Vec3<i32>, &dyn VoxelAccess, &Registry) -> (Vec<BlockFace>, Vec<AABB>, [bool; 6])
@@ -57,6 +78,7 @@ pub struct BlockBuilder {
         Arc<dyn Fn(Vec3<i32>, &dyn VoxelAccess, &Registry) -> Vec<VoxelUpdate> + Send + Sync>,
     >,
     active_ticker: Option<Arc<dyn Fn(Vec3<i32>, &dyn VoxelAccess, &Registry) -> u64 + Send + Sync>>,
+    hands_off_wakes: bool,
 }
 
 impl BlockBuilder {
@@ -67,6 +89,7 @@ impl BlockBuilder {
             faces: BlockFaces::six_faces().build().to_vec(),
             aabbs: vec![AABB::new().build()],
             ground_friction_multiplier: 1.0,
+            swim_speed_multiplier: 1.0,
             ..Default::default()
         }
     }
@@ -118,6 +141,14 @@ impl BlockBuilder {
 
     pub fn ground_friction_multiplier(mut self, ground_friction_multiplier: f32) -> Self {
         self.ground_friction_multiplier = ground_friction_multiplier;
+        self
+    }
+
+    /// Configure the multiplier applied to an entity's swim speed while this
+    /// block is the fluid at its feet. Default is 1.0; a viscous fluid (lava)
+    /// should be lower.
+    pub fn swim_speed_multiplier(mut self, swim_speed_multiplier: f32) -> Self {
+        self.swim_speed_multiplier = swim_speed_multiplier;
         self
     }
 
@@ -190,6 +221,34 @@ impl BlockBuilder {
         self
     }
 
+    /// Couple this block to another voxel of the same unit: the block at
+    /// local-frame `offset` (rotated with the block) must hold `id`, and the two
+    /// live and die together. Call once per other part of the unit — a door
+    /// bottom couples to its top at `(0, 1, 0)`, the top couples back to the
+    /// bottom at `(0, -1, 0)` — and mark exactly one part with
+    /// [`Self::coupled_anchor`].
+    ///
+    /// What the engine then guarantees, for every write that goes through
+    /// the update queue: replacing any part clears the rest of the unit in
+    /// the same committed batch; writing the anchor materialises the other
+    /// parts into free voxels, mirroring its rotation and stage, or is
+    /// refused when one of them is occupied; a part written without its
+    /// anchor is refused. A block that also declares its own `active_fn`
+    /// keeps it; the orphan guard the engine installs runs first and defers
+    /// to it while the unit is whole.
+    pub fn coupled_with(mut self, offset: Vec3<i32>, id: u32) -> Self {
+        self.coupled_parts.push(CoupledPart { offset, id });
+        self
+    }
+
+    /// Mark this block as its unit's anchor — the part that is placed,
+    /// picked and dropped, and whose shape state the other parts follow.
+    /// Default is false; see [`Self::coupled_with`].
+    pub fn coupled_anchor(mut self, is_anchor: bool) -> Self {
+        self.is_coupled_anchor = is_anchor;
+        self
+    }
+
     /// Configure whether or not this block can be climbed. Default is false.
     pub fn is_climbable(mut self, is_climbable: bool) -> Self {
         self.is_climbable = is_climbable;
@@ -222,11 +281,39 @@ impl BlockBuilder {
         self
     }
 
-    /// Render every face of this block emissive at `strength` (tonemapped-
-    /// scene-relative; quantized to the mesher's shared level table). Emissive
-    /// faces bypass the lighting model — a lava surface stays bright at night.
-    /// This declares how the block *looks*; light cast onto neighbors still
-    /// comes from the flood levels (`torch_light_level` and friends).
+    /// Shade faces through the shared 16-entry stage palette. Stage zero
+    /// remains the unmodified material. Supports non-fluid vertical stacks
+    /// up to four blocks; longer runs keep their sway and remain untinted.
+    pub fn stage_tint(mut self, mask: u32) -> Self {
+        self.stage_tint_mask = mask & 15;
+        self
+    }
+
+    /// Shade every face with the chunk's regional colour (its corner colour
+    /// field) on the neutral palette, never reading the stage: for a block
+    /// whose stage holds state of its own but should match the region round
+    /// it, as a tree's soil and foliage match the grass and leaves nearby.
+    pub fn regional_tint(mut self) -> Self {
+        self.regional_tint = true;
+        self
+    }
+
+    /// Colour every face through the colour table by the voxel stage.
+    /// Stage zero stays the untinted material.
+    pub fn pigment(self, mask: u32) -> Self {
+        self.face_pigment("", mask)
+    }
+
+    /// Colour only the faces whose name starts with `prefix` through the
+    /// colour table (an inset panel, say, but not the trim around it). Later calls
+    /// override earlier ones for the faces they both name.
+    pub fn face_pigment(mut self, prefix: &str, mask: u32) -> Self {
+        self.face_pigments.push((prefix.to_owned(), mask & 15));
+        self
+    }
+
+    /// Render every face emissive at this quantized strength. This declares
+    /// appearance; light cast onto neighbors still comes from flood levels.
     pub fn emissive(mut self, strength: f32) -> Self {
         self.emissive = strength;
         self
@@ -247,6 +334,16 @@ impl BlockBuilder {
         self
     }
 
+    /// With `transparent_standalone`, mesh the faces between this block's
+    /// voxels only within `depth` voxels of either side of a mass of it,
+    /// along each face's axis: a cutout hides what lies deeper. A depth also
+    /// makes a see-through cube a cutout mass, drawn single-sided with inward
+    /// copies of its surface. Default is 0, every layer.
+    pub fn standalone_face_depth(mut self, depth: u32) -> Self {
+        self.standalone_face_depth = depth;
+        self
+    }
+
     /// Configure the faces that the block has. Default is `vec![]`.
     pub fn faces(mut self, faces: &[BlockFace]) -> Self {
         self.faces = faces.to_vec();
@@ -256,6 +353,15 @@ impl BlockBuilder {
     /// Configure the bounding boxes that the block has. Default is `vec![]`.
     pub fn aabbs(mut self, aabbs: &[AABB]) -> Self {
         self.aabbs = aabbs.to_vec();
+        self
+    }
+
+    /// Have the bodies the server simulates find this block `height` blocks
+    /// tall: the top of every box it collides as is raised to `height`, while
+    /// its declared boxes stay what clients collide with, pick and outline
+    /// (see [`Block::barrier_height`]). Default is none.
+    pub fn barrier_height(mut self, height: f32) -> Self {
+        self.barrier_height = Some(height);
         self
     }
 
@@ -281,6 +387,26 @@ impl BlockBuilder {
     /// Does this block prevent fluids from rendering faces against it?
     pub fn occludes_fluid(mut self, occludes_fluid: bool) -> Self {
         self.occludes_fluid = occludes_fluid;
+        self
+    }
+
+    /// Mesh every voxel of this block as its own geometry so the client can
+    /// animate a state change as a motion (a door swinging, a trapdoor
+    /// lifting) instead of a cut. The geometry per state still comes from
+    /// `dynamic_patterns`; the client pairs the block name with a
+    /// `World.blockAnimations` spec that says how one state's rest pose
+    /// moves into the next. Default is false.
+    pub fn is_animated(mut self, is_animated: bool) -> Self {
+        self.is_animated = is_animated;
+        self
+    }
+
+    /// Say outright whether this block casts a sun shadow, overriding the
+    /// client's rule of thumb (solids and leaf-like cutouts cast; fluids and
+    /// clear see-through blocks do not). A see-through block that is
+    /// nevertheless solid to the eye — a door, a fence — wants `true`.
+    pub fn casts_shadow(mut self, casts_shadow: bool) -> Self {
+        self.casts_shadow = Some(casts_shadow);
         self
     }
 
@@ -370,6 +496,89 @@ impl BlockBuilder {
         self
     }
 
+    /// Join this block's faces with the coplanar faces of neighbours declaring
+    /// the same frame: the frame drawn in its texture border then outlines
+    /// the joined sheet instead of every block, and faces inside the sheet
+    /// are dropped. Faces must carry their texture at `texels_per_block`
+    /// (`auto_uv_offset` on partial faces) for the frame to be found.
+    pub fn connected_frame(mut self, frame: ConnectedFrame) -> Self {
+        self.connected = Some(frame);
+        self
+    }
+
+    /// Draw every voxel of this block as a branch: a square-section tube of
+    /// the radius its stage holds, joined to neighbours of the same key at
+    /// the thinner of the two radii. Collision and picking follow the drawn
+    /// shape. The block's `faces` must include the shape's side and end
+    /// faces, whose textures the branch wears. A wide core or a fin keeps its
+    /// size in its rotation bits, so declaring one makes them state.
+    pub fn branch(mut self, shape: BranchShape) -> Self {
+        if shape.kind != BranchKind::Voxel {
+            self.rotation_bits_are_state = true;
+        }
+        self.branch = Some(shape);
+        self
+    }
+
+    /// Draw every voxel of this block as a cell of a wide branch section,
+    /// pointing at its core through its rotation bits (which become state)
+    /// and wearing the core's faces. One shell block serves every species'
+    /// sections; it declares no shape of its own.
+    pub fn branch_shell(mut self) -> Self {
+        self.branch_shell = true;
+        self.rotation_bits_are_state = true;
+        self
+    }
+
+    /// Let branches of `socket.key` up to `socket.max_radius` run into this
+    /// block, as a twig runs into a leaf or a trunk into its soil.
+    pub fn branch_socket(mut self, socket: BranchSocket) -> Self {
+        self.branch_sockets.push(socket);
+        self
+    }
+
+    /// Keep raw bits 16–23 of this block's voxels as the block's own state,
+    /// not a rotation ([`Block::rotation_bits_are_state`]). Such a block never
+    /// rotates and is equally transparent on all six sides, so the paths that
+    /// rotate a voxel's transparency by those bits change nothing.
+    pub fn rotation_bits_are_state(mut self) -> Self {
+        self.rotation_bits_are_state = true;
+        self
+    }
+
+    /// Wear `faces` instead of the block's own on a voxel whose stage holds
+    /// any of `mask`'s bits ([`Block::stage_faces`]): the same cube in
+    /// another look, as a canopy in flower wears its blossoms over its
+    /// leaves. Each face stands in for the block's face toward the same
+    /// side, and takes the tint and glow the block gives its own.
+    pub fn stage_faces(mut self, mask: u32, faces: &[BlockFace]) -> Self {
+        self.stage_faces = Some((mask, faces.to_vec()));
+        self
+    }
+
+    /// Wear the loose quads `faces` over the cube wherever a voxel meets the
+    /// open air ([`Block::tufts`]), each voxel's set turned about its centre,
+    /// leant by up to `tilt` radians and nudged by up to `jitter` blocks per
+    /// axis. They share the atlas and take the tint and glow of the block's
+    /// first face.
+    pub fn tufts(mut self, faces: &[BlockFace], jitter: f32, tilt: f32) -> Self {
+        let stage = self
+            .tufts
+            .take()
+            .map(|(_, stage, ..)| stage)
+            .unwrap_or_default();
+        self.tufts = Some((faces.to_vec(), stage, jitter, tilt));
+        self
+    }
+
+    /// The tufts a voxel wears instead while its stage picks the block's
+    /// stage faces ([`BlockBuilder::stage_faces`]), one per tuft.
+    pub fn stage_tufts(mut self, faces: &[BlockFace]) -> Self {
+        let (own, _, jitter, tilt) = self.tufts.take().unwrap_or_default();
+        self.tufts = Some((own, faces.to_vec(), jitter, tilt));
+        self
+    }
+
     /// Configure the function that is used to create dynamic AABBs and faces for this block.
     pub fn dynamic_fn<
         F: Fn(Vec3<i32>, &dyn VoxelAccess, &Registry) -> (Vec<BlockFace>, Vec<AABB>, [bool; 6])
@@ -401,6 +610,25 @@ impl BlockBuilder {
         self
     }
 
+    /// Wake this block as an active block, but hand each wake that comes
+    /// due to the game instead of to an updater: `ticker` says when, as for
+    /// [`Self::active_fn`], and the due voxel waits on
+    /// [`crate::Chunks::take_handed_wakes`] for a game system to take. For
+    /// behaviour that reaches past the voxels (spawning an entity, paying
+    /// out), which an updater, reading only voxels, cannot do. A world whose
+    /// registry holds such a block takes its wakes every tick.
+    pub fn hand_off_wakes<
+        F: Fn(Vec3<i32>, &dyn VoxelAccess, &Registry) -> u64 + 'static + Send + Sync,
+    >(
+        mut self,
+        ticker: F,
+    ) -> Self {
+        self.active_ticker = Some(Arc::new(ticker));
+        self.active_updater = Some(Arc::new(|_, _, _| Vec::new()));
+        self.hands_off_wakes = true;
+        self
+    }
+
     pub fn is_entity(mut self, is_entity: bool) -> Self {
         self.is_entity = is_entity;
         self
@@ -424,6 +652,34 @@ impl BlockBuilder {
     /// Construct a block instance, ready to be added into the registry.
     pub fn build(self) -> Block {
         let mut faces = self.faces;
+        if self.stage_tint_mask != 0 {
+            assert!(!self.is_fluid, "stage tint cannot share a fluid field");
+            for face in &mut faces {
+                face.stage_tint_mask = self.stage_tint_mask;
+            }
+        }
+        if self.regional_tint {
+            assert!(
+                !self.is_fluid && self.stage_tint_mask == 0 && self.face_pigments.is_empty(),
+                "{}: a regional tint takes its colour from the region alone, not with a stage tint or pigment",
+                self.name
+            );
+            for face in &mut faces {
+                face.regional_tint = true;
+            }
+        }
+        if !self.face_pigments.is_empty() {
+            assert!(!self.is_fluid, "a pigment cannot share a fluid field");
+            assert!(
+                self.stack_group == 0,
+                "a pigment cannot share a plant's stack field"
+            );
+        }
+        for (prefix, mask) in &self.face_pigments {
+            for face in faces.iter_mut().filter(|face| face.name.starts_with(prefix)) {
+                face.pigment_mask = *mask;
+            }
+        }
         if self.emissive > 0.0 {
             for face in faces.iter_mut() {
                 face.emissive = self.emissive;
@@ -434,6 +690,246 @@ impl BlockBuilder {
                 face.emissive = *strength;
             }
         }
+        let stage_faces = self.stage_faces.map(|(mask, mut alternates)| {
+            assert!(
+                mask != 0 && mask <= 0xF,
+                "{}: stage faces answer to stage bits, not {mask:#x}",
+                self.name
+            );
+            assert!(
+                !self.is_fluid
+                    && self.branch.is_none()
+                    && !self.branch_shell
+                    && self.connected.is_none()
+                    && self.dynamic_fn.is_none()
+                    && self.dynamic_patterns.is_none(),
+                "{}: stage faces dress a plain block, not a fluid, branch, shell, frame or dynamic one",
+                self.name
+            );
+            let tint_bits = faces
+                .iter()
+                .fold(0, |bits, face| bits | face.stage_tint_mask | face.pigment_mask);
+            assert!(
+                tint_bits & mask == 0,
+                "{}: stage bits {mask:#06b} pick its faces and cannot also pick a tint ({tint_bits:#06b})",
+                self.name
+            );
+            assert_eq!(
+                alternates.len(),
+                faces.len(),
+                "{}: every face needs one stage face to stand in for it",
+                self.name
+            );
+            for alternate in &mut alternates {
+                assert!(
+                    !alternate.independent && !alternate.isolated,
+                    "{}: stage face {} must share the atlas",
+                    self.name,
+                    alternate.name
+                );
+                let own: Vec<&BlockFace> =
+                    faces.iter().filter(|face| face.dir == alternate.dir).collect();
+                let [own] = own.as_slice() else {
+                    panic!(
+                        "{}: stage face {} stands in for no single face toward {:?}",
+                        self.name, alternate.name, alternate.dir
+                    );
+                };
+                alternate.stage_tint_mask = own.stage_tint_mask;
+                alternate.pigment_mask = own.pigment_mask;
+                alternate.regional_tint = own.regional_tint;
+                alternate.emissive = own.emissive;
+            }
+            StageFaces {
+                mask,
+                faces: alternates,
+            }
+        });
+        let tufts = self.tufts.map(|(mut own, mut stage, jitter, tilt)| {
+            assert!(
+                !own.is_empty(),
+                "{}: stage tufts stand in for tufts it has none of",
+                self.name
+            );
+            assert!(
+                !self.is_fluid
+                    && !self.rotatable
+                    && !self.y_rotatable
+                    && !self.is_animated
+                    && self.branch.is_none()
+                    && !self.branch_shell
+                    && self.connected.is_none()
+                    && self.dynamic_fn.is_none()
+                    && self.dynamic_patterns.is_none(),
+                "{}: tufts dress a plain cube, not a fluid, rotating, animated, branch, shell, frame or dynamic one",
+                self.name
+            );
+            assert!(
+                stage.is_empty() || (stage_faces.is_some() && stage.len() == own.len()),
+                "{}: stage tufts need stage faces and one stand-in per tuft",
+                self.name
+            );
+            let dress = |tufts: &mut Vec<BlockFace>, like: Option<&BlockFace>| {
+                for tuft in tufts.iter_mut() {
+                    assert!(
+                        !tuft.independent && !tuft.isolated,
+                        "{}: tuft {} must share the atlas",
+                        self.name,
+                        tuft.name
+                    );
+                    if let Some(like) = like {
+                        tuft.stage_tint_mask = like.stage_tint_mask;
+                        tuft.pigment_mask = like.pigment_mask;
+                        tuft.regional_tint = like.regional_tint;
+                        tuft.emissive = like.emissive;
+                    }
+                }
+            };
+            dress(&mut own, faces.first());
+            dress(
+                &mut stage,
+                stage_faces
+                    .as_ref()
+                    .and_then(|s| s.faces.first())
+                    .or(faces.first()),
+            );
+            Tufts {
+                faces: own,
+                stage_faces: stage,
+                jitter,
+                tilt,
+            }
+        });
+        if let Some(frame) = &self.connected {
+            assert!(
+                !self.rotatable && !self.y_rotatable,
+                "{}: a connected frame joins faces in world space and cannot rotate",
+                self.name
+            );
+            let reach = frame.frame_texels + frame.corner_texels;
+            assert!(
+                frame.texels_per_block > 0 && 3 * reach < frame.texels_per_block,
+                "{}: a frame reaching {reach} texels into each corner leaves no glass to reflect in a {}-texel face",
+                self.name,
+                frame.texels_per_block
+            );
+        }
+        if let Some(shape) = &self.branch {
+            assert!(
+                !self.rotatable && !self.y_rotatable,
+                "{}: a branch is laid in world space and cannot rotate",
+                self.name
+            );
+            assert!(
+                self.dynamic_fn.is_none() && self.dynamic_patterns.is_none(),
+                "{}: a branch's shape comes from its radius and joints alone",
+                self.name
+            );
+            assert!(
+                shape.texels_per_block >= 2 && shape.texels_per_block % 2 == 0,
+                "{}: a branch needs an even number of texels per block, not {}",
+                self.name,
+                shape.texels_per_block
+            );
+            if shape.kind == BranchKind::Core {
+                assert!(
+                    shape.radius_mask == 0,
+                    "{}: a wide core keeps its radius in its rotation bits and its cut flag in stage bit 0, so its stage holds no radius",
+                    self.name
+                );
+            } else {
+                let bits = shape.radius_mask >> shape.radius_mask.trailing_zeros().min(31);
+                assert!(
+                    shape.radius_mask != 0 && (bits & (bits + 1)) == 0,
+                    "{}: the radius must sit in one run of stage bits, not {:#06b}",
+                    self.name,
+                    shape.radius_mask
+                );
+                assert!(
+                    shape.radius_mask <= 0xF && bits < shape.max_radius(),
+                    "{}: radius bits {:#06b} reach past half a block of {} texels",
+                    self.name,
+                    shape.radius_mask,
+                    shape.texels_per_block
+                );
+            }
+            assert!(
+                shape.kind != BranchKind::Fin || shape.seat == BranchSeat::Floor,
+                "{}: a fin stands on its voxel's floor",
+                self.name
+            );
+            assert!(
+                self.stage_tint_mask == 0 && self.face_pigments.is_empty(),
+                "{}: a branch's stage holds its radius, not a tint",
+                self.name
+            );
+            for name in [&shape.side_face, &shape.end_face] {
+                assert!(
+                    faces.iter().any(|face| &face.name == name),
+                    "{}: the branch wears face {name:?}, which the block does not have",
+                    self.name
+                );
+            }
+        }
+
+        if self.branch_shell {
+            assert!(
+                self.branch.is_none(),
+                "{}: a shell wears its core's shape, not one of its own",
+                self.name
+            );
+            assert!(
+                self.dynamic_fn.is_none() && self.dynamic_patterns.is_none(),
+                "{}: a shell's shape comes from its core alone",
+                self.name
+            );
+        }
+        if let Some(height) = self.barrier_height {
+            assert!(
+                height.is_finite() && height > 0.0,
+                "{}: a barrier stands a positive height above its floor, not {height}",
+                self.name
+            );
+            assert!(
+                !self.rotatable,
+                "{}: a barrier raises its boxes along the block's own up, which a block turned onto its side would point sideways",
+                self.name
+            );
+        }
+        if self.rotation_bits_are_state {
+            assert!(
+                !self.rotatable && !self.y_rotatable,
+                "{}: a block whose rotation bits are state cannot rotate",
+                self.name
+            );
+            let sides = [
+                self.is_px_transparent,
+                self.is_py_transparent,
+                self.is_pz_transparent,
+                self.is_nx_transparent,
+                self.is_ny_transparent,
+                self.is_nz_transparent,
+            ];
+            assert!(
+                sides.iter().all(|&side| side == sides[0]),
+                "{}: a block whose rotation bits are state must be equally transparent on all six sides",
+                self.name
+            );
+        }
+
+        // A coupled block is always active: the orphan guard wraps whatever
+        // the block declared for itself, so both can coexist (an iron door
+        // keeps its auto-close dwell and still heals as a unit).
+        let (active_ticker, active_updater) = if self.coupled_parts.is_empty() {
+            (self.active_ticker, self.active_updater)
+        } else {
+            let (ticker, updater) = coupled_guard_fns(
+                self.coupled_parts.clone(),
+                self.active_ticker,
+                self.active_updater,
+            );
+            (Some(ticker), Some(updater))
+        };
 
         Block {
             id: self.id,
@@ -445,6 +941,7 @@ impl BlockBuilder {
             is_fluid: self.is_fluid,
             fluid_flow_force: self.fluid_flow_force,
             ground_friction_multiplier: self.ground_friction_multiplier,
+            swim_speed_multiplier: self.swim_speed_multiplier,
             is_waterloggable: self.is_waterloggable,
             is_waterlogging_fluid: self.is_waterlogging_fluid,
             is_light: self.red_light_level > 0
@@ -462,13 +959,19 @@ impl BlockBuilder {
             green_light_level: self.green_light_level,
             blue_light_level: self.blue_light_level,
             transparent_standalone: self.transparent_standalone,
+            standalone_face_depth: self.standalone_face_depth,
             faces,
             aabbs: self.aabbs,
+            barrier_height: self.barrier_height,
             is_see_through: self.is_see_through,
             occludes_fluid: self.occludes_fluid,
             is_plant: self.is_plant,
             stack_group: self.stack_group,
+            is_animated: self.is_animated,
+            casts_shadow: self.casts_shadow,
             requires_support: self.requires_support,
+            coupled_parts: self.coupled_parts,
+            is_coupled_anchor: self.is_coupled_anchor,
             is_transparent: [
                 self.is_px_transparent,
                 self.is_py_transparent,
@@ -478,12 +981,23 @@ impl BlockBuilder {
                 self.is_nz_transparent,
             ],
             light_attenuation: self.light_attenuation,
-            is_dynamic: self.dynamic_fn.is_some() || self.dynamic_patterns.is_some(),
+            is_dynamic: self.dynamic_fn.is_some()
+                || self.dynamic_patterns.is_some()
+                || self.branch.is_some()
+                || self.branch_shell,
             dynamic_patterns: self.dynamic_patterns,
+            connected: self.connected,
+            branch: self.branch,
+            branch_sockets: self.branch_sockets,
+            branch_shell: self.branch_shell,
+            rotation_bits_are_state: self.rotation_bits_are_state,
+            stage_faces,
+            tufts,
             dynamic_fn: self.dynamic_fn,
-            is_active: self.active_updater.is_some() && self.active_ticker.is_some(),
-            active_ticker: self.active_ticker,
-            active_updater: self.active_updater,
+            is_active: active_updater.is_some() && active_ticker.is_some(),
+            active_ticker,
+            active_updater,
+            hands_off_wakes: self.hands_off_wakes,
             is_random_tickable: self.is_random_tickable,
             is_entity: self.is_entity,
             default_entity_json: self.default_entity_json,

@@ -1,20 +1,35 @@
+#[cfg(test)]
+mod branch_parity_tests;
 mod builder;
+#[cfg(test)]
+mod connected_parity_tests;
+mod coupled;
 mod faces;
 mod rules;
+#[cfg(test)]
+mod stage_faces_parity_tests;
+#[cfg(test)]
+mod tufts_parity_tests;
 
 use std::{f32, marker::Sync, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{LightColor, Registry, Vec3, VoxelAccess, VoxelUpdate, AABB};
+use crate::{BlockUtils, LightColor, Registry, Vec3, VoxelAccess, VoxelUpdate, AABB};
 
 pub use builder::*;
+pub use coupled::*;
 pub use faces::*;
 pub use rules::*;
 
 pub use voxelize_core::{
     BlockRotation, CornerData, NX_ROTATION, NY_ROTATION, NZ_ROTATION, PX_ROTATION, PY_ROTATION,
-    PZ_ROTATION, ROTATION_MASK, STAGE_MASK, Y_ROTATION_MASK, Y_ROT_SEGMENTS,
+    PZ_ROTATION, ROTATION_BYTE_MASK, ROTATION_MASK, STAGE_MASK, Y_ROTATION_MASK, Y_ROT_SEGMENTS,
+};
+pub use voxelize_mesher::{
+    branch_cell, BranchBlocks, BranchCell, BranchKind, BranchLayout, BranchPart, BranchPartKind,
+    BranchSeat, BranchShape, BranchSide, BranchSocket, ConnectedFrame, WideBranchBits,
+    WideBranchSection, WideCell,
 };
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -47,6 +62,13 @@ pub struct Block {
     /// 1.0 is normal grip; lower values are slipperier.
     #[serde(default = "default_ground_friction_multiplier")]
     pub ground_friction_multiplier: f32,
+
+    /// Multiplier applied to an entity's swim speed while this block is the
+    /// fluid at its feet. 1.0 is normal swim speed; lower values are thicker
+    /// / more viscous (e.g. lava). Read client-side by the local player's
+    /// swim controls, the same extension point as `ground_friction_multiplier`.
+    #[serde(default = "default_swim_speed_multiplier")]
+    pub swim_speed_multiplier: f32,
 
     /// Can this block hold the world's waterlogging fluid alongside itself?
     ///
@@ -84,11 +106,32 @@ pub struct Block {
     /// Do faces of this transparent block need to be rendered?
     pub transparent_standalone: bool,
 
+    /// With `transparent_standalone`, how many voxels in from either side of
+    /// a mass of this block the faces between its voxels are still meshed
+    /// (along each face's axis); 0 meshes every layer. A depth also makes a
+    /// see-through cube a cutout mass: drawn single-sided, with inward copies
+    /// of its surface.
+    pub standalone_face_depth: u32,
+
     /// The faces that this block has to render.
     pub faces: Vec<BlockFace>,
 
     /// Bounding boxes of this block.
     pub aabbs: Vec<AABB>,
+
+    /// How high, in blocks above its voxel's floor, the bodies the server
+    /// simulates find this block standing: every box [`Block::get_aabbs`]
+    /// returns keeps its footprint and floor and has its top raised to this.
+    /// The declared boxes stay what a client's own body collides with, what
+    /// picking and the highlight follow, and what particles land on, so a
+    /// fence can be one block tall to the eye and to a player's jump while
+    /// nothing the server walks can hop it. A client reads it only to keep
+    /// automatic moves (auto-jump, auto-step) from carrying its body over.
+    /// Heights are in the block's own frame, before its rotation: meant for
+    /// blocks that stand upright. Declared with
+    /// [`BlockBuilder::barrier_height`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub barrier_height: Option<f32>,
 
     /// Is the block overall see-through? Opacity equals 0.1 or something?
     pub is_see_through: bool,
@@ -103,10 +146,46 @@ pub struct Block {
     /// run. Zero means the block never stacks.
     pub stack_group: u16,
 
+    /// Meshed as its own geometry per voxel, never merged into the chunk's
+    /// shared buffers, so the client can move that voxel's faces on their own
+    /// — a door leaf swinging on its hinge, a trapdoor lifting, a lever
+    /// tilting. The block's state (its `stage`, its rotation) stays the only
+    /// authority; this flag only keeps the geometry addressable so a state
+    /// change can be shown as a motion instead of a cut. The client declares
+    /// the motion itself (`World.blockAnimations`).
+    #[serde(default)]
+    pub is_animated: bool,
+
+    /// Whether this block's geometry is drawn into the sun's shadow maps.
+    /// `None` leaves it to the client's rule of thumb — solids and
+    /// light-attenuating cutouts (leaves) cast, fluids and clear see-through
+    /// blocks (glass, barriers) do not — which gets a solid-looking
+    /// see-through block wrong: a door is a plank slab, not a pane. Set it
+    /// where the rule of thumb is wrong.
+    #[serde(default)]
+    pub casts_shadow: Option<bool>,
+
     /// Declares whether this block auto-clears when its support is removed.
     /// Wired through [`BlockBuilder::requires_support`] into `active_fn`.
     #[serde(default)]
     pub requires_support: SupportRequirement,
+
+    /// The other voxels of the multi-voxel unit this block is one part of —
+    /// a door's other leaf, a tall flower's other half — each as an offset
+    /// from this voxel and the id it must hold. Empty for an ordinary block.
+    /// Every part of a unit lists every other part, so the unit can be
+    /// read whole from any of its voxels. Declared with
+    /// [`BlockBuilder::coupled_with`]; the engine keeps units whole at update
+    /// intake (see the `coupled` module).
+    #[serde(default)]
+    pub coupled_parts: Vec<CoupledPart>,
+
+    /// Whether this part is its unit's anchor: the part that is placed,
+    /// picked and dropped, that materialises the other parts when written,
+    /// and whose rotation and stage the other parts mirror. Exactly one part
+    /// of a unit is the anchor.
+    #[serde(default)]
+    pub is_coupled_anchor: bool,
 
     /// Is this block transparent from looking from all 6 sides?
     /// The order is: px, py, pz, nx, ny, nz.
@@ -129,6 +208,51 @@ pub struct Block {
 
     pub dynamic_patterns: Option<Vec<BlockDynamicPattern>>,
 
+    /// Joins this block's faces with coplanar faces of neighbours sharing the
+    /// frame, so the frame in its texture border outlines the joined sheet
+    /// instead of every block. Declared with [`BlockBuilder::connected_frame`].
+    #[serde(default)]
+    pub connected: Option<ConnectedFrame>,
+
+    /// Draws every voxel of this block as a branch of the radius its stage
+    /// holds, joined to its neighbours; collision and picking follow the
+    /// drawn shape ([`Block::branch_layout_at`]). Declared with
+    /// [`BlockBuilder::branch`].
+    #[serde(default)]
+    pub branch: Option<BranchShape>,
+
+    /// The branches this block takes without being one. Declared with
+    /// [`BlockBuilder::branch_socket`].
+    #[serde(default)]
+    pub branch_sockets: Vec<BranchSocket>,
+
+    /// Draws every voxel of this block as a cell of a wide branch section:
+    /// its slice of the tube of the core its raw bits point at
+    /// ([`WideBranchBits::shell_offset`]), wearing that core's faces. A shell
+    /// whose core is gone draws and collides as nothing. Declared with
+    /// [`BlockBuilder::branch_shell`].
+    #[serde(default)]
+    pub branch_shell: bool,
+
+    /// Raw bits 16–23 of this block's voxels hold state the block keeps for
+    /// itself, not a rotation: every path that would decode them as one reads
+    /// the identity rotation instead ([`Block::rotation_of`]), and the update
+    /// intake writes them as they come. Declared with
+    /// [`BlockBuilder::rotation_bits_are_state`].
+    #[serde(default)]
+    pub rotation_bits_are_state: bool,
+
+    /// The faces a voxel of this block wears instead of `faces` while its
+    /// stage holds any of the mask's bits. Declared with
+    /// [`BlockBuilder::stage_faces`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_faces: Option<StageFaces>,
+
+    /// Loose quads a voxel of this block wears over its cube where it meets
+    /// the open air. Declared with [`BlockBuilder::tufts`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tufts: Option<Tufts>,
+
     /// Dynamic aabb and face generation function. Defaults to `None`.
     #[serde(skip)]
     pub dynamic_fn: Option<
@@ -149,6 +273,12 @@ pub struct Block {
         Option<Arc<dyn Fn(Vec3<i32>, &dyn VoxelAccess, &Registry) -> u64 + Send + Sync>>,
 
     pub is_active: bool,
+
+    /// Each wake of this block that comes due is handed to the game
+    /// ([`crate::Chunks::take_handed_wakes`]) rather than run through an
+    /// updater. Declared with [`BlockBuilder::hand_off_wakes`].
+    #[serde(skip)]
+    pub hands_off_wakes: bool,
 
     /// When true, the subchunk random-tick sampler may invoke this block's
     /// `active_updater` (scheduled via `mark_voxel_active` at the current
@@ -192,12 +322,56 @@ impl Block {
         self.is_light
     }
 
+    /// How the branch voxel at `pos` is put together: its radius, what each
+    /// side joins and the boxes it is drawn and collides as. `None` for a
+    /// block that is not a branch, and for a shell with no core.
+    pub fn branch_layout_at(
+        &self,
+        pos: &Vec3<i32>,
+        space: &dyn VoxelAccess,
+        registry: &Registry,
+    ) -> Option<BranchLayout> {
+        if self.branch.is_none() && !self.branch_shell {
+            return None;
+        }
+        let &Vec3(vx, vy, vz) = pos;
+        let raw_at = |x: i32, y: i32, z: i32| space.get_raw_voxel(x, y, z);
+        voxelize_mesher::branch_layout_at([vx, vy, vz], &raw_at, registry).map(|(layout, _)| layout)
+    }
+
+    /// The boxes the bodies the server simulates collide with in the voxel at
+    /// `pos`, in the block's own frame: its declared boxes, each raised to
+    /// [`Block::barrier_height`] when the block has one.
     pub fn get_aabbs(
         &self,
         pos: &Vec3<i32>,
         space: &dyn VoxelAccess,
         registry: &Registry,
     ) -> Vec<AABB> {
+        let mut aabbs = self.get_declared_aabbs(pos, space, registry);
+        if let Some(height) = self.barrier_height {
+            for aabb in &mut aabbs {
+                aabb.max_y = aabb.max_y.max(height);
+            }
+        }
+        aabbs
+    }
+
+    /// The boxes the block declares for the voxel at `pos` (its branch
+    /// layout, its matched dynamic parts or its static boxes), before
+    /// [`Block::barrier_height`] raises them: what a client's own body
+    /// collides with and picks against.
+    pub fn get_declared_aabbs(
+        &self,
+        pos: &Vec3<i32>,
+        space: &dyn VoxelAccess,
+        registry: &Registry,
+    ) -> Vec<AABB> {
+        if self.branch.is_some() || self.branch_shell {
+            return self
+                .branch_layout_at(pos, space, registry)
+                .map_or_else(Vec::new, |layout| layout.aabbs());
+        }
         if self.is_dynamic {
             if let Some(dynamic_patterns) = &self.dynamic_patterns {
                 for pattern in dynamic_patterns {
@@ -221,6 +395,11 @@ impl Block {
         space: &dyn VoxelAccess,
         registry: &Registry,
     ) -> Vec<BlockFace> {
+        if self.branch.is_some() || self.branch_shell {
+            // The mesher lays a branch out from its neighbours; the faces
+            // here are the textures it wears.
+            return self.faces.clone();
+        }
         if self.is_dynamic {
             if let Some(dynamic_patterns) = &self.dynamic_patterns {
                 for pattern in dynamic_patterns {
@@ -289,6 +468,16 @@ impl Block {
 
     pub fn get_rotated_transparency(&self, rotation: &BlockRotation) -> [bool; 6] {
         rotation.rotate_transparency(self.is_transparent)
+    }
+
+    /// The rotation a voxel of this block holding `raw` is drawn and collides
+    /// at: the identity for a block whose rotation bits are state.
+    pub fn rotation_of(&self, raw: u32) -> BlockRotation {
+        if self.rotation_bits_are_state {
+            BlockRotation::default()
+        } else {
+            BlockUtils::extract_rotation(raw)
+        }
     }
 
     /// Evaluate the dynamic pattern and return the combined faces and AABBs based on the rules.
@@ -379,17 +568,76 @@ impl Block {
             is_see_through: self.is_see_through,
             is_transparent: self.is_transparent,
             transparent_standalone: self.transparent_standalone,
+            standalone_face_depth: self.standalone_face_depth,
             occludes_fluid: self.occludes_fluid,
             is_plant: self.is_plant,
             stack_group: self.stack_group,
+            is_animated: self.is_animated,
             faces: self.faces.iter().map(|f| f.to_mesher_face()).collect(),
             aabbs: self.aabbs.clone(),
             dynamic_patterns: self
                 .dynamic_patterns
                 .as_ref()
                 .map(|patterns| patterns.iter().map(|p| p.to_mesher_pattern()).collect()),
+            connected: self.connected.clone(),
+            branch: self.branch.clone(),
+            branch_sockets: self.branch_sockets.clone(),
+            branch_shell: self.branch_shell,
+            stage_faces: self
+                .stage_faces
+                .as_ref()
+                .map(|alternate| voxelize_mesher::StageFaces {
+                    mask: alternate.mask,
+                    faces: alternate.faces.iter().map(|f| f.to_mesher_face()).collect(),
+                }),
+            tufts: self.tufts.as_ref().map(|tufts| voxelize_mesher::Tufts {
+                faces: tufts.faces.iter().map(|f| f.to_mesher_face()).collect(),
+                stage_faces: tufts
+                    .stage_faces
+                    .iter()
+                    .map(|f| f.to_mesher_face())
+                    .collect(),
+                jitter: tufts.jitter,
+                tilt: tufts.tilt,
+            }),
         }
     }
+
+    /// The faces a voxel of this block at `stage` wears: its stage faces
+    /// while the stage holds any of their bits, its own otherwise.
+    pub fn faces_at(&self, stage: u32) -> &[BlockFace] {
+        match &self.stage_faces {
+            Some(alternate) if stage & alternate.mask != 0 => &alternate.faces,
+            _ => &self.faces,
+        }
+    }
+}
+
+/// Loose quads drawn over a cube where it meets the open air, mirroring the
+/// mesher's `Tufts`: `faces` in the voxel's frame (corners may reach past the
+/// cell), `stage_faces` worn instead while the stage picks the block's stage
+/// faces (empty keeps `faces`), the largest per-axis nudge in blocks and the
+/// largest lean from upright in radians.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Tufts {
+    pub faces: Vec<BlockFace>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stage_faces: Vec<BlockFace>,
+    pub jitter: f32,
+    #[serde(default)]
+    pub tilt: f32,
+}
+
+/// Faces a block wears in place of its own on a voxel whose stage holds any
+/// of `mask`'s bits: the same cube in another look, as a canopy in flower
+/// wears its blossoms over its leaves. Each face stands in for the block's
+/// face toward the same side.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StageFaces {
+    pub mask: u32,
+    pub faces: Vec<BlockFace>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -407,4 +655,120 @@ impl Default for YRotatableSegments {
 
 fn default_ground_friction_multiplier() -> f32 {
     1.0
+}
+
+fn default_swim_speed_multiplier() -> f32 {
+    1.0
+}
+
+impl BranchBlocks for Registry {
+    fn branch_shape(&self, id: u32) -> Option<&BranchShape> {
+        self.get_block_by_id(id).branch.as_ref()
+    }
+
+    fn branch_sockets(&self, id: u32) -> &[BranchSocket] {
+        &self.get_block_by_id(id).branch_sockets
+    }
+
+    fn is_branch_shell(&self, id: u32) -> bool {
+        self.get_block_by_id(id).branch_shell
+    }
+}
+
+#[cfg(test)]
+mod barrier_tests {
+    use super::*;
+    use crate::{Chunk, ChunkOptions};
+
+    fn hurdles() -> [Block; 2] {
+        let slab = AABB::create(0.0, 0.0, 0.375, 1.0, 1.0, 0.625);
+        let patterned = Block::new("Hurdle")
+            .id(9002)
+            .dynamic_patterns(&[BlockDynamicPattern {
+                parts: vec![BlockConditionalPart {
+                    aabbs: vec![slab],
+                    ..Default::default()
+                }],
+            }])
+            .barrier_height(1.5)
+            .build();
+        let plain = Block::new("Low Hurdle")
+            .id(9003)
+            .aabbs(&[
+                AABB::create(0.0, 0.0, 0.0, 1.0, 0.5, 1.0),
+                AABB::create(0.25, 0.0, 0.25, 0.75, 2.0, 0.75),
+            ])
+            .barrier_height(1.5)
+            .build();
+        [patterned, plain]
+    }
+
+    #[test]
+    fn a_barrier_raises_what_server_bodies_collide_with_and_keeps_the_declared_boxes() {
+        let registry = Registry::new();
+        let space = Chunk::new(
+            "barrier",
+            0,
+            0,
+            &ChunkOptions {
+                size: 16,
+                max_height: 16,
+                sub_chunks: 1,
+            },
+        );
+        let at = Vec3(1, 1, 1);
+        for block in hurdles() {
+            let declared = block.get_declared_aabbs(&at, &space, &registry);
+            let collided = block.get_aabbs(&at, &space, &registry);
+            assert!(!declared.is_empty(), "{}", block.name);
+            assert_eq!(declared.len(), collided.len(), "{}", block.name);
+            for (declared, collided) in declared.iter().zip(&collided) {
+                assert_eq!(
+                    collided.max_y,
+                    declared.max_y.max(1.5),
+                    "{}: a box rises to the barrier and a taller one keeps its top",
+                    block.name
+                );
+                assert_eq!(
+                    [
+                        collided.min_x,
+                        collided.min_y,
+                        collided.min_z,
+                        collided.max_x,
+                        collided.max_z
+                    ],
+                    [
+                        declared.min_x,
+                        declared.min_y,
+                        declared.min_z,
+                        declared.max_x,
+                        declared.max_z
+                    ],
+                    "{}: only the top moves",
+                    block.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_block_with_a_barrier_sends_one_to_clients() {
+        let [hurdle, _] = hurdles();
+        let open = Block::new("Crate").id(9004).build();
+        assert_eq!(serde_json::to_value(&hurdle).unwrap()["barrierHeight"], 1.5);
+        assert!(serde_json::to_value(&open)
+            .unwrap()
+            .get("barrierHeight")
+            .is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "turned onto its side")]
+    fn a_block_that_can_lie_on_its_side_cannot_carry_a_barrier() {
+        Block::new("Hurdle")
+            .id(9002)
+            .rotatable(true)
+            .barrier_height(1.5)
+            .build();
+    }
 }
