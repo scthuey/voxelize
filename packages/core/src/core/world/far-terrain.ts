@@ -9,6 +9,7 @@ import {
   HalfFloatType,
   LinearFilter,
   LinearMipmapLinearFilter,
+  Matrix4,
   Mesh,
   NearestFilter,
   PlaneGeometry,
@@ -186,6 +187,8 @@ export type FarTerrainSharedUniforms = {
   farCoverMask: ShaderUniform<Texture | null>;
   farCover: ShaderUniform<Vector4>;
   farSeam: ShaderUniform<number>;
+  /** World space to block space (far-terrain-seam). */
+  farBlockFromWorld: ShaderUniform<Matrix4>;
   /**
    * The weather on surfaces the chunks draw (surface-weather.ts), so the
    * far land wears the same coat and wet ground; without them it wears
@@ -452,7 +455,9 @@ const VERTEX_SHADER = `
 attribute vec2 aFarColumn;
 attribute vec4 aFarMaterial;
 attribute vec4 aFarTint;
+uniform mat4 uFarBlockFromWorld;
 varying vec3 vWorldPosition;
+varying vec3 vFarBlockPosition;
 varying float vFarOcclusion;
 flat varying vec4 vFarMaterial;
 flat varying vec2 vFarColumn;
@@ -475,6 +480,7 @@ void main() {
     vFarFade = vec2(1.0);
   #endif
   vWorldPosition = worldPosition.xyz;
+  vFarBlockPosition = (uFarBlockFromWorld * worldPosition).xyz;
   vFarMaterial = aFarMaterial;
   vFarOcclusion = aFarMaterial.z / 255.0;
   vFarColumn = aFarColumn;
@@ -485,10 +491,13 @@ void main() {
 `;
 
 const WATER_VERTEX_SHADER = `
+uniform mat4 uFarBlockFromWorld;
 varying vec3 vWorldPosition;
+varying vec3 vFarBlockPosition;
 void main() {
   vec4 worldPosition = modelMatrix * vec4(position, 1.0);
   vWorldPosition = worldPosition.xyz;
+  vFarBlockPosition = (uFarBlockFromWorld * worldPosition).xyz;
   gl_Position = projectionMatrix * viewMatrix * worldPosition;
 }
 `;
@@ -594,7 +603,14 @@ uniform sampler2D uFarShadowMap;
 uniform vec4 uFarShadow;
 ${FAR_SEAM_UNIFORM_DECLARATIONS}
 varying vec3 vWorldPosition;
+// The fragment in blocks, which the tiles, mask, ring and shadows are laid
+// out in; vWorldPosition stays in world units for the fog the chunks share.
+varying vec3 vFarBlockPosition;
 ${FAR_SEAM_FUNCTIONS}
+
+vec3 farCameraBlock() {
+  return (uFarBlockFromWorld * vec4(cameraPosition, 1.0)).xyz;
+}
 
 // The sun on a point as the far land and canopy toward the sun let it
 // through (far-terrain-shadow): 1 above the shadow line over its texel, 0
@@ -614,11 +630,11 @@ float farTerrainSun(vec3 p) {
  * past the reach, measured from the viewer the tiles were picked around.
  */
 const COVER_DISCARD = `
-  vec2 farTexel = farCoverTexel(vWorldPosition.xz);
+  vec2 farTexel = farCoverTexel(vFarBlockPosition.xz);
   if (farCoverInside(farTexel) && farCoverHard(farTexel) > 0.5) {
     if (uFarSeam <= 0.0 || farSeamWeight(farTexel) > farSeamDither(gl_FragCoord.xy)) discard;
   }
-  float horizontal = length(vWorldPosition.xz - uRingCenter);
+  float horizontal = length(vFarBlockPosition.xz - uRingCenter);
   if (horizontal >= uRingOuter) discard;
 `;
 
@@ -685,8 +701,8 @@ void main() {
   if (vFarFade.y > 0.0 ? fadeDither >= vFarFade.x : fadeDither < 1.0 - vFarFade.x) discard;
   ${COVER_DISCARD}
 
-  vec3 normal = normalize(cross(dFdx(vWorldPosition), dFdy(vWorldPosition)));
-  if (dot(normal, cameraPosition - vWorldPosition) < 0.0) normal = -normal;
+  vec3 normal = normalize(cross(dFdx(vFarBlockPosition), dFdy(vFarBlockPosition)));
+  if (dot(normal, farCameraBlock() - vFarBlockPosition) < 0.0) normal = -normal;
 
   int cls = int(vFarMaterial.x + 0.5);
   int kind = int(vFarMaterial.y + 0.5);
@@ -694,7 +710,7 @@ void main() {
   vec4 m1 = texelFetch(uFarMaterials, ivec2(1, cls), 0);
   vec4 m2 = texelFetch(uFarMaterials, ivec2(2, cls), 0);
 
-  vec3 p = vWorldPosition;
+  vec3 p = vFarBlockPosition;
   // In cells, a wall's rows counted down from its column's ground so the
   // top cell's side starts at the ground, as a block's does.
   float step = max(vFarStep, 1.0);
@@ -876,7 +892,7 @@ vec3 farWaterSurface(vec3 light, float seaDepth, float fresnel, vec3 toCamera, f
   );
   // The column the deep haze counts: what the chunk water could measure at
   // the loaded edge, the sea's own depth by the end of the ramp past it.
-  float edgeDistance = length(vWorldPosition.xz - cameraPosition.xz);
+  float edgeDistance = length(vFarBlockPosition.xz - farCameraBlock().xz);
   float columnDepth = mix(
     min(seaDepth, ${CHUNK_WATER_DEPTH_REACH}),
     seaDepth,
@@ -920,7 +936,7 @@ ${FAR_WATER_FN}
 void main() {
   ${COVER_DISCARD}
   vec3 normal = vec3(0.0, 1.0, 0.0);
-  vec2 depthUv = (vWorldPosition.xz - uFarDepth.xy) / (uFarDepth.z * uFarDepth.w);
+  vec2 depthUv = (vFarBlockPosition.xz - uFarDepth.xy) / (uFarDepth.z * uFarDepth.w);
   float seaDepth = texture2D(uFarDepthMap, depthUv).r * ${DEPTH_RANGE}.0;
   // No sea where the tiles stand at or above it. A lake or shore level
   // with the sea has its own top an eighth of a block over this plane, and
@@ -928,13 +944,13 @@ void main() {
   // fought in bands, the sea's side painted as the sand of a zero depth.
   bool inMap = all(greaterThanEqual(depthUv, vec2(0.0))) && all(lessThanEqual(depthUv, vec2(1.0)));
   if (inMap && seaDepth < ${FAR_SEA_MIN_DEPTH}) discard;
-  vec3 toCamera = normalize(cameraPosition - vWorldPosition);
+  vec3 toCamera = normalize(farCameraBlock() - vFarBlockPosition);
   float fresnel = farWaterFresnel(toCamera.y);
   vec3 albedo = farSeabed();
   float occlusion = 1.0;
-  float shadow = farTerrainSun(vWorldPosition);
+  float shadow = farTerrainSun(vFarBlockPosition);
   ${lightAndFog(
-    "gl_FragColor.rgb = farWaterSurface(light, seaDepth, fresnel, toCamera, length(cameraPosition - vWorldPosition));",
+    "gl_FragColor.rgb = farWaterSurface(light, seaDepth, fresnel, toCamera, length(farCameraBlock() - vFarBlockPosition));",
   )}
 }
 `;
@@ -1361,6 +1377,7 @@ export class FarTerrain extends Group {
       uFarCoverMask: shared.farCoverMask,
       uFarCover: shared.farCover,
       uFarSeam: shared.farSeam,
+      uFarBlockFromWorld: shared.farBlockFromWorld,
       uRingOuter: { value: 0 },
       uRingCenter: this.ringCenter,
       uFarEdge: this.farEdge,

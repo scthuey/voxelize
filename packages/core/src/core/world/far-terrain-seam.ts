@@ -15,6 +15,9 @@ uniform sampler2D uFarCoverMask;
 uniform vec4 uFarCover;
 // The seam band's ramp scale: 0 keeps the loaded edge hard.
 uniform float uFarSeam;
+// World space to the block space the mask and the far layer are laid out
+// in: identity unless the host transforms the world (scales it to metres).
+uniform mat4 uFarBlockFromWorld;
 `;
 
 /** The 4x4 Bayer matrix, row-major, each of 0..15 once. */

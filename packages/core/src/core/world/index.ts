@@ -5791,6 +5791,11 @@ export class World<T = any> extends Scene implements NetIntercept {
     const updateSkyAndCloudsDuration =
       performance.now() - startUpdateSkyAndClouds;
 
+    // The mask and the far layer are laid out in blocks; a host that scales
+    // or moves the world needs its fragments taken back into them.
+    this.chunkRenderer.uniforms.farBlockFromWorld.value
+      .copy(this.matrixWorld)
+      .invert();
     this.updateFarTerrain(position);
 
     const startEmitServerUpdates = performance.now();
@@ -8591,6 +8596,7 @@ export class World<T = any> extends Scene implements NetIntercept {
         farCoverMask: chunkUniforms.farCoverMask,
         farCover: chunkUniforms.farCover,
         farSeam: chunkUniforms.farSeam,
+        farBlockFromWorld: chunkUniforms.farBlockFromWorld,
         surfaceWeather: chunkUniforms.surfaceWeather,
         surfaceWeatherMap: chunkUniforms.surfaceWeatherMap,
         surfaceWeatherWindow: chunkUniforms.surfaceWeatherWindow,

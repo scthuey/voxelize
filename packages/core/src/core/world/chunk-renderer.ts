@@ -203,6 +203,8 @@ export class ChunkRenderer {
     farCover: { value: Vector4 };
     /** The seam band's ramp scale; 0 keeps the loaded edge hard. */
     farSeam: { value: number };
+    /** World space to block space: the inverse of the world's own transform. */
+    farBlockFromWorld: { value: Matrix4 };
   } & SurfaceWeatherUniforms = {
     // Weather on surfaces (surface-weather.ts): off until a host sets it.
     ...createSurfaceWeatherUniforms(),
@@ -229,6 +231,7 @@ export class ChunkRenderer {
     farCoverMask: { value: null },
     farCover: { value: new Vector4(0, 0, 16, 1) },
     farSeam: { value: 0 },
+    farBlockFromWorld: { value: new Matrix4() },
     skyFogTopColor: { value: new Color(0.4, 0.6, 0.9) },
     skyFogMiddleColor: { value: new Color(0.7, 0.8, 0.95) },
     skyFogBottomColor: { value: new Color(0.15, 0.18, 0.25) },

@@ -367,6 +367,9 @@ varying float vEmissive;
 varying float vAO;
 varying float vIsFluid;
 varying float vIsGreedy;
+// The face's atlas UV as its provoking vertex has it, which names the cell a
+// greedy quad tiles; see greedyCellUv in the fragment.
+flat varying vec2 vGreedyCellUv;
 varying float vIsFluidPane;
 varying float vFluidDepthBelow;
 varying float vFluidRestY;
@@ -490,6 +493,9 @@ if (isSurfaceVertex == 1) {
 vAO = uAOTable[ao] / 255.0;
 vIsFluid = float(isFluid);
 vIsGreedy = float(isGreedy);
+#ifdef USE_MAP
+  vGreedyCellUv = vMapUv;
+#endif
 vIsFluidPane = float(isFluidPane);
 vWaterExposed = float(isWaterExposed);
 vLight = unpackLight(light & LIGHT_MASK);
@@ -725,6 +731,9 @@ ${SURFACE_WEATHER_FUNCTIONS}
 varying float vAO;
 varying float vIsFluid;
 varying float vIsGreedy;
+// The face's atlas UV as its provoking vertex has it, which names the cell a
+// greedy quad tiles; see greedyCellUv in the fragment.
+flat varying vec2 vGreedyCellUv;
 varying float vIsFluidPane;
 varying float vFluidDepthBelow;
 varying float vFluidRestY;
@@ -930,7 +939,7 @@ float getShadow() {
 // band instead of along a line. Fluids keep drawing; the far water plane
 // lies under them anyway.
 if (uFarSeam > 0.0 && vIsFluid < 0.5) {
-  vec2 farSeamTexel = farCoverTexel(vWorldPosition.xz);
+  vec2 farSeamTexel = farCoverTexel((uFarBlockFromWorld * vec4(vWorldPosition.xyz, 1.0)).xz);
   if (farCoverInside(farSeamTexel)
       && farSeamWeight(farSeamTexel) <= farSeamDither(gl_FragCoord.xy)) {
     discard;
@@ -955,7 +964,12 @@ if (uFarSeam > 0.0 && vIsFluid < 0.5) {
     }
     vec2 localUv = greedyFaceUv(greedyNormal, fract(greedyPosition));
     
-    vec2 cellMin = floor(vMapUv / cellSize) * cellSize;
+    // The cell comes from the flat UV, not the interpolated one: every corner
+    // of a quad holds a UV inside its cell, but across a long quad seen far
+    // off at a grazing angle the interpolated value drifts over the cell's
+    // edge, and the fragment tiled its neighbour's texture - the unknown
+    // checker's magenta, where that neighbour is an unused slot.
+    vec2 cellMin = floor(vGreedyCellUv / cellSize) * cellSize;
     vec2 innerMin = cellMin + padding;
     float innerSize = cellSize - padding * 2.0;
     finalUv = innerMin + localUv * innerSize;

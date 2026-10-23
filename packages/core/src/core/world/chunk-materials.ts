@@ -467,6 +467,7 @@ export function makeChunkShaderMaterial(
       uFarCoverMask: chunksUniforms.farCoverMask,
       uFarCover: chunksUniforms.farCover,
       uFarSeam: chunksUniforms.farSeam,
+      uFarBlockFromWorld: chunksUniforms.farBlockFromWorld,
       ...bindSurfaceWeatherUniforms(chunksUniforms),
       // Per material: how it takes the weather (SURFACE_RESPONSE). Forks
       // share it with the material they draw for.
