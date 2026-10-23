@@ -581,6 +581,11 @@ const lightAndFog = (afterLight = "") => `
 
   gl_FragColor = vec4(albedo * light, 1.0);
   ${afterLight}
+  // The renderer's tone mapping and output encoding, in the chunk shader's
+  // order (three's basic fragment, its fog after them). Without them the
+  // layer wrote linear light to an sRGB target and drew far too dark.
+  #include <tonemapping_fragment>
+  #include <colorspace_fragment>
   ${createSkyAtmosphereFragment()}
   gl_FragColor.rgb = mix(
     gl_FragColor.rgb,
