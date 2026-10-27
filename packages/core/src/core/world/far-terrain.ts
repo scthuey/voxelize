@@ -2562,7 +2562,7 @@ export class FarTerrain extends Group {
       this.waterSpan = span;
     }
     this.water.position.set(position.x, descriptor.waterSurface, position.z);
-    this.water.visible = true;
+    this.water.visible = !descriptor.dry;
   }
 
   private disposeTile(tile: ResidentTile) {

@@ -17,6 +17,11 @@ export type FarTerrainDescriptor = {
   /** The y of the far water plane. */
   waterSurface: number;
   /**
+   * No sea: no far water plane or seabed is drawn, and past the land is open
+   * sky. Nothing under `waterSurface` is built either way.
+   */
+  dry?: boolean;
+  /**
    * What each material class is made of, indexed by a sample's class.
    * Absent leaves the colours to the client's palette.
    */

@@ -88,6 +88,11 @@ pub struct FarTerrainDescriptor {
     /// The y the far water plane sits at: the top face of the sea's top
     /// block.
     pub water_surface: f32,
+    /// No sea at all: the client draws no far water plane or seabed, and
+    /// past the land is open sky. Nothing under `water_surface` is built
+    /// either way, so a sampler marks empty ground by a height under it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dry: bool,
     /// What each material class is made of, indexed by the class a sample
     /// carries. Empty leaves the colours to the client's own palette.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -597,6 +602,7 @@ mod tests {
             tile_samples: 33,
             levels: 3,
             water_surface: 86.9,
+            dry: false,
             materials: Vec::new(),
             sky_material: None,
             seabed_material: None,
